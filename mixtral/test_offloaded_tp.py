@@ -2,22 +2,14 @@ import argparse
 import json
 import logging
 import time
+import concurrent.futures
 from pathlib import Path
 
 import safetensors.torch
 import torch
+from numpy.random import default_rng
 from torch import nn
 
-# class FeedForward(nn.Module):
-#     def __init__(self, args: TransformerArgs):
-#         super().__init__()
-
-#         self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
-#         self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
-#         self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
 
 def get_json(file_path: Path) -> dict:
     try:
@@ -29,7 +21,27 @@ def get_json(file_path: Path) -> dict:
 
     return res
 
-def load_model(model_path: str):
+
+def main(model_path: str):
+
+    # def mlp(x: torch.Tensor, li: int, e: int, gpu: torch.device, compute_on_gpu: bool):
+    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
+    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
+    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
+
+    #     if compute_on_gpu:
+    #         w1.to(gpu)
+    #         w2.to(gpu)
+    #         w3.to(gpu)
+    #         x.to(gpu, copy=True)
+
+    #     y = (nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T
+        
+    #     if not compute_on_gpu:
+    #         y.to(gpu)
+
+    #     return y
+
     model_path = Path(model_path)
     configs = get_json(model_path / "config.json")
     tensor_index = get_json(model_path / "model.safetensors.index.json")
@@ -41,29 +53,54 @@ def load_model(model_path: str):
             weight_filenames.add(v)
 
     for filename in weight_filenames:
-        for k, v in safetensors.torch.load_file(model_path / filename, device="cpu").items():
+        for k, v in safetensors.torch.load_file(
+            model_path / filename, device="cpu"
+        ).items():
             if "block_sparse_moe.experts" in k:
                 weights[k] = v
 
-    logging.info(len(weights))
-    time.sleep(10)
+    rng = default_rng(seed=0)
+    selection = []
+    for _ in range(configs["num_hidden_layers"]):
+        selection.append(rng.choice(8, size=2, replace=False).tolist())
 
-    # assert (
-    #     pt_model_file.exists() or safetensors_model_file.exists()
-    # ), f"Make sure either {pt_model_file} or {safetensors_model_file} exists"
-    # assert not (
-    #     pt_model_file.exists() and safetensors_model_file.exists()
-    # ), f"Both {pt_model_file} and {safetensors_model_file} cannot exist"
 
-    # loaded = safetensors.torch.load_file(str(safetensors_model_file))
+    gpu_0 = torch.device("cuda:0")
+    x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
+    ys = []
 
-    # model.load_state_dict(loaded, assign=True, strict=True)
+    tic = time.perf_counter()
 
-    # return model.to(device=device, dtype=dtype)
+    # with concurrent.futures.ThreadPoolExecutor(max_workers=5) as xcutor:
+    #     for li in range(configs["num_hidden_layers"]):
+    #         e0, e1 = selection[li]
+    #         cpu_job = xcutor.submit(mlp, x, li, e0, gpu_0, True)
+    #         gpu_job = xcutor.submit(mlp, x, li, e1, gpu_0, True)
+    #         concurrent.futures.wait([gpu_job, cpu_job])
+    #         ys.append(cpu_job.result() + gpu_job.result())
+
+    # for li in range(configs["num_hidden_layers"] // 2):
+    #     for e in selection[li]:
+    #         w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
+    #         w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
+    #         w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
+    #         w1.to(gpu_0)
+    #         w2.to(gpu_0)
+    #         w3.to(gpu_0)
+
+    for li in range(configs["num_hidden_layers"]):
+        x.to("cpu")
+        x.to(gpu_0)
+
+    logging.info(f"finished MoE computations in {time.perf_counter() - tic} secs")
+    print(len(ys))
+    # print(ys[0].shape)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
 
-    load_model(args.model_path)
+    main(args.model_path)
