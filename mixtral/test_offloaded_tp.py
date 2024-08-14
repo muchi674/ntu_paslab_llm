@@ -41,7 +41,7 @@ def load_model(model_path: str):
             weight_filenames.add(v)
 
     for filename in weight_filenames:
-        for k, v in safetensors.torch.load_file(filename, device="cpu").items():
+        for k, v in safetensors.torch.load_file(model_path / filename, device="cpu").items():
             if "block_sparse_moe.experts" in k:
                 weights[k] = v
 
