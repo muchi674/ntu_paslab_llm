@@ -2,7 +2,6 @@ import argparse
 import json
 import logging
 import time
-import concurrent.futures
 from pathlib import Path
 
 import safetensors.torch
@@ -23,24 +22,6 @@ def get_json(file_path: Path) -> dict:
 
 
 def main(model_path: str):
-
-    # def mlp(x: torch.Tensor, li: int, e: int, gpu: torch.device, compute_on_gpu: bool):
-    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
-    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
-    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-
-    #     if compute_on_gpu:
-    #         w1.to(gpu)
-    #         w2.to(gpu)
-    #         w3.to(gpu)
-    #         x.to(gpu, copy=True)
-
-    #     y = (nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T
-        
-    #     if not compute_on_gpu:
-    #         y.to(gpu)
-
-    #     return y
 
     model_path = Path(model_path)
     configs = get_json(model_path / "config.json")
@@ -64,37 +45,82 @@ def main(model_path: str):
     for _ in range(configs["num_hidden_layers"]):
         selection.append(rng.choice(8, size=2, replace=False).tolist())
 
-
     gpu_0 = torch.device("cuda:0")
     x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
     ys = []
+    N = 64
 
+    # compute everything on CPU
+    # tic = time.perf_counter()
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         x = x.to("cpu")
+    #         for e in selection[li]:
+    #             w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
+    #             w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
+    #             w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
+    #             ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
+    #         x = x.to(gpu_0)
+    # lat = time.perf_counter() - tic
+    # logging.info(f"finished MoE computations in {lat} secs")
+    # logging.info(f"each layer took {lat / N / configs['num_hidden_layers']} secs")
+
+    # compute half of the layers on GPU
+    # for li in range(configs["num_hidden_layers"]):
+    #     for e in selection[li]:
+    #         for wi in ["w1", "w2", "w3"]:
+    #             weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.{wi}.weight"
+    #             ] = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.{wi}.weight"
+    #             ].to(
+    #                 gpu_0
+    #             )
+
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
+
+    # start.record()
+
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         for e in selection[li]:
+    #             w1 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"
+    #             ]
+    #             w2 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"
+    #             ]
+    #             w3 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"
+    #             ]
+    #             x = ((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T) / 1000
+
+    # end.record()
+    # torch.cuda.synchronize()
+    # lat = start.elapsed_time(end)
+    # print(f"finished MoE computations in {lat} ms")
+    # print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
+    # finished MoE computations in 1606.722412109375 ms
+    # each layer took 0.7845324277877808 ms
+
+    # move weights to GPU
     tic = time.perf_counter()
 
-    # with concurrent.futures.ThreadPoolExecutor(max_workers=5) as xcutor:
-    #     for li in range(configs["num_hidden_layers"]):
-    #         e0, e1 = selection[li]
-    #         cpu_job = xcutor.submit(mlp, x, li, e0, gpu_0, True)
-    #         gpu_job = xcutor.submit(mlp, x, li, e1, gpu_0, True)
-    #         concurrent.futures.wait([gpu_job, cpu_job])
-    #         ys.append(cpu_job.result() + gpu_job.result())
-
-    # for li in range(configs["num_hidden_layers"] // 2):
-    #     for e in selection[li]:
-    #         w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
-    #         w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
-    #         w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-    #         w1.to(gpu_0)
-    #         w2.to(gpu_0)
-    #         w3.to(gpu_0)
-
     for li in range(configs["num_hidden_layers"]):
-        x.to("cpu")
-        x.to(gpu_0)
+        for e in selection[li]:
+            for wi in ["w1", "w2", "w3"]:
+                weights[
+                    f"model.layers.{li}.block_sparse_moe.experts.{e}.{wi}.weight"
+                ] = weights[
+                    f"model.layers.{li}.block_sparse_moe.experts.{e}.{wi}.weight"
+                ].to(
+                    gpu_0
+                )
 
-    logging.info(f"finished MoE computations in {time.perf_counter() - tic} secs")
-    print(len(ys))
-    # print(ys[0].shape)
+    print(
+        f"to gpu avg lat per layer: {(time.perf_counter() - tic) / configs['num_hidden_layers'] / 2} seconds"
+    )
 
 
 if __name__ == "__main__":
