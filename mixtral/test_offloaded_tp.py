@@ -48,7 +48,7 @@ def main(model_path: str):
     selection = []
     for _ in range(configs["num_hidden_layers"]):
         # selection.append(rng.choice(8, size=2, replace=False).tolist())
-        selection.append(list(range(6)))
+        selection.append(list(range(7)))
 
     gpu_0 = torch.device("cuda:0")
     x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
@@ -64,7 +64,7 @@ def main(model_path: str):
     #             w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
     #             w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
     #             w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-    #             ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
+    #             x = ((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T) / 1000
     #         x = x.to(gpu_0)
     # lat = time.perf_counter() - tic
     # logging.info(f"finished MoE computations in {lat} secs")
@@ -168,19 +168,26 @@ def main(model_path: str):
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    t0 = torch.cuda.Event(enable_timing=True)
+    t1 = torch.cuda.Event(enable_timing=True)
+    t_lats = []
 
     start.record()
 
     for _ in range(N):
         for li in range(configs["num_hidden_layers"]):
-            cpu_x = x.to("cpu")
+            x = x.to("cpu")
+            t0.record()
             ws = stacked[li].to(gpu_0, non_blocking=True)
-            for e in range(5):
+            for e in range(6):
                 w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
                 w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
                 w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-                ys.append((nn.functional.silu(cpu_x @ w1.T) * (cpu_x @ w3.T)) @ w2.T)
-            # torch.cuda.synchronize()
+                ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
+            t1.record()
+            torch.cuda.synchronize()
+            t_lats.append(t0.elapsed_time(t1))
+            x = x.to(gpu_0)
             ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
             torch.cuda.synchronize()
 
@@ -189,6 +196,7 @@ def main(model_path: str):
     lat = start.elapsed_time(end)
     print(f"finished MoE computations in {lat} ms")
     print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
+    print(mean(t_lats))
 
 
 if __name__ == "__main__":
