@@ -52,15 +52,19 @@ def main(model_path: str):
 
     gpu_0 = torch.device("cuda:0")
     x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
+    x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
+    x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
     ys = []
-    N = 20
+    N = 100
+
+    # -------------------------------------------------------------------------------------
 
     # compute everything on CPU
     # tic = time.perf_counter()
     # for _ in range(N):
     #     for li in range(configs["num_hidden_layers"]):
     #         x = x.to("cpu")
-    #         for e in selection[li]:
+    #         for e in range(2):
     #             w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
     #             w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
     #             w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
@@ -158,45 +162,125 @@ def main(model_path: str):
 
     # overlap weights transfer to GPU memory with CPU compute
     # assumes num selected experts per layer = 6
-    stacked = []
+    # stacked = []
 
-    for li in range(configs["num_hidden_layers"]):
-        w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.5.w1.weight"]
-        w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.5.w2.weight"]
-        w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.5.w3.weight"]
-        stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
+    # for li in range(configs["num_hidden_layers"]):
+    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w1.weight"]
+    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w2.weight"]
+    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w3.weight"]
+    #     stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    t0 = torch.cuda.Event(enable_timing=True)
-    t1 = torch.cuda.Event(enable_timing=True)
-    t_lats = []
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
+    # # t0 = torch.cuda.Event(enable_timing=True)
+    # # t1 = torch.cuda.Event(enable_timing=True)
+    # # t_lats = []
 
-    start.record()
+    # start.record()
 
-    for _ in range(N):
-        for li in range(configs["num_hidden_layers"]):
-            x = x.to("cpu")
-            t0.record()
-            ws = stacked[li].to(gpu_0, non_blocking=True)
-            for e in range(6):
-                w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
-                w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
-                w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-                ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
-            t1.record()
-            torch.cuda.synchronize()
-            t_lats.append(t0.elapsed_time(t1))
-            x = x.to(gpu_0)
-            ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
-            torch.cuda.synchronize()
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         x = x.to("cpu")
+    #         # t0.record()
+    #         ws = stacked[li].to(gpu_0, non_blocking=True)
+    #         for e in range(6):
+    #             w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
+    #             w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
+    #             w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
+    #             ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
+    #         # t1.record()
+    #         torch.cuda.synchronize()
+    #         # t_lats.append(t0.elapsed_time(t1))
+    #         x = x.to(gpu_0)
+    #         ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
+    #         torch.cuda.synchronize()
 
-    end.record()
-    torch.cuda.synchronize()
-    lat = start.elapsed_time(end)
-    print(f"finished MoE computations in {lat} ms")
-    print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
-    print(mean(t_lats))
+    # end.record()
+    # torch.cuda.synchronize()
+    # lat = start.elapsed_time(end)
+    # print(f"finished MoE computations in {lat} ms")
+    # print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
+    # print(mean(t_lats))
+
+    # -------------------------------------------------------------------------------------
+
+    # overlap CPU and GPU compute
+    # stacked = []
+
+    # for li in range(configs["num_hidden_layers"]):
+    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w1.weight"]
+    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w2.weight"]
+    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w3.weight"]
+    #     stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
+
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
+
+    # start.record()
+
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         cpu_x = x.to("cpu")
+    #         ws = stacked[li].to(gpu_0, non_blocking=True)
+    #         # ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
+    #         # ys.append((nn.functional.silu(x1 @ ws[0].T) * (x1 @ ws[2].T)) @ ws[1])
+    #         # ys.append((nn.functional.silu(x2 @ ws[0].T) * (x2 @ ws[2].T)) @ ws[1])
+    #         gpu_xs = torch.stack((x, x1, x2))
+    #         ys.append(
+    #             (nn.functional.silu(gpu_xs @ ws[0].T) * (gpu_xs @ ws[2].T)) @ ws[1]
+    #         )
+    #         cpu_ys = []
+    #         for e in range(6):
+    #             w1 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"
+    #             ]
+    #             w2 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"
+    #             ]
+    #             w3 = weights[
+    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"
+    #             ]
+    #             cpu_ys.append(
+    #                 (nn.functional.silu(cpu_x @ w1.T) * (cpu_x @ w3.T)) @ w2.T
+    #             )
+    #         torch.cuda.synchronize()
+    #         ys.append(torch.sum(torch.stack(cpu_ys), dim=0).to(gpu_0))
+
+    # end.record()
+    # torch.cuda.synchronize()
+    # lat = start.elapsed_time(end)
+    # print(f"finished MoE computations in {lat} ms")
+    # print(
+    #     f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms"
+    # )
+
+    # -------------------------------------------------------------------------------------
+
+    # cpu computation with stacked weights
+    # stacked = []
+    # for li in range(configs["num_hidden_layers"]):
+    #     for e in range(configs["num_local_experts"]):
+    #         w1 = weights.pop(f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight")
+    #         w2 = weights.pop(f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight")
+    #         w3 = weights.pop(f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight")
+    #         stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
+    #     gc.collect()
+    
+    # print(len(weights))
+
+    # tic = time.perf_counter()
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         x = x.to("cpu")
+    #         for e in range(2):
+    #             ws = stacked[li * configs["num_local_experts"] + e]
+    #             ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
+    #         x = x.to(gpu_0)
+    # lat = time.perf_counter() - tic
+    # logging.info(f"finished MoE computations in {lat} secs")
+    # logging.info(f"each layer took {lat / N / configs['num_hidden_layers']} secs")
+
+    # -------------------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
