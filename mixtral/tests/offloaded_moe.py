@@ -52,6 +52,7 @@ from torch import nn
 # INFO:root:finished MoE computations in 9.442421261002892 secs
 # INFO:root:each layer took 0.014753783220317018 secs
 
+
 def get_json(file_path: Path) -> dict:
     try:
         with open(file_path, "r") as f:
@@ -75,8 +76,8 @@ def main(model_path: str):
     gc.collect()
 
     x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
-    # x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
-    # x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
+    x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
+    x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
     ys = []
     N = 100
 
@@ -97,67 +98,25 @@ def main(model_path: str):
 
     # -------------------------------------------------------------------------------------
 
-    # move stacked weights to GPU
-    for li in range(configs["num_hidden_layers"]):
-        for ei in range(2):
-            ws[f"{li}.{ei}"] = ws[f"{li}.{ei}"].to(gpu_0, non_blocking=True)
-
-    # wait for weights copy to finish
-    torch.cuda.synchronize(device=gpu_0)
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-
-    for _ in range(N):
-        for li in range(configs["num_hidden_layers"]):
-            for ei in range(2):
-                w = ws[f"{li}.{ei}"]
-                ys.append((nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1])
-            torch.cuda.synchronize()
-
-    end.record()
-    torch.cuda.synchronize()
-    lat = start.elapsed_time(end)
-    print(f"finished MoE computations in {lat} ms")
-    print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
-
-    # ----------------------------------------------------CPU comp---------------------------------
-
-    # overlap weights transfer to GPU memory with ute
-    # assumes num selected experts per layer = 6
-    # stacked = []
-
+    # # move stacked weights to GPU
     # for li in range(configs["num_hidden_layers"]):
-    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w1.weight"]
-    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w2.weight"]
-    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w3.weight"]
-    #     stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
+    #     for ei in range(2):
+    #         ws[f"{li}.{ei}"] = ws[f"{li}.{ei}"].to(gpu_0, non_blocking=True)
+
+    # # wait for weights copy to finish
+    # torch.cuda.synchronize(device=gpu_0)
 
     # start = torch.cuda.Event(enable_timing=True)
     # end = torch.cuda.Event(enable_timing=True)
-    # # t0 = torch.cuda.Event(enable_timing=True)
-    # # t1 = torch.cuda.Event(enable_timing=True)
-    # # t_lats = []
 
+    # # GPU computation on stacked weights
     # start.record()
 
     # for _ in range(N):
     #     for li in range(configs["num_hidden_layers"]):
-    #         x = x.to("cpu")
-    #         # t0.record()
-    #         ws = stacked[li].to(gpu_0, non_blocking=True)
-    #         for e in range(6):
-    #             w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"]
-    #             w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"]
-    #             w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"]
-    #             ys.append((nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2.T)
-    #         # t1.record()
-    #         torch.cuda.synchronize()
-    #         # t_lats.append(t0.elapsed_time(t1))
-    #         x = x.to(gpu_0)
-    #         ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
+    #         for ei in range(2):
+    #             w = ws[f"{li}.{ei}"]
+    #             ys.append((nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1])
     #         torch.cuda.synchronize()
 
     # end.record()
@@ -165,18 +124,34 @@ def main(model_path: str):
     # lat = start.elapsed_time(end)
     # print(f"finished MoE computations in {lat} ms")
     # print(f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms")
-    # print(mean(t_lats))
 
     # -------------------------------------------------------------------------------------
 
-    # overlap CPU and GPU compute
-    # stacked = []
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
 
-    # for li in range(configs["num_hidden_layers"]):
-    #     w1 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w1.weight"]
-    #     w2 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w2.weight"]
-    #     w3 = weights[f"model.layers.{li}.block_sparse_moe.experts.6.w3.weight"]
-    #     stacked.append(torch.stack((w1, w2.T, w3)).pin_memory())
+    # # overlap weights transfer to GPU memory with CPU computation
+    # start.record()
+
+    # for _ in range(N):
+    #     for li in range(configs["num_hidden_layers"]):
+    #         x = x.to("cpu")
+    #         ws[f"{li}.3"].to(gpu_0, non_blocking=True)
+    #         for ei in range(3):
+    #             w = ws[f"{li}.{ei}"]
+    #             ys.append((nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1])
+    #         torch.cuda.synchronize(device=gpu_0)
+    #         x = x.to(gpu_0)
+
+    # end.record()
+    # torch.cuda.synchronize(device=gpu_0)
+    # lat = start.elapsed_time(end)
+    # print(f"finished MoE computations in {lat} ms")
+    # print(
+    #     f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms"
+    # )
+
+    # -------------------------------------------------------------------------------------
 
     # start = torch.cuda.Event(enable_timing=True)
     # end = torch.cuda.Event(enable_timing=True)
@@ -186,33 +161,25 @@ def main(model_path: str):
     # for _ in range(N):
     #     for li in range(configs["num_hidden_layers"]):
     #         cpu_x = x.to("cpu")
-    #         ws = stacked[li].to(gpu_0, non_blocking=True)
-    #         # ys.append((nn.functional.silu(x @ ws[0].T) * (x @ ws[2].T)) @ ws[1])
-    #         # ys.append((nn.functional.silu(x1 @ ws[0].T) * (x1 @ ws[2].T)) @ ws[1])
-    #         # ys.append((nn.functional.silu(x2 @ ws[0].T) * (x2 @ ws[2].T)) @ ws[1])
-    #         gpu_xs = torch.stack((x, x1, x2))
+    #         gpu_w = ws[f"{li}.6"].to(gpu_0, non_blocking=True)
     #         ys.append(
-    #             (nn.functional.silu(gpu_xs @ ws[0].T) * (gpu_xs @ ws[2].T)) @ ws[1]
+    #             (nn.functional.silu(x @ gpu_w[0].T) * (x @ gpu_w[2].T)) @ gpu_w[1]
     #         )
-    #         cpu_ys = []
-    #         for e in range(6):
-    #             w1 = weights[
-    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w1.weight"
-    #             ]
-    #             w2 = weights[
-    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w2.weight"
-    #             ]
-    #             w3 = weights[
-    #                 f"model.layers.{li}.block_sparse_moe.experts.{e}.w3.weight"
-    #             ]
-    #             cpu_ys.append(
-    #                 (nn.functional.silu(cpu_x @ w1.T) * (cpu_x @ w3.T)) @ w2.T
-    #             )
-    #         torch.cuda.synchronize()
-    #         ys.append(torch.sum(torch.stack(cpu_ys), dim=0).to(gpu_0))
+    #         ys.append(
+    #             (nn.functional.silu(x1 @ gpu_w[0].T) * (x1 @ gpu_w[2].T)) @ gpu_w[1]
+    #         )
+    #         ys.append(
+    #             (nn.functional.silu(x2 @ gpu_w[0].T) * (x2 @ gpu_w[2].T)) @ gpu_w[1]
+    #         )
+    #         tmp = []
+    #         for ei in range(6):
+    #             w = ws[f"{li}.{ei}"]
+    #             tmp.append((nn.functional.silu(cpu_x @ w[0].T) * (cpu_x @ w[2].T)) @ w[1])
+    #         ys.append(torch.sum(torch.stack(tmp), dim=0).to(gpu_0))
+    #         torch.cuda.synchronize(device=gpu_0)
 
     # end.record()
-    # torch.cuda.synchronize()
+    # torch.cuda.synchronize(device=gpu_0)
     # lat = start.elapsed_time(end)
     # print(f"finished MoE computations in {lat} ms")
     # print(
