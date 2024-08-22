@@ -344,39 +344,37 @@ class Attention(nn.Module):
         return self.wo(output)  # type: ignore
 
 
-# class FeedForward(nn.Module):
-#     def __init__(self, args: TransformerArgs):
-#         super().__init__()
+class Experts:
+    # tmp design: shared across layers
 
-#         MaybeLora = maybe_lora(args)
-#         self.w1 = MaybeLora(args.dim, args.hidden_dim, bias=False)
-#         self.w2 = MaybeLora(args.hidden_dim, args.dim, bias=False)
-#         self.w3 = MaybeLora(args.dim, args.hidden_dim, bias=False)
+    def __init__(self, ws: dict):
+        self.ws = ws
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))  # type: ignore
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        w = self.ws[f"{li}.{ei}"]
+        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]  # type: ignore
 
-# class MoeLayer(nn.Module):
-#     def __init__(self, experts: List[nn.Module], gate: nn.Module, moe_args: MoeArgs):
-#         super().__init__()
-#         assert len(experts) > 0
-#         self.experts = nn.ModuleList(experts)
-#         self.gate = gate
-#         self.args = moe_args
 
-#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-#         gate_logits = self.gate(inputs)
-#         weights, selected_experts = torch.topk(
-#             gate_logits, self.args.num_experts_per_tok
-#         )
-#         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-#         results = torch.zeros_like(inputs)
-#         for i, expert in enumerate(self.experts):
-#             batch_idx, nth_expert = torch.where(selected_experts == i)
-#             results[batch_idx] += weights[batch_idx, nth_expert, None] * expert(
-#                 inputs[batch_idx]
-#             )
-#         return results
+class MoeLayer(nn.Module):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+        super().__init__()
+        self.num_local_experts: int = args.num_local_experts
+        self.num_experts_per_tok: int = args.num_experts_per_tok
+        self.li = li
+        self.gate = gate
+        self.experts = experts
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        gate_logits = self.gate(inputs)
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        results = torch.zeros_like(inputs)
+
+        for ei in range(self.num_local_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        return results
 
 
 class RMSNorm(torch.nn.Module):
