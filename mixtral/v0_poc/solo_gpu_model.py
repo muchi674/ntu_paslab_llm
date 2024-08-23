@@ -65,6 +65,20 @@ class ModelArgs:
 
 
 @dataclass
+class SimpleInputMetadata:
+    # rope absolute positions
+    positions: torch.Tensor
+
+    @staticmethod
+    def from_seqlens(seqlens: List[int], device: torch.device) -> "SimpleInputMetadata":
+        return SimpleInputMetadata(
+            positions=torch.cat([torch.arange(0, seqlen) for seqlen in seqlens]).to(
+                device=device, dtype=torch.long
+            )
+        )
+
+
+@dataclass
 class CacheInputMetadata:
     # rope absolute positions
     positions: torch.Tensor
@@ -392,18 +406,16 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ffn_norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.args = args
-
-        self.feed_forward: nn.Module
         self.feed_forward = MoeLayer(
-            experts=[FeedForward(args=args) for _ in range(args.moe.num_experts)],
-            gate=nn.Linear(args.hidden_size, args.moe.num_experts, bias=False),
-            moe_args=args.moe,
+            args=args,
+            li=li,
+            gate=nn.Linear(args.hidden_size, args.num_local_experts, bias=False),
+            experts=experts,
         )
 
     def forward(
@@ -416,218 +428,97 @@ class TransformerBlock(nn.Module):
         return out
 
 
-# class Transformer(ModelBase, LoRALoaderMixin):
-#     def __init__(
-#         self,
-#         args: TransformerArgs,
-#         pipeline_rank: int = 0,
-#         num_pipeline_ranks: int = 1,
-#     ):
-#         super().__init__()
-#         self.args = args
-#         self.vocab_size = args.vocab_size
-#         self.n_layers = args.n_layers
-#         self._precomputed_freqs_cis: Optional[torch.Tensor] = None
-#         assert self.vocab_size > 0
-#         assert pipeline_rank < num_pipeline_ranks, (pipeline_rank, num_pipeline_ranks)
-#         self.pipeline_rank = pipeline_rank
-#         self.num_pipeline_ranks = num_pipeline_ranks
-#         # Modules specific to some ranks:
-#         self.tok_embeddings: Optional[nn.Embedding] = None
-#         self.norm: Optional[RMSNorm] = None
-#         self.output: Optional[nn.Linear] = None
-#         if pipeline_rank == 0:
-#             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-#         if pipeline_rank == num_pipeline_ranks - 1:
-#             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-#             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-#         # Initialize all layers but slice off those not of this rank.
-#         layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
-#         num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
-#         offset = self.pipeline_rank * num_layers_per_rank
-#         end = min(self.n_layers, offset + num_layers_per_rank)
-#         self.layers = nn.ModuleDict({str(i): layers[i] for i in range(offset, end)})
-#         self.n_local_layers = len(self.layers)
+class Transformer:
+    def __init__(self, args: ModelArgs, experts: Experts):
+        super().__init__()
+        self.args = args
+        self.vocab_size = args.vocab_size
+        self._precomputed_freqs_cis: torch.Tensor = None
+        self.tok_embeddings: nn.Embedding = None
+        self.norm: RMSNorm = None
+        self.output: nn.Linear = None
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.output = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.layers = nn.ModuleDict(
+            {
+                str(li): TransformerBlock(args=args, li=li, experts=experts)
+                for li in range(args.num_hidden_layers)
+            }
+        )
 
-#     @property
-#     def dtype(self) -> torch.dtype:
-#         return next(self.parameters()).dtype
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
 
-#     @property
-#     def device(self) -> torch.device:
-#         return next(self.parameters()).device
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
 
-#     @property
-#     def freqs_cis(self) -> torch.Tensor:
-#         # We cache freqs_cis but need to take care that it is on the right device
-#         # and has the right dtype (complex64). The fact that the dtype is different
-#         # from the module's  dtype means we cannot register it as a buffer
-#         if self._precomputed_freqs_cis is None:
-#             # default to 10**6
-#             theta = self.args.rope_theta or 1000000.0
-#             self._precomputed_freqs_cis = precompute_freqs_cis(
-#                 self.args.head_dim, 128_000, theta
-#             )
+    @property
+    def freqs_cis(self) -> torch.Tensor:
+        # We cache freqs_cis but need to take care that it is on the right device
+        # and has the right dtype (complex64). The fact that the dtype is different
+        # from the module's dtype means we cannot register it as a buffer
+        if self._precomputed_freqs_cis is None:
+            # default to 10**6
+            theta = self.args.rope_theta or 1000000.0
+            self._precomputed_freqs_cis = precompute_freqs_cis(
+                self.args.hidden_size // self.args.num_attention_heads, 128_000, theta
+            )
 
-#         if self._precomputed_freqs_cis.device != self.device:
-#             self._precomputed_freqs_cis = self._precomputed_freqs_cis.to(
-#                 device=self.device
-#             )
-#         return self._precomputed_freqs_cis
+        if self._precomputed_freqs_cis.device != self.device:
+            self._precomputed_freqs_cis = self._precomputed_freqs_cis.to(
+                device=self.device
+            )
+        return self._precomputed_freqs_cis
 
-#     def forward_partial(
-#         self,
-#         input_ids: torch.Tensor,
-#         seqlens: List[int],
-#         cache: Optional[BufferCache] = None,
-#     ) -> torch.Tensor:
-#         """Local forward pass.
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        seqlens: List[int],
+        cache: Optional[BufferCache] = None,
+    ) -> torch.Tensor:
+        (num_toks,) = input_ids.shape
+        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
-#         If doing pipeline parallelism, this will return the activations of the last layer of this stage.
-#         For the last stage, this will return the normalized final embeddings.
-#         """
-#         assert (
-#             len(seqlens) <= self.args.max_batch_size
-#         ), f"Max batch size is {self.args.max_batch_size}, got batch size of {len(seqlens)}"
-#         (num_toks,) = input_ids.shape
-#         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
+        input_metadata: Union[CacheInputMetadata, SimpleInputMetadata]
 
-#         input_metadata: Union[CacheInputMetadata, SimpleInputMetadata]
+        if cache is not None:
+            input_metadata = cache.get_input_metadata(seqlens)
+        else:
+            input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
 
-#         if cache is not None:
-#             input_metadata = cache.get_input_metadata(seqlens)
-#         else:
-#             input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
+        h = self.tok_embeddings(input_ids)
+        freqs_cis = self.freqs_cis[input_metadata.positions]
 
-#         if self.pipeline_rank == 0:
-#             assert self.tok_embeddings is not None
-#             h = self.tok_embeddings(input_ids)
-#         else:
-#             h = torch.empty(
-#                 num_toks, self.args.dim, device=self.device, dtype=self.dtype
-#             )
-#             torch.distributed.recv(h, src=self.pipeline_rank - 1)
+        for li, layer in self.layers.items():
+            if cache is not None:
+                assert input_metadata is not None
+                assert isinstance(input_metadata, CacheInputMetadata)
+                cache_view = cache.get_view(li, input_metadata)
+            else:
+                cache_view = None
+            h = layer(h, freqs_cis, cache_view)
 
-#         freqs_cis = self.freqs_cis[input_metadata.positions]
+        if cache is not None:
+            cache.update_seqlens(seqlens)
 
-#         for local_layer_id, layer in enumerate(self.layers.values()):
-#             if cache is not None:
-#                 assert input_metadata is not None
-#                 assert isinstance(input_metadata, CacheInputMetadata)
-#                 cache_view = cache.get_view(local_layer_id, input_metadata)
-#             else:
-#                 cache_view = None
-#             h = layer(h, freqs_cis, cache_view)
+        outs = self.output(self.norm(h))
+        return outs.float()
 
-#         if cache is not None:
-#             cache.update_seqlens(seqlens)
-#         if self.pipeline_rank < self.num_pipeline_ranks - 1:
-#             torch.distributed.send(h, dst=self.pipeline_rank + 1)
-#             return h  # type: ignore
-#         else:
-#             # Last rank has a final normalization step.
-#             assert self.norm is not None
-#             return self.norm(h)  # type: ignore
+    @staticmethod
+    def from_folder(folder: str) -> "Transformer":
+        folder = Path(folder)
+        with open(folder / "config.json", "r") as f:
+            model_args = ModelArgs.from_dict(json.load(f))
 
-#     def forward(
-#         self,
-#         input_ids: torch.Tensor,
-#         seqlens: List[int],
-#         cache: Optional[BufferCache] = None,
-#     ) -> torch.Tensor:
-#         h = self.forward_partial(input_ids, seqlens, cache=cache)
-#         if self.pipeline_rank < self.num_pipeline_ranks - 1:
-#             # ignore the intermediate activations as we'll get the final output from
-#             # the last stage
-#             outs = torch.empty(
-#                 h.shape[0], self.vocab_size, device=h.device, dtype=h.dtype
-#             )
-#         else:
-#             assert self.output is not None
-#             outs = self.output(h)
-#         if self.num_pipeline_ranks > 1:
-#             torch.distributed.broadcast(outs, src=self.num_pipeline_ranks - 1)
-#         return outs.float()
+        gpu_0 = torch.device("cuda:0")
+        non_experts = safetensors.torch.load_file(folder / "non-experts.safetensors", device=gpu_0)
+        experts = safetensors.torch.load_file(folder / "non-experts.safetensors", device="cpu")
 
-#     def load_state_dict(
-#         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
-#     ) -> None:
-#         state_to_load = {}
-#         skipped = set([])
-#         for k, v in state_dict.items():
-#             if k.startswith("tok_embeddings"):
-#                 if self.pipeline_rank == 0:
-#                     state_to_load[k] = v
-#                 else:
-#                     logging.debug(
-#                         "Skipping parameter %s at pipeline rank %d",
-#                         k,
-#                         self.pipeline_rank,
-#                     )
-#                     skipped.add(k)
-#             elif k.startswith("norm") or k.startswith("output"):
-#                 if self.pipeline_rank == self.num_pipeline_ranks - 1:
-#                     state_to_load[k] = v
-#                 else:
-#                     logging.debug(
-#                         "Skipping parameter %s at pipeline rank %d",
-#                         k,
-#                         self.pipeline_rank,
-#                     )
-#                     skipped.add(k)
-#             elif k.startswith("layers"):
-#                 layer_id = k.split(".")[1]
-#                 if layer_id in self.layers:
-#                     state_to_load[k] = v
-#                 else:
-#                     logging.debug(
-#                         "Skipping parameter %s at pipeline rank %d",
-#                         k,
-#                         self.pipeline_rank,
-#                     )
-#                     skipped.add(k)
-#             else:
-#                 raise ValueError(f"Unexpected key {k}")
-#         assert set(state_dict.keys()) == skipped.union(set(state_to_load.keys()))
-#         super().load_state_dict(state_to_load, strict=strict, assign=assign)
+        with torch.device("meta"):
+            model = Transformer(args=model_args, experts=experts)
+        model.load_state_dict(non_experts, assign=True, strict=True)
 
-#     @staticmethod
-#     def from_folder(
-#         folder: Union[Path, str],
-#         max_batch_size: int = 1,
-#         num_pipeline_ranks: int = 1,
-#         device: Union[torch.device, str] = "cuda",
-#         dtype: Optional[torch.dtype] = None,
-#     ) -> "Transformer":
-#         with open(Path(folder) / "params.json", "r") as f:
-#             model_args = TransformerArgs.from_dict(json.load(f))
-#         model_args.max_batch_size = max_batch_size
-#         if num_pipeline_ranks > 1:
-#             pipeline_rank = torch.distributed.get_rank()
-#         else:
-#             pipeline_rank = 0
-#         with torch.device("meta"):
-#             model = Transformer(
-#                 model_args,
-#                 pipeline_rank=pipeline_rank,
-#                 num_pipeline_ranks=num_pipeline_ranks,
-#             )
-
-#         pt_model_file = Path(folder) / "consolidated.00.pth"
-#         safetensors_model_file = Path(folder) / "consolidated.safetensors"
-
-#         assert (
-#             pt_model_file.exists() or safetensors_model_file.exists()
-#         ), f"Make sure either {pt_model_file} or {safetensors_model_file} exists"
-#         assert not (
-#             pt_model_file.exists() and safetensors_model_file.exists()
-#         ), f"Both {pt_model_file} and {safetensors_model_file} cannot exist"
-
-#         if pt_model_file.exists():
-#             loaded = torch.load(str(pt_model_file), mmap=True)
-#         else:
-#             loaded = safetensors.torch.load_file(str(safetensors_model_file))
-
-#         model.load_state_dict(loaded, assign=True, strict=True)
-
-#         return model.to(device=device, dtype=dtype)
+        return model
