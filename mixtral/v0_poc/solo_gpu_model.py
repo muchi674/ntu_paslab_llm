@@ -1,10 +1,9 @@
+import argparse
+import inspect
 import json
-import logging
-import math
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
-from typing import Any, List, Mapping, Optional, Tuple, Type, Union
+from typing import List, Optional, Tuple, Union
 
 import safetensors.torch
 
@@ -17,8 +16,11 @@ from xformers.ops.fmha.attn_bias import (  # type: ignore
     AttentionBias,
     BlockDiagonalCausalMask,
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
-    BlockDiagonalMask,
 )
+
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from mistral_common.protocol.instruct.messages import UserMessage
+from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
@@ -62,6 +64,14 @@ class ModelArgs:
     rms_norm_eps: float
     rope_theta: float
     vocab_size: int
+
+    # calculated after json.load()
+    head_dim: int = 0
+
+    @classmethod
+    def from_dict(cls, params: dict):
+        cls_params = inspect.signature(cls).parameters
+        return cls(**{k: v for k, v in params.items() if k in cls_params})
 
 
 @dataclass
@@ -251,7 +261,6 @@ class BufferCache:
         positions = torch.cat(
             [torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]
         ).to(device=self.device, dtype=torch.long)
-
         batch_idx = torch.tensor(
             sum([[i] * seqlen for i, seqlen in enumerate(seqlens)], []),
             device=self.device,
@@ -259,21 +268,12 @@ class BufferCache:
         )
         cache_positions = positions + batch_idx * self.max_seq_len
 
-        first_prefill = seqpos[0] == 0
-        subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
-        if first_prefill:
+        during_prefill = seqpos[0] == 0
+        if during_prefill:
             assert all([pos == 0 for pos in seqpos]), seqpos
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(
                 self.max_seq_len
             )
-        elif subsequent_prefill:
-            mask = BlockDiagonalMask.from_seqlens(
-                q_seqlen=seqlens,
-                kv_seqlen=[
-                    s + cached_s.clamp(max=self.max_seq_len).item()
-                    for (s, cached_s) in zip(seqlens, self.kv_seqlens)
-                ],
-            ).make_local_attention_from_bottomright(self.max_seq_len)
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
@@ -286,7 +286,7 @@ class BufferCache:
         return CacheInputMetadata(
             positions=positions,
             cache_positions=cache_positions,
-            prefill=first_prefill or subsequent_prefill,
+            prefill=during_prefill,
             mask=mask,
             seqlens=seqlens,
         )
@@ -298,7 +298,7 @@ class Attention(nn.Module):
         self.args = args
 
         self.n_heads: int = args.num_attention_heads
-        self.head_dim: int = args.hidden_size // args.num_attention_heads
+        self.head_dim: int = args.head_dim
         self.n_kv_heads: int = args.num_key_value_heads
 
         self.repeats = self.n_heads // self.n_kv_heads
@@ -428,15 +428,12 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Transformer:
+class Transformer(nn.Module):
     def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self._precomputed_freqs_cis: torch.Tensor = None
-        self.tok_embeddings: nn.Embedding = None
-        self.norm: RMSNorm = None
-        self.output: nn.Linear = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.output = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -477,48 +474,147 @@ class Transformer:
         self,
         input_ids: torch.Tensor,
         seqlens: List[int],
-        cache: Optional[BufferCache] = None,
+        cache: BufferCache,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
-        input_metadata: Union[CacheInputMetadata, SimpleInputMetadata]
-
-        if cache is not None:
-            input_metadata = cache.get_input_metadata(seqlens)
-        else:
-            input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
-
+        input_metadata = cache.get_input_metadata(seqlens)
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for li, layer in self.layers.items():
-            if cache is not None:
-                assert input_metadata is not None
-                assert isinstance(input_metadata, CacheInputMetadata)
-                cache_view = cache.get_view(li, input_metadata)
-            else:
-                cache_view = None
+            cache_view = cache.get_view(li, input_metadata)
             h = layer(h, freqs_cis, cache_view)
 
-        if cache is not None:
-            cache.update_seqlens(seqlens)
-
+        cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
         return outs.float()
 
     @staticmethod
-    def from_folder(folder: str) -> "Transformer":
-        folder = Path(folder)
-        with open(folder / "config.json", "r") as f:
+    def load(model_path: Path) -> "Transformer":
+        with open(model_path / "config.json", "r") as f:
             model_args = ModelArgs.from_dict(json.load(f))
+        model_args.head_dim = model_args.hidden_size // model_args.num_attention_heads
 
         gpu_0 = torch.device("cuda:0")
-        non_experts = safetensors.torch.load_file(folder / "non-experts.safetensors", device=gpu_0)
-        experts = safetensors.torch.load_file(folder / "non-experts.safetensors", device="cpu")
+        non_experts = safetensors.torch.load_file(
+            model_path / "non-experts.safetensors", device=gpu_0
+        )
+        experts = safetensors.torch.load_file(
+            model_path / "non-experts.safetensors", device="cpu"
+        )
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=experts)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
+
+
+@torch.inference_mode()
+def generate(
+    encoded_prompts: List[List[int]],
+    model: Transformer,
+    *,
+    max_tokens: int,
+    max_batch_size: int = 64,
+    temperature: float = 0.0,
+    eos_id: Optional[int] = None,
+) -> Tuple[List[List[int]], List[List[float]]]:
+    model = model.eval()
+    B, V = len(encoded_prompts), model.args.vocab_size
+
+    seqlens = [len(x) for x in encoded_prompts]
+
+    # Cache
+    cache_window = max(seqlens) + max_tokens
+    cache = BufferCache(
+        model.args.num_hidden_layers,
+        max_batch_size,
+        cache_window,
+        model.args.num_key_value_heads,
+        model.args.head_dim,
+    )
+    cache.to(device=model.device, dtype=model.dtype)
+    cache.reset()
+
+    # prefill
+    prelogits = model.forward(
+        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
+        seqlens=seqlens,
+        cache=cache,
+    )
+    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+    last_token_prelogits = prelogits.index_select(0, last_positions)
+
+    # decode
+    generated_tensors = []
+    is_finished = torch.tensor([False for _ in range(B)])
+
+    for _ in range(max_tokens):
+        next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
+        is_finished = is_finished | (next_token == eos_id).cpu()
+
+        if is_finished.all():
+            break
+
+        generated_tensors.append(next_token[:, None])
+        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+        assert last_token_prelogits.shape == (B, V)
+
+    generated_tokens: List[List[int]]
+    if generated_tensors:
+        generated_tokens = torch.cat(generated_tensors, 1).tolist()
+    else:
+        generated_tokens = []
+
+    return generated_tokens
+
+
+def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    if temperature > 0:
+        probs = torch.softmax(logits / temperature, dim=-1)
+        next_token = sample_top_p(probs, top_p)
+    else:
+        next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
+
+    return next_token.reshape(-1)
+
+
+def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+    assert 0 <= p <= 1
+
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    return torch.gather(probs_idx, -1, next_token)
+
+
+def main(model_path: str, prompt: str, max_tokens: int):
+    tokenizer = MistralTokenizer.v1()
+    completion_request = ChatCompletionRequest(messages=[UserMessage(content=prompt)])
+    tokens = tokenizer.encode_chat_completion(completion_request).tokens
+
+    model = Transformer.load(Path(model_path))
+    out_tkns = generate(
+        tokens,
+        model,
+        max_tokens=max_tokens,
+        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    )
+    result = tokenizer.decode(out_tkns[0])
+    print(f"RESPONSE:\n{result}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--max-tokens", type=int)
+    args = parser.parse_args()
+
+    main(args.model_path, args.prompt, args.max_tokens)
