@@ -62,11 +62,39 @@ class WeightsPreprocessor:
 
         return ws
 
+    def process_non_experts(self, ws: dict) -> None:
+        non_experts = {
+            "tok_embeddings.weight": ws.pop("model.embed_tokens.weight"),
+            "norm.weight": ws.pop("model.norm.weight"),
+            "lm_head.weight": ws.pop("lm_head.weight"),
+        }
+        for li in range(self.config["num_hidden_layers"]):
+            prefix = f"model.layers.{li}"
+            pfx = prefix[6:]
+            non_experts[f"{pfx}.attention_norm.weight"] = ws.pop(
+                f"{prefix}.input_layernorm.weight"
+            )
+            non_experts[f"{pfx}.ffn_norm.weight"] = ws.pop(
+                f"{prefix}.post_attention_layernorm.weight"
+            )
+            non_experts[f"{pfx}.feed_forward.gate.weight"] = ws.pop(
+                f"{prefix}.block_sparse_moe.gate.weight"
+            )
+            for pi in ["q", "k", "v", "o"]:
+                non_experts[f"{pfx}.attention.w{pi}.weight"] = ws.pop(
+                    f"{prefix}.self_attn.{pi}_proj.weight"
+                )
+
+        safetensors.torch.save_file(non_experts, self.output_path / f"non-experts.safetensors")
+        logging.info("finished processing non-expert weights")
+
+        return ws
+
     def start(self) -> None:
         ws = self.process_experts(self.load_weights())
         gc.collect()
-        safetensors.torch.save_file(ws, self.output_path / f"non-experts.safetensors")
-        logging.info("finished processing non-expert weights")
+        ws = self.process_non_experts(ws)
+        assert len(ws) == 0
 
 
 if __name__ == "__main__":

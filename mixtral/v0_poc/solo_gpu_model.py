@@ -1,9 +1,10 @@
 import argparse
 import inspect
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import safetensors.torch
 
@@ -359,7 +360,9 @@ class Attention(nn.Module):
 
 
 class Experts:
-    # tmp design: shared across layers
+    # tmp design:
+    # 1. shared across layers
+    # 2. weights and computation on CPU
 
     def __init__(self, ws: dict):
         self.ws = ws
@@ -386,7 +389,8 @@ class MoeLayer(nn.Module):
 
         for ei in range(self.num_local_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            ex = inputs[batch_idx].to("cpu")
+            ey = self.experts.forward(self.li, ei, ex).to(weights.device)
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         return results
 
@@ -432,11 +436,10 @@ class Transformer(nn.Module):
     def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args = args
-        self.vocab_size = args.vocab_size
         self._precomputed_freqs_cis: torch.Tensor = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.output = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(args=args, li=li, experts=experts)
@@ -483,12 +486,12 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
-        for li, layer in self.layers.items():
+        for li in range(self.args.num_hidden_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = layer(h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view)
 
         cache.update_seqlens(seqlens)
-        outs = self.output(self.norm(h))
+        outs = self.lm_head(self.norm(h))
         return outs.float()
 
     @staticmethod
@@ -497,16 +500,15 @@ class Transformer(nn.Module):
             model_args = ModelArgs.from_dict(json.load(f))
         model_args.head_dim = model_args.hidden_size // model_args.num_attention_heads
 
-        gpu_0 = torch.device("cuda:0")
         non_experts = safetensors.torch.load_file(
-            model_path / "non-experts.safetensors", device=gpu_0
+            model_path / "non-experts.safetensors", device="cuda:0"
         )
         experts = safetensors.torch.load_file(
-            model_path / "non-experts.safetensors", device="cpu"
+            model_path / "experts.safetensors", device="cpu"
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=experts)
+            model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -514,17 +516,25 @@ class Transformer(nn.Module):
 
 @torch.inference_mode()
 def generate(
-    encoded_prompts: List[List[int]],
+    prompts: List[str],
+    tokenizer: MistralTokenizer,
     model: Transformer,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
-) -> Tuple[List[List[int]], List[List[float]]]:
+) -> Tuple[List[List[int]], int, float, int, float]:
     model = model.eval()
-    B, V = len(encoded_prompts), model.args.vocab_size
+    tic = time.perf_counter()
 
+    encoded_prompts: List[List[int]] = [
+        tokenizer.encode_chat_completion(
+            ChatCompletionRequest(messages=[UserMessage(content=p)])
+        ).tokens
+        for p in prompts
+    ]
+    B, V = len(encoded_prompts), model.args.vocab_size
     seqlens = [len(x) for x in encoded_prompts]
 
     # Cache
@@ -539,7 +549,7 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
-    # prefill
+    # prefill / prompt evaluation stage
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
@@ -547,6 +557,8 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
+    prefill_time = time.perf_counter() - tic
+    tic = time.perf_counter()
 
     # decode
     generated_tensors = []
@@ -568,8 +580,16 @@ def generate(
         generated_tokens = torch.cat(generated_tensors, 1).tolist()
     else:
         generated_tokens = []
+    responses = [tokenizer.decode(y) for y in generated_tokens]
+    decode_time = time.perf_counter() - tic
 
-    return generated_tokens
+    return (
+        responses,
+        sum(seqlens),
+        prefill_time,
+        sum(len(y) for y in generated_tokens),
+        decode_time,
+    )
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -594,20 +614,26 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def main(model_path: str, prompt: str, max_tokens: int):
+def main(model_path: str, prompts: List[str], max_tokens: int):
     tokenizer = MistralTokenizer.v1()
-    completion_request = ChatCompletionRequest(messages=[UserMessage(content=prompt)])
-    tokens = tokenizer.encode_chat_completion(completion_request).tokens
-
     model = Transformer.load(Path(model_path))
-    out_tkns = generate(
-        tokens,
+    responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
+        prompts,
+        tokenizer,
         model,
         max_tokens=max_tokens,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
-    result = tokenizer.decode(out_tkns[0])
-    print(f"RESPONSE:\n{result}")
+    print("PROMPT EVALUATION:")
+    print(f"token count: {n_p_tkns}")
+    print(f"total time in sec(s): {prefill_time}")
+    print(f"throughput: {(n_p_tkns / prefill_time):.3f} t/s")
+    print("TOKEN GENERATION:")
+    print(f"token count: {n_gen_tkns}")
+    print(f"total time in sec(s): {decode_time}")
+    print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
+    print("RESPONSE:")
+    print("\n".join(responses))
 
 
 if __name__ == "__main__":
@@ -617,4 +643,4 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args()
 
-    main(args.model_path, args.prompt, args.max_tokens)
+    main(args.model_path, [args.prompt], args.max_tokens)
