@@ -52,6 +52,11 @@ def repeat_kv(
     return keys, values
 
 
+def get_json(file_path: Path) -> dict:
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+
 @dataclass
 class ModelArgs:
     # follows hf weights config.json
@@ -496,8 +501,7 @@ class Transformer(nn.Module):
 
     @staticmethod
     def load(model_path: Path) -> "Transformer":
-        with open(model_path / "config.json", "r") as f:
-            model_args = ModelArgs.from_dict(json.load(f))
+        model_args = ModelArgs.from_dict(get_json(model_path / "config.json"))
         model_args.head_dim = model_args.hidden_size // model_args.num_attention_heads
 
         non_experts = safetensors.torch.load_file(
@@ -524,7 +528,7 @@ def generate(
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
-) -> Tuple[List[List[int]], int, float, int, float]:
+) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
     tic = time.perf_counter()
 
@@ -614,7 +618,8 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def main(model_path: str, prompts: List[str], max_tokens: int):
+def main(model_path: str, prompt: str, prompt_path: str, max_tokens: int):
+    prompts = get_json(Path(prompt_path))["prompts"] if not prompt else [prompt]
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path))
     responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
@@ -624,6 +629,8 @@ def main(model_path: str, prompts: List[str], max_tokens: int):
         max_tokens=max_tokens,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
+    print("=" * 20)
+    print("PERFORMANCE BREAKDOWN\n")
     print("PROMPT EVALUATION:")
     print(f"token count: {n_p_tkns}")
     print(f"total time in sec(s): {prefill_time}")
@@ -631,16 +638,23 @@ def main(model_path: str, prompts: List[str], max_tokens: int):
     print("TOKEN GENERATION:")
     print(f"token count: {n_gen_tkns}")
     print(f"total time in sec(s): {decode_time}")
-    print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
-    print("RESPONSE:")
-    print("\n".join(responses))
+    if n_gen_tkns > 0:
+        print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
+    else:
+        responses = ["" for _ in prompts]
+    print("=" * 20)
+    print("In-n-Outs\n")
+    for p, resp in zip(prompts, responses):
+        print(f"PROMPT:\n{p}")
+        print(f"RESPONSE:\n{resp}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args()
 
-    main(args.model_path, [args.prompt], args.max_tokens)
+    main(args.model_path, args.prompt, args.prompt_path, args.max_tokens)
