@@ -490,12 +490,12 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, gpu: torch.device) -> "Transformer":
+    def load(model_path: Path) -> "Transformer":
         model_args = ModelArgs.from_dict(get_json(model_path / "params.json"))
 
         non_experts = torch.load(
             model_path / "non-experts.pt",
-            map_location=gpu,
+            map_location=torch.device("cuda:0"),
             mmap=True,
         )
         experts = torch.load(
@@ -514,7 +514,6 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    gpu: torch.device,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -522,9 +521,6 @@ def generate(
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
-    prefill_tic = torch.cuda.Event(enable_timing=True)
-    prefill_toc = torch.cuda.Event(enable_timing=True)
-    prefill_tic.record()
 
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
@@ -555,14 +551,10 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
-    prefill_toc.record()
-    torch.cuda.synchronize(device=gpu)
-    prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
+    prefill_time = time.perf_counter() - tic
+    tic = time.perf_counter()
 
     # decode
-    decode_tic = torch.cuda.Event(enable_timing=True)
-    decode_toc = torch.cuda.Event(enable_timing=True)
-    decode_tic.record()
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
@@ -583,9 +575,7 @@ def generate(
     else:
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
-    decode_toc.record()
-    torch.cuda.synchronize(device=gpu)
-    decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
+    decode_time = time.perf_counter() - tic
 
     return (
         responses,
@@ -618,26 +608,16 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def main(
-    model_path: str, prompt: str, prompt_path: str, n_prompts: int, max_tokens: int
-):
-    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    gpu_0 = torch.device("cuda:0")
-    prompts: list[str] = None
-    if prompt:
-        prompts = [prompt]
-    else:
-        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
-        prompts = dataset[:n_prompts]
+def main(model_path: str, prompt: str, prompt_path: str, max_tokens: int):
+    prompts = get_json(Path(prompt_path))["prompts"] if not prompt else [prompt]
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu_0)
+    model = Transformer.load(Path(model_path))
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        gpu_0,
         max_tokens=1,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
@@ -646,7 +626,6 @@ def main(
         prompts,
         tokenizer,
         model,
-        gpu_0,
         max_tokens=max_tokens,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
@@ -675,10 +654,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
-    parser.add_argument("--n-prompts", type=int)
     parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args()
 
-    main(
-        args.model_path, args.prompt, args.prompt_path, args.n_prompts, args.max_tokens
-    )
+    main(args.model_path, args.prompt, args.prompt_path, args.max_tokens)
