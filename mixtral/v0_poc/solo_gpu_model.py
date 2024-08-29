@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import safetensors.torch
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -59,20 +57,16 @@ def get_json(file_path: Path) -> dict:
 
 @dataclass
 class ModelArgs:
-    # follows hf weights config.json
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    num_local_experts: int
-    num_experts_per_tok: int
-    rms_norm_eps: float
-    rope_theta: float
+    dim: int
+    n_layers: int
+    head_dim: int
+    hidden_dim: int
+    n_heads: int
+    n_kv_heads: int
+    norm_eps: float
     vocab_size: int
-
-    # calculated after json.load()
-    head_dim: int = 0
+    rope_theta: float
+    moe: dict
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -303,22 +297,18 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
 
-        self.n_heads: int = args.num_attention_heads
+        self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
-        self.n_kv_heads: int = args.num_key_value_heads
+        self.n_kv_heads: int = args.n_kv_heads
 
         self.repeats = self.n_heads // self.n_kv_heads
 
-        self.scale = self.head_dim**-0.5
+        self.scale = self.args.head_dim**-0.5
 
-        self.wq = nn.Linear(args.hidden_size, self.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(
-            args.hidden_size, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.wv = nn.Linear(
-            args.hidden_size, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.wo = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=False)
+        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
     def forward(
         self,
@@ -380,8 +370,8 @@ class Experts:
 class MoeLayer(nn.Module):
     def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
         super().__init__()
-        self.num_local_experts: int = args.num_local_experts
-        self.num_experts_per_tok: int = args.num_experts_per_tok
+        self.num_experts: int = args.moe["num_experts"]
+        self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
         self.experts = experts
@@ -391,8 +381,7 @@ class MoeLayer(nn.Module):
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
-
-        for ei in range(self.num_local_experts):
+        for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             ex = inputs[batch_idx].to("cpu")
             ey = self.experts.forward(self.li, ei, ex).to(weights.device)
@@ -418,12 +407,12 @@ class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
         self.attention = Attention(args)
-        self.attention_norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.ffn_norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
             args=args,
             li=li,
-            gate=nn.Linear(args.hidden_size, args.num_local_experts, bias=False),
+            gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
         )
 
@@ -442,13 +431,13 @@ class Transformer(nn.Module):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
-        self.tok_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(args=args, li=li, experts=experts)
-                for li in range(args.num_hidden_layers)
+                for li in range(args.n_layers)
             }
         )
 
@@ -469,7 +458,7 @@ class Transformer(nn.Module):
             # default to 10**6
             theta = self.args.rope_theta or 1000000.0
             self._precomputed_freqs_cis = precompute_freqs_cis(
-                self.args.hidden_size // self.args.num_attention_heads, 128_000, theta
+                self.args.head_dim, 128_000, theta
             )
 
         if self._precomputed_freqs_cis.device != self.device:
@@ -491,24 +480,25 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
-        for li in range(self.args.num_hidden_layers):
+        for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
         cache.update_seqlens(seqlens)
-        outs = self.lm_head(self.norm(h))
+        outs = self.output(self.norm(h))
         return outs.float()
 
     @staticmethod
     def load(model_path: Path) -> "Transformer":
-        model_args = ModelArgs.from_dict(get_json(model_path / "config.json"))
-        model_args.head_dim = model_args.hidden_size // model_args.num_attention_heads
+        model_args = ModelArgs.from_dict(get_json(model_path / "params.json"))
 
-        non_experts = safetensors.torch.load_file(
-            model_path / "non-experts.safetensors", device="cuda:0"
+        non_experts = torch.load(
+            model_path / "non-experts.pt",
+            map_location=torch.device("cuda:0"),
+            mmap=True,
         )
-        experts = safetensors.torch.load_file(
-            model_path / "experts.safetensors", device="cpu"
+        experts = torch.load(
+            model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
         )
 
         with torch.device("meta"):
@@ -544,10 +534,10 @@ def generate(
     # Cache
     cache_window = max(seqlens) + max_tokens
     cache = BufferCache(
-        model.args.num_hidden_layers,
+        model.args.n_layers,
         max_batch_size,
         cache_window,
-        model.args.num_key_value_heads,
+        model.args.n_kv_heads,
         model.args.head_dim,
     )
     cache.to(device=model.device, dtype=model.dtype)
@@ -622,6 +612,16 @@ def main(model_path: str, prompt: str, prompt_path: str, max_tokens: int):
     prompts = get_json(Path(prompt_path))["prompts"] if not prompt else [prompt]
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path))
+
+    # warmup
+    generate(
+        ["hello, how are you?"],
+        tokenizer,
+        model,
+        max_tokens=1,
+        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    )
+
     responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
         prompts,
         tokenizer,
