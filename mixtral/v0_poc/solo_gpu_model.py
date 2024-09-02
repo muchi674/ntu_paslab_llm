@@ -1,3 +1,5 @@
+#!/home/joe/miniconda3/envs/mixtral/bin/python
+
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -577,8 +579,10 @@ def generate(
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
+    n_gen_tkns = 0
     if generated_tensors:
         generated_tokens = torch.cat(generated_tensors, 1).tolist()
+        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
     else:
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
@@ -591,7 +595,7 @@ def generate(
         responses,
         sum(seqlens),
         prefill_time,
-        sum(len(y) for y in generated_tokens),
+        n_gen_tkns,
         decode_time,
     )
 

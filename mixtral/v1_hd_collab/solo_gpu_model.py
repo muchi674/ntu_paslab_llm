@@ -1,8 +1,9 @@
+#!/home/joe/miniconda3/envs/mixtral/bin/python
+
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
 import json
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -364,8 +365,10 @@ class Experts:
         self.ws = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w = self.ws[f"{li}.{ei}"]
-        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]  # type: ignore
+        w: torch.Tensor = self.ws[f"{li}.{ei}"]
+        ex = x.to(w.device)
+        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
+        return ey.to(x.device)  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -384,8 +387,7 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            ex = inputs[batch_idx].to("cpu")
-            ey = self.experts.forward(self.li, ei, ex).to(weights.device)
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         return results
 
@@ -490,17 +492,21 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_dict(get_json(model_path / "params.json"))
 
         non_experts = torch.load(
             model_path / "non-experts.pt",
-            map_location=torch.device("cuda:0"),
+            map_location=gpu,
             mmap=True,
         )
         experts = torch.load(
             model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
         )
+
+        for li in range(model_args.n_layers):
+            ei = li % 8
+            experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -514,6 +520,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
+    gpu: torch.device,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -521,6 +528,9 @@ def generate(
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
+    prefill_tic = torch.cuda.Event(enable_timing=True)
+    prefill_toc = torch.cuda.Event(enable_timing=True)
+    prefill_tic.record()
 
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
@@ -551,10 +561,14 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
-    prefill_time = time.perf_counter() - tic
-    tic = time.perf_counter()
+    prefill_toc.record()
+    torch.cuda.synchronize(device=gpu)
+    prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
 
     # decode
+    decode_tic = torch.cuda.Event(enable_timing=True)
+    decode_toc = torch.cuda.Event(enable_timing=True)
+    decode_tic.record()
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
@@ -570,18 +584,23 @@ def generate(
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
+    n_gen_tkns = 0
     if generated_tensors:
         generated_tokens = torch.cat(generated_tensors, 1).tolist()
+        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
     else:
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
-    decode_time = time.perf_counter() - tic
+    decode_toc.record()
+    torch.cuda.synchronize(device=gpu)
+    decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
 
     return (
+        seqlens,
         responses,
         sum(seqlens),
         prefill_time,
-        sum(len(y) for y in generated_tokens),
+        n_gen_tkns,
         decode_time,
     )
 
@@ -608,25 +627,44 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def main(model_path: str, prompt: str, prompt_path: str, max_tokens: int):
-    prompts = get_json(Path(prompt_path))["prompts"] if not prompt else [prompt]
+def main(
+    model_path: str,
+    prompt: str,
+    prompt_path: str,
+    n_prompts: int,
+    max_tokens: int,
+    hide_resp: bool,
+):
+    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    gpu_0 = torch.device("cuda:0")
+    prompts: list[str] = None
+    if prompt:
+        prompts = [prompt]
+    else:
+        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
+        n_repeats = -(n_prompts // -len(dataset))  # ceil division
+        prompts = (dataset * n_repeats)[:n_prompts]
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path))
+    model = Transformer.load(Path(model_path), gpu_0)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
+        gpu_0,
         max_tokens=1,
+        max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
+    seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
         prompts,
         tokenizer,
         model,
+        gpu_0,
         max_tokens=max_tokens,
+        max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
     print("=" * 20)
@@ -642,11 +680,13 @@ def main(model_path: str, prompt: str, prompt_path: str, max_tokens: int):
         print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
     else:
         responses = ["" for _ in prompts]
-    print("=" * 20)
-    print("In-n-Outs\n")
-    for p, resp in zip(prompts, responses):
-        print(f"PROMPT:\n{p}")
-        print(f"RESPONSE:\n{resp}\n")
+    if not hide_resp:
+        print("=" * 20)
+        print("In-n-Outs")
+        print(f"seqlens: {seqlens}\n")
+        for p, resp in zip(prompts, responses):
+            print(f"PROMPT:\n{p}")
+            print(f"RESPONSE:\n{resp}\n")
 
 
 if __name__ == "__main__":
@@ -654,7 +694,16 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
+    parser.add_argument("--n-prompts", type=int)
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
-    main(args.model_path, args.prompt, args.prompt_path, args.max_tokens)
+    main(
+        args.model_path,
+        args.prompt,
+        args.prompt_path,
+        args.n_prompts,
+        args.max_tokens,
+        args.hide_resp,
+    )
