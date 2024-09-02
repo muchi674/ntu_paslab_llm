@@ -587,6 +587,7 @@ def generate(
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
 
     return (
+        seqlens,
         responses,
         sum(seqlens),
         prefill_time,
@@ -618,7 +619,12 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
 
 def main(
-    model_path: str, prompt: str, prompt_path: str, n_prompts: int, max_tokens: int
+    model_path: str,
+    prompt: str,
+    prompt_path: str,
+    n_prompts: int,
+    max_tokens: int,
+    hide_resp: bool,
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
     gpu_0 = torch.device("cuda:0")
@@ -627,7 +633,8 @@ def main(
         prompts = [prompt]
     else:
         dataset: list[str] = get_json(Path(prompt_path))["prompts"]
-        prompts = dataset[:n_prompts]
+        n_repeats = -(n_prompts // -len(dataset))  # ceil division
+        prompts = (dataset * n_repeats)[:n_prompts]
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), gpu_0)
 
@@ -638,15 +645,17 @@ def main(
         model,
         gpu_0,
         max_tokens=1,
+        max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
+    seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
         prompts,
         tokenizer,
         model,
         gpu_0,
         max_tokens=max_tokens,
+        max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
     print("=" * 20)
@@ -662,11 +671,13 @@ def main(
         print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
     else:
         responses = ["" for _ in prompts]
-    print("=" * 20)
-    print("In-n-Outs\n")
-    for p, resp in zip(prompts, responses):
-        print(f"PROMPT:\n{p}")
-        print(f"RESPONSE:\n{resp}\n")
+    if not hide_resp:
+        print("=" * 20)
+        print("In-n-Outs")
+        print(f"seqlens: {seqlens}\n")
+        for p, resp in zip(prompts, responses):
+            print(f"PROMPT:\n{p}")
+            print(f"RESPONSE:\n{resp}\n")
 
 
 if __name__ == "__main__":
@@ -676,8 +687,14 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int)
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
     main(
-        args.model_path, args.prompt, args.prompt_path, args.n_prompts, args.max_tokens
+        args.model_path,
+        args.prompt,
+        args.prompt_path,
+        args.n_prompts,
+        args.max_tokens,
+        args.hide_resp,
     )
