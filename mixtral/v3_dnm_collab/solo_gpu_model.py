@@ -6,6 +6,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import List, Optional, Tuple
 
 import torch
@@ -24,7 +25,7 @@ from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
 MEMCPY_COST = 4  # N different expert's calculations on CPU
-IN_CACHE_COST = 3 / 4
+IN_CACHE_COST = 0.025
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
@@ -409,6 +410,7 @@ class MoeLayer(nn.Module):
             if spares - load >= MEMCPY_COST:
                 worthy.append(ei)
                 del unworthy[ei]
+                spares -= load
             else:
                 unworthy[ei] = inputs[jobs[ei][0]].to("cpu")
 
@@ -427,18 +429,19 @@ class MoeLayer(nn.Module):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
-        cpu_eys: list[tuple[torch.Tensor, torch.Tensor]] = []
+        cpu_eys: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for ei, ex in unworthy.items():
             batch_idx, nth_expert = jobs[ei]
             cpu_eys.append(
                 (
+                    batch_idx,
                     weights[batch_idx, nth_expert, None],
                     self.experts.forward(self.li, ei, ex),
                 )
             )
 
         torch.cuda.synchronize()
-        for w, ey in cpu_eys:
+        for batch_idx, w, ey in cpu_eys:
             results[batch_idx] += w * ey.to(w.device)
 
         return results
@@ -555,10 +558,6 @@ class Transformer(nn.Module):
         experts: dict[str, torch.Tensor] = torch.load(
             model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
         )
-
-        # for li in range(model_args.n_layers):
-        #     for ei in range(model_args.moe["num_experts"]):
-        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].pin_memory()
 
         for li in range(model_args.n_layers):
             static_e = li % model_args.moe["num_experts"]
@@ -745,6 +744,7 @@ def main(
     if not hide_resp:
         print("=" * 20)
         print("In-n-Outs")
+        print(f"AVG seqlen: {mean(seqlens)}")
         print(f"seqlens: {seqlens}\n")
         for p, resp in zip(prompts, responses):
             print(f"PROMPT:\n{p}")
