@@ -23,6 +23,9 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+MEMCPY_COST = 4  # N different expert's calculations on CPU
+IN_CACHE_COST = 3 / 4
+
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -362,13 +365,11 @@ class Experts:
     # 2. CPU and GPU computations are not overlapped
 
     def __init__(self, ws: dict):
-        self.ws = ws
+        self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        ex = x.to(w.device)
-        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device)  # type: ignore
+        w = self.ws[f"{li}.{ei}"].to(x.device, non_blocking=True)
+        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -379,16 +380,67 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.static_e = self.li % self.num_experts
+
+    def allocate(
+        self, selected_experts: torch.Tensor, inputs: torch.Tensor
+    ) -> tuple[list, list, dict]:
+        jobs = []
+        worthy = []
+        unworthy = {}  # initially dict[int, int], later dict[int, torch.Tensor]
+        spares = 0
+        for ei in range(self.num_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            load = (
+                1 + (batch_idx.shape[0] - 1) * IN_CACHE_COST
+                if batch_idx.shape[0]
+                else 0
+            )
+            jobs.append((batch_idx, nth_expert))
+            if ei == self.static_e or load >= MEMCPY_COST:
+                worthy.append(ei)
+            elif load > 0:  # filtering out unselected experts
+                spares += load
+                unworthy[ei] = load
+
+        for ei, load in sorted(
+            unworthy.items(), key=lambda item: item[1], reverse=True
+        ):
+            if spares - load >= MEMCPY_COST:
+                worthy.append(ei)
+                del unworthy[ei]
+            else:
+                unworthy[ei] = inputs[jobs[ei][0]].to("cpu")
+
+        return jobs, worthy, unworthy
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
+        jobs, worthy, unworthy = self.allocate(selected_experts, inputs)
+
+        # TODO: static_e should work first to enable more memcpy overlap
+        for ei in worthy:
+            batch_idx, nth_expert = jobs[ei]
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+
+        cpu_eys: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for ei, ex in unworthy.items():
+            batch_idx, nth_expert = jobs[ei]
+            cpu_eys.append(
+                (
+                    weights[batch_idx, nth_expert, None],
+                    self.experts.forward(self.li, ei, ex),
+                )
+            )
+
+        torch.cuda.synchronize()
+        for w, ey in cpu_eys:
+            results[batch_idx] += w * ey.to(w.device)
+
         return results
 
 
@@ -500,13 +552,22 @@ class Transformer(nn.Module):
             map_location=gpu,
             mmap=True,
         )
-        experts = torch.load(
+        experts: dict[str, torch.Tensor] = torch.load(
             model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
         )
 
+        # for li in range(model_args.n_layers):
+        #     for ei in range(model_args.moe["num_experts"]):
+        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].pin_memory()
+
         for li in range(model_args.n_layers):
-            ei = li % 8
-            experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+            static_e = li % model_args.moe["num_experts"]
+            for ei in range(model_args.moe["num_experts"]):
+                experts[f"{li}.{ei}"] = (
+                    experts[f"{li}.{ei}"].to(gpu)
+                    if ei == static_e
+                    else experts[f"{li}.{ei}"].pin_memory()
+                )
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -657,6 +718,7 @@ def main(
         max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
+    print("finished warming up")
 
     seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
         prompts,

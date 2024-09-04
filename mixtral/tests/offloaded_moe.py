@@ -79,7 +79,7 @@ def main(model_path: str):
     x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
     x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
     ys = []
-    N = 100
+    N = 1000
 
     # -------------------------------------------------------------------------------------
 
@@ -186,6 +186,19 @@ def main(model_path: str):
     #     f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms"
     # )
 
+    # -------------------------------------------------------------------------------------
+    n_warmups = 10
+    cpu_x = x.to("cpu")
+
+    # warmup
+    for _ in range(n_warmups):
+        w = ws["0.0"]
+        (nn.functional.silu(cpu_x @ w[0].T) * (cpu_x @ w[2].T)) @ w[1]
+
+    latencies = []
+    for _ in range(N):
+        w = ws["0.0"]
+        (nn.functional.silu(cpu_x @ w[0].T) * (cpu_x @ w[2].T)) @ w[1]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

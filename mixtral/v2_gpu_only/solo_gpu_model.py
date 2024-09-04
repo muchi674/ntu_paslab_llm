@@ -362,13 +362,11 @@ class Experts:
     # 2. CPU and GPU computations are not overlapped
 
     def __init__(self, ws: dict):
-        self.ws = ws
+        self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        ex = x.to(w.device)
-        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device)  # type: ignore
+        w = self.ws[f"{li}.{ei}"].to(x.device, non_blocking=True)
+        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -387,6 +385,8 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
+            if batch_idx.shape[0] == 0:
+                continue
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         return results
@@ -500,13 +500,22 @@ class Transformer(nn.Module):
             map_location=gpu,
             mmap=True,
         )
-        experts = torch.load(
+        experts: dict[str, torch.Tensor] = torch.load(
             model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
         )
 
+        # for li in range(model_args.n_layers):
+        #     for ei in range(model_args.moe["num_experts"]):
+        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].pin_memory()
+
         for li in range(model_args.n_layers):
-            ei = li % 8
-            experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+            static_e = li % model_args.moe["num_experts"]
+            for ei in range(model_args.moe["num_experts"]):
+                experts[f"{li}.{ei}"] = (
+                    experts[f"{li}.{ei}"].to(gpu)
+                    if ei == static_e
+                    else experts[f"{li}.{ei}"].pin_memory()
+                )
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -657,6 +666,7 @@ def main(
         max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
+    print("finished warming up")
 
     seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
         prompts,
