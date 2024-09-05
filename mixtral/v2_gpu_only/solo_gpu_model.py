@@ -6,6 +6,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import List, Optional, Tuple
 
 import torch
@@ -681,18 +682,19 @@ def main(
     print("PERFORMANCE BREAKDOWN\n")
     print("PROMPT EVALUATION:")
     print(f"token count: {n_p_tkns}")
-    print(f"total time in sec(s): {prefill_time}")
-    print(f"throughput: {(n_p_tkns / prefill_time):.3f} t/s")
+    print(f"total time in sec(s): {prefill_time:.2f}")
+    print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
     print("TOKEN GENERATION:")
     print(f"token count: {n_gen_tkns}")
-    print(f"total time in sec(s): {decode_time}")
+    print(f"total time in sec(s): {decode_time:.2f}")
     if n_gen_tkns > 0:
-        print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
+        print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
     else:
         responses = ["" for _ in prompts]
     if not hide_resp:
         print("=" * 20)
         print("In-n-Outs")
+        print(f"AVG seqlen: {mean(seqlens)}")
         print(f"seqlens: {seqlens}\n")
         for p, resp in zip(prompts, responses):
             print(f"PROMPT:\n{p}")

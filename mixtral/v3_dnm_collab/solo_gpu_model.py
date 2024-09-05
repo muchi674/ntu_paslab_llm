@@ -732,13 +732,13 @@ def main(
     print("PERFORMANCE BREAKDOWN\n")
     print("PROMPT EVALUATION:")
     print(f"token count: {n_p_tkns}")
-    print(f"total time in sec(s): {prefill_time}")
-    print(f"throughput: {(n_p_tkns / prefill_time):.3f} t/s")
+    print(f"total time in sec(s): {prefill_time:.2f}")
+    print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
     print("TOKEN GENERATION:")
     print(f"token count: {n_gen_tkns}")
-    print(f"total time in sec(s): {decode_time}")
+    print(f"total time in sec(s): {decode_time:.2f}")
     if n_gen_tkns > 0:
-        print(f"throughput: {(n_gen_tkns / decode_time):.3f} t/s")
+        print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
     else:
         responses = ["" for _ in prompts]
     if not hide_resp:
