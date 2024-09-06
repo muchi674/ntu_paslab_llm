@@ -418,7 +418,7 @@ class MoeLayer(nn.Module):
                 self.li, ei, inputs[batch_idx], on_gpu_cnt
             )  # perf_analysis
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        ACT_STATS[self.li].append(on_gpu_cnt / inputs.shape[0] * 2)  # perf_analysis
+        ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))  # perf_analysis
         return results
 
 
@@ -597,10 +597,9 @@ def generate(
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
     if verbose:  # perf_analysis
-        print(
-            "PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n",
-            [ACT_STATS[li][0] for li in range(32)],
-        )
+        on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
+        print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}")
 
     # decode
     reset_perf_logs()  # perf_analysis
@@ -633,10 +632,9 @@ def generate(
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
     if verbose:  # perf_analysis
-        print(
-            "PCT OF EXPERT CALCS ON GPU DURING DECODE:\n",
-            [mean(ACT_STATS[li]) for li in range(32)],
-        )
+        on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
+        print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}") # average of averages
 
     return (
         seqlens,

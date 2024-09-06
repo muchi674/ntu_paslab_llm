@@ -26,6 +26,12 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
 MEMCPY_COST = 4  # N different expert's calculations on CPU
 IN_CACHE_COST = 0.025
+ACT_STATS = None
+
+
+def reset_perf_logs():
+    global ACT_STATS
+    ACT_STATS = {li: [] for li in range(32)}
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
@@ -390,6 +396,7 @@ class MoeLayer(nn.Module):
         worthy = []
         unworthy = {}  # initially dict[int, int], later dict[int, torch.Tensor]
         spares = 0
+        on_gpu_cnt = 0  # perf_analysis
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             load = (
@@ -400,6 +407,7 @@ class MoeLayer(nn.Module):
             jobs.append((batch_idx, nth_expert))
             if ei == self.static_e or load >= MEMCPY_COST:
                 worthy.append(ei)
+                on_gpu_cnt += batch_idx.shape[0]  # perf_analysis
             elif load > 0:  # filtering out unselected experts
                 spares += load
                 unworthy[ei] = load
@@ -411,8 +419,11 @@ class MoeLayer(nn.Module):
                 worthy.append(ei)
                 del unworthy[ei]
                 spares -= load
+                on_gpu_cnt += jobs[ei][0].shape[0]  # perf_analysis
             else:
                 unworthy[ei] = inputs[jobs[ei][0]].to("cpu")
+
+        ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))
 
         return jobs, worthy, unworthy
 
@@ -586,6 +597,7 @@ def generate(
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
+    verbose: bool = False,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
     prefill_tic = torch.cuda.Event(enable_timing=True)
@@ -614,6 +626,7 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
+    reset_perf_logs()  # perf_analysis
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
@@ -624,8 +637,13 @@ def generate(
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
+    if verbose:  # perf_analysis
+        on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
+        print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}")
 
     # decode
+    reset_perf_logs()  # perf_analysis
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
@@ -654,6 +672,10 @@ def generate(
     decode_toc.record()
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
+    if verbose:  # perf_analysis
+        on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
+        print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}") # average of averages
 
     return (
         seqlens,
@@ -727,6 +749,7 @@ def main(
         max_tokens=max_tokens,
         max_batch_size=len(prompts),
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        verbose=True,  # perf_analysis
     )
     print("=" * 20)
     print("PERFORMANCE BREAKDOWN\n")
