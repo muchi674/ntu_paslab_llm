@@ -387,7 +387,7 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.static_e = self.li % self.num_experts
+        self.static_e = 0
 
     def allocate(
         self, selected_experts: torch.Tensor, inputs: torch.Tensor
@@ -418,7 +418,7 @@ class MoeLayer(nn.Module):
             if spares - load >= MEMCPY_COST:
                 worthy.append(ei)
                 del unworthy[ei]
-                spares -= load
+                spares -= load + MEMCPY_COST
                 on_gpu_cnt += jobs[ei][0].shape[0]  # perf_analysis
             else:
                 unworthy[ei] = inputs[jobs[ei][0]].to("cpu")
@@ -571,11 +571,16 @@ class Transformer(nn.Module):
         )
 
         for li in range(model_args.n_layers):
-            static_e = li % model_args.moe["num_experts"]
+            # static_e = li % model_args.moe["num_experts"]
             for ei in range(model_args.moe["num_experts"]):
+                # experts[f"{li}.{ei}"] = (
+                #     experts[f"{li}.{ei}"].to(gpu)
+                #     if ei == static_e
+                #     else experts[f"{li}.{ei}"].pin_memory()
+                # )
                 experts[f"{li}.{ei}"] = (
                     experts[f"{li}.{ei}"].to(gpu)
-                    if ei == static_e
+                    if ei == 0
                     else experts[f"{li}.{ei}"].pin_memory()
                 )
 

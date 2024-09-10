@@ -414,6 +414,7 @@ class MoeLayer(nn.Module):
         on_gpu_cnt = 0  # perf_analysis
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
+            # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             ey, on_gpu_cnt = self.experts.forward(
                 self.li, ei, inputs[batch_idx], on_gpu_cnt
             )  # perf_analysis
@@ -535,8 +536,9 @@ class Transformer(nn.Module):
         )
 
         for li in range(model_args.n_layers):
-            ei = li % 8
-            experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+            # ei = li % 8
+            # experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+            experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -634,7 +636,7 @@ def generate(
     if verbose:  # perf_analysis
         on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
         print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}") # average of averages
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
 
     return (
         seqlens,
