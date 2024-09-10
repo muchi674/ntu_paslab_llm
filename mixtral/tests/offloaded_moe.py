@@ -67,19 +67,22 @@ def get_json(file_path: Path) -> dict:
 def main(model_path: str):
 
     model_path = Path(model_path)
-    configs = get_json(model_path / "config.json")
+    # configs = get_json(model_path / "config.json")
     gpu_0 = torch.device("cuda:0")
-    ws = safetensors.torch.load_file(model_path / "experts.safetensors", device="cpu")
+    # ws = safetensors.torch.load_file(model_path / "experts.safetensors", device="cpu")
+    ws: dict[str, torch.Tensor] = torch.load(
+        model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
+    )
 
-    for k in ws:
-        ws[k] = ws[k].pin_memory()
-    gc.collect()
+    # for k in ws:
+    #     ws[k] = ws[k].pin_memory()
+    # gc.collect()
 
-    x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
-    x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
-    x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
+    # x = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0)
+    # x1 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 2
+    # x2 = torch.ones(1, configs["hidden_size"], dtype=torch.bfloat16, device=gpu_0) * 3
     ys = []
-    N = 100
+    N = 10
 
     # -------------------------------------------------------------------------------------
 
@@ -185,6 +188,27 @@ def main(model_path: str):
     # print(
     #     f"each layer took {start.elapsed_time(end) / N / configs['num_hidden_layers']} ms"
     # )
+
+    # -------------------------------------------------------------------------------------
+    n_warmups = 10
+    x = torch.ones(2, 4096, dtype=torch.bfloat16, device="cpu")
+
+    # warmup
+    for _ in range(n_warmups):
+        w = ws["0.0"]
+        (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]
+
+    latencies = []
+    for _ in range(N):
+        w = ws["0.0"]
+        tic = time.perf_counter()
+        # for _ in range(128):
+        #     (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]
+        (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]
+        latencies.append((time.perf_counter() - tic) * 1000)
+
+    print(f"avg latency: {mean(latencies)} ms")
+    print(latencies)
 
 
 if __name__ == "__main__":
