@@ -1,5 +1,5 @@
 #!/usr/bin/bash
-# for dir in "v0_poc" "v1_gpu_only" "v2_static_collab" "v3_dnm_collab"
+# for dir in "v0_cpu_experts" "v1_gpu_experts" "v2_static_collab" "v3_dnm_collab"
 for dir in "v2_static_collab"
 do
     for batch_size in 1 2 4 8 16 32 64 128
