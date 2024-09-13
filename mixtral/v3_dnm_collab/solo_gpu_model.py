@@ -434,6 +434,7 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         jobs, worthy, unworthy = self.allocate(selected_experts, inputs)
 
+        # ACT_STATS[self.li].append(weights)  # experiment
         # TODO: static_e should work first to enable more memcpy overlap
         for ei in worthy:
             batch_idx, nth_expert = jobs[ei]
@@ -680,7 +681,7 @@ def generate(
     if verbose:  # perf_analysis
         on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
         print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}") # average of averages
+        print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
 
     return (
         seqlens,
@@ -777,6 +778,19 @@ def main(
         for p, resp in zip(prompts, responses):
             print(f"PROMPT:\n{p}")
             print(f"RESPONSE:\n{resp}\n")
+
+    # top1_avgs, top2_avgs = [], []
+    # for li in range(32):
+    #     score_avgs = torch.mean(torch.cat(ACT_STATS[li], axis=0).T, dim=1).tolist()
+    #     assert len(score_avgs) == 2
+    #     top1_avgs.append(score_avgs[0])
+    #     top2_avgs.append(score_avgs[1])
+
+    # print()
+    # print(f"top-1 layer-wise score average: (model-wise: {mean(top1_avgs)})")
+    # print(top1_avgs)
+    # print(f"top-2 layer-wise score average: (model-wise: {mean(top2_avgs)})")
+    # print(top2_avgs)
 
 
 if __name__ == "__main__":
