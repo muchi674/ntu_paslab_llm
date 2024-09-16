@@ -1,16 +1,51 @@
+import argparse
+import json
 import math
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
 from torch import nn
+
+from llama_models.llama3.api.tokenizer import Tokenizer
+
+DEFAULT_SEED = 7
+MAX_BATCH_SIZE = 32
+MAX_SEQ_LEN = 512
+
+
+def get_json(file_path: Path) -> dict:
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+
+def sample_top_p(probs, p):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution.
+
+    Args:
+        probs (torch.Tensor): Probability distribution tensor.
+        p (float): Probability threshold for top-p sampling.
+
+    Returns:
+        torch.Tensor: Sampled token indices.
+
+    Note:
+        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
+        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
 
 
 @dataclass
@@ -184,21 +219,19 @@ class Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
             keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
         values = repeat_kv(
             values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -278,7 +311,6 @@ class Transformer(nn.Module):
             params.use_scaled_rope,
         )
 
-    @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
@@ -304,3 +336,204 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+
+class Llama3_1:
+
+    @staticmethod
+    def build(model_path: str) -> "Llama3_1":
+        assert torch.cuda.is_bf16_supported()
+        torch.manual_seed(DEFAULT_SEED)
+        start_time = time.time()
+
+        ckpt_dir = Path(model_path)
+        checkpoints = sorted(ckpt_dir.glob("*.pth"))
+        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
+
+        state_dict = {}
+        for ckpt_path in checkpoints:
+            state_dict.update(
+                torch.load(
+                    ckpt_path,
+                    map_location=torch.device("cpu"),
+                    weights_only=True,
+                    mmap=True,
+                )
+            )
+
+        params = get_json(ckpt_dir / "params.json")
+        model_args: ModelArgs = ModelArgs(
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=MAX_BATCH_SIZE,
+            **params,
+        )
+        tokenizer = Tokenizer(model_path=str(ckpt_dir / "tokenizer.model"))
+
+        assert (
+            model_args.vocab_size == tokenizer.n_words
+        ), f"model_args vocab = {model_args.vocab_size} but tokenizer vocab = {tokenizer.n_words}"
+
+        with torch.device("meta"):
+            model = Transformer(model_args)
+        model.load_state_dict(state_dict, assign=True, strict=True)
+
+        print(f"Loaded model in {time.time() - start_time:.2f} seconds")
+        return Llama3_1(model, tokenizer, model_args)
+
+    def __init__(self, model: Transformer, tokenizer: Tokenizer, args: ModelArgs):
+        self.args = args
+        self.model = model
+        self.tokenizer = tokenizer
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompts: list[str],
+        max_gen_len: int,
+        gpu: torch.device,
+        temperature: float = 0.0,
+        top_p: float = 0.0,
+    ) -> tuple:
+        assert max_gen_len > 0
+
+        model = self.model.eval()
+        params = model.params
+        bsz = len(prompts)
+
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        start_time.record()
+
+        encoded_prompts: list[list[int]] = [
+            self.tokenizer.encode(prompt, bos=True, eos=False) for prompt in prompts
+        ]
+        min_prompt_len = min(len(p) for p in encoded_prompts)
+        max_prompt_len = max(len(p) for p in encoded_prompts)
+
+        if max_prompt_len + max_gen_len >= params.max_seq_len:
+            print(
+                f"Out of token budget {max_prompt_len + max_gen_len} vs {params.max_seq_len}"
+            )
+            return
+
+        total_len = max_gen_len + max_prompt_len
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=gpu)
+        for k, t in enumerate(encoded_prompts):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=gpu)
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=gpu)
+        input_text_mask = tokens != pad_id
+
+        # TODO: not sure what this is for
+        if min_prompt_len == total_len:
+            logits = model.forward(tokens, prev_pos)
+
+        stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
+        gen_tokens = []
+
+        # notice:
+        # it seems that prompts with length < max
+        # will generate total_len - len(prompt) tokens
+        for cur_pos in range(min_prompt_len, total_len):
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = sample_top_p(probs, top_p)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+
+            flat_next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            flat_next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], flat_next_token
+            )
+            tokens[:, cur_pos] = flat_next_token
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                torch.isin(flat_next_token, stop_tokens)
+            )
+
+            gen_tokens.append(next_token)
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
+
+        gen_tokens = torch.cat(gen_tokens, 1).tolist()
+        n_gen_tkns = sum(len(y) - 1 for y in gen_tokens)
+        responses = [self.tokenizer.decode(y) for y in gen_tokens]
+
+        end_time.record()
+        torch.cuda.synchronize(device=gpu)
+        total_latency = start_time.elapsed_time(end_time) / 1000  # to seconds
+
+        return (
+            sum(len(p) for p in encoded_prompts),
+            n_gen_tkns,
+            responses,
+            total_latency,
+        )
+
+
+def main(
+    model_path: str,
+    prompt: str,
+    prompt_path: str,
+    n_prompts: int,
+    max_gen_len: int,
+    hide_resp: bool,
+):
+    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+
+    gpu_0 = torch.device("cuda:0")
+    prompts: list[str] = None
+    if prompt:
+        prompts = [prompt]
+    else:
+        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
+        n_repeats = -(n_prompts // -len(dataset))  # ceil division
+        prompts = (dataset * n_repeats)[:n_prompts]
+    model = Llama3_1.build(model_path)
+
+    # warmup
+    model.generate(prompts=["hello, how are you?"], max_gen_len=1, gpu=gpu_0)
+    print("finished warming up")
+
+    n_p_tkns, n_gen_tkns, responses, total_latency = model.generate(
+        prompts=prompts, max_gen_len=max_gen_len, gpu=gpu_0
+    )
+
+    print("=" * 20)
+    print("PERFORMANCE BREAKDOWN\n")
+    print(f"num prompt tokens: {n_p_tkns}")
+    print(f"num generated tokens: {n_gen_tkns}")
+    print(f"total latency: {total_latency:.2f} secs")
+    print(f"mixed throughput: {((n_p_tkns + n_gen_tkns) / total_latency):.2f} t/s")
+    if not hide_resp:
+        print("=" * 20)
+        print("In-n-Outs")
+        for p, resp in zip(prompts, responses):
+            print(f"PROMPT:\n{p}")
+            print(f"RESPONSE:\n{resp}\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompt-path", type=str)
+    parser.add_argument("--n-prompts", type=int)
+    parser.add_argument("--max-gen-len", type=int)
+    parser.add_argument("--hide-resp", action="store_true")
+    args = parser.parse_args()
+
+    main(
+        args.model_path,
+        args.prompt,
+        args.prompt_path,
+        args.n_prompts,
+        args.max_gen_len,
+        args.hide_resp,
+    )
