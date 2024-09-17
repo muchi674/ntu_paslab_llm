@@ -1,7 +1,6 @@
 import argparse
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,48 +45,6 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
-
-
-@dataclass
-class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = -1
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000
-    use_scaled_rope: bool = False
-
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-
-        if self.n_kv_heads is None:
-            self.n_kv_heads = self.n_heads
-        assert self.n_kv_heads <= self.n_heads
-        assert self.n_heads % self.n_kv_heads == 0
-        assert self.dim % self.n_heads == 0
-
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
 
 
 def apply_scaling(freqs: torch.Tensor):
@@ -160,8 +117,50 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000
+    use_scaled_rope: bool = False
+
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+        if self.n_kv_heads is None:
+            self.n_kv_heads = self.n_heads
+        assert self.n_kv_heads <= self.n_heads
+        assert self.n_heads % self.n_kv_heads == 0
+        assert self.dim % self.n_heads == 0
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, device: torch.device):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_heads = args.n_heads
@@ -180,16 +179,18 @@ class Attention(nn.Module):
                 args.max_seq_len,
                 self.n_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device,
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
                 self.n_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device,
+        )
 
     def forward(
         self,
@@ -260,12 +261,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, device: torch.device):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(args, device)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
@@ -289,7 +290,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    def __init__(self, params: ModelArgs, device: torch.device):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -299,7 +300,7 @@ class Transformer(nn.Module):
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock(layer_id, params, device))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
@@ -341,8 +342,9 @@ class Transformer(nn.Module):
 class Llama3_1:
 
     @staticmethod
-    def build(model_path: str) -> "Llama3_1":
+    def build(model_path: str, device: torch.device) -> "Llama3_1":
         assert torch.cuda.is_bf16_supported()
+        torch.set_default_dtype(torch.bfloat16)
         torch.manual_seed(DEFAULT_SEED)
         start_time = time.time()
 
@@ -355,7 +357,7 @@ class Llama3_1:
             state_dict.update(
                 torch.load(
                     ckpt_path,
-                    map_location=torch.device("cpu"),
+                    map_location=device,
                     weights_only=True,
                     mmap=True,
                 )
@@ -374,7 +376,8 @@ class Llama3_1:
         ), f"model_args vocab = {model_args.vocab_size} but tokenizer vocab = {tokenizer.n_words}"
 
         with torch.device("meta"):
-            model = Transformer(model_args)
+            # device here specifies where to pre-allocate KV-cache
+            model = Transformer(model_args, device=device)
         model.load_state_dict(state_dict, assign=True, strict=True)
 
         print(f"Loaded model in {time.time() - start_time:.2f} seconds")
@@ -390,6 +393,7 @@ class Llama3_1:
         self,
         prompts: list[str],
         max_gen_len: int,
+        cpu: torch.device,
         gpu: torch.device,
         temperature: float = 0.0,
         top_p: float = 0.0,
@@ -419,12 +423,12 @@ class Llama3_1:
 
         total_len = max_gen_len + max_prompt_len
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=gpu)
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=cpu)
         for k, t in enumerate(encoded_prompts):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=gpu)
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=cpu)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device=gpu)
+        eos_reached = torch.tensor([False] * bsz, device=cpu)
         input_text_mask = tokens != pad_id
 
         # TODO: not sure what this is for
@@ -435,8 +439,11 @@ class Llama3_1:
         gen_tokens = []
 
         # notice:
-        # it seems that prompts with length < max
-        # will generate total_len - len(prompt) tokens
+        # 1. it seems that prompts with length < max will generate
+        # total_len - len(prompt) tokens
+        # 2. when batch size > 1, only the first bsz * min_prompt_len tokens
+        # will be processed in parallel. Longer prompts' remaining tokens are
+        # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_prompt_len, total_len):
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
 
@@ -487,6 +494,7 @@ def main(
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
 
+    cpu = torch.device("cpu")
     gpu_0 = torch.device("cuda:0")
     prompts: list[str] = None
     if prompt:
@@ -495,7 +503,7 @@ def main(
         dataset: list[str] = get_json(Path(prompt_path))["prompts"]
         n_repeats = -(n_prompts // -len(dataset))  # ceil division
         prompts = (dataset * n_repeats)[:n_prompts]
-    model = Llama3_1.build(model_path)
+    model = Llama3_1.build(model_path, cpu)
 
     # warmup
     model.generate(prompts=["hello, how are you?"], max_gen_len=1, gpu=gpu_0)
