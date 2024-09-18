@@ -73,10 +73,16 @@ def apply_scaling(freqs: torch.Tensor):
 
 
 def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+    dim: int,
+    end: int,
+    device: torch.device,
+    theta: float = 10000.0,
+    use_scaled: bool = False,
 ):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
+    )
+    t = torch.arange(end, device=device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
@@ -123,6 +129,7 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
+    head_dim: int = None
     vocab_size: int = -1
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
@@ -138,6 +145,8 @@ class ModelArgs:
             if hasattr(self, k):
                 setattr(self, k, v)
 
+        # assumes head_dim not in kwargs, but not a hard requirement
+        self.head_dim = self.dim // self.n_heads
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
         assert self.n_kv_heads <= self.n_heads
@@ -160,43 +169,25 @@ class RMSNorm(torch.nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, device: torch.device):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_heads = args.n_heads
         self.n_kv_heads = self.n_kv_heads
         self.n_rep = self.n_heads // self.n_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.head_dim = args.head_dim
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            ),
-            device=device,
-        )
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            ),
-            device=device,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
+        cache: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
@@ -205,17 +196,12 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        cache[0, :bsz, start_pos : start_pos + seqlen] = xk
+        cache[1, :bsz, start_pos : start_pos + seqlen] = xv
+        keys = cache[0, :bsz, : start_pos + seqlen]
+        values = cache[1, :bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
@@ -261,19 +247,16 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs, device: torch.device):
+    def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args, device)
+        self.layer_id = layer_id
+        self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
         )
-        self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -282,15 +265,18 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
+        cache: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, cache, mask
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs, device: torch.device):
+    def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -300,22 +286,15 @@ class Transformer(nn.Module):
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params, device))
+            self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.freqs_cis: torch.Tensor = None
 
-        self.freqs_cis = precompute_freqs_cis(
-            params.dim // params.n_heads,
-            params.max_seq_len * 2,
-            params.rope_theta,
-            params.use_scaled_rope,
-        )
-
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache: list[torch.Tensor]):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
@@ -332,8 +311,8 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+        for li, layer in enumerate(self.layers):
+            h = layer(h, start_pos, freqs_cis, cache[li], mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
@@ -349,20 +328,12 @@ class Llama3_1:
         start_time = time.time()
 
         ckpt_dir = Path(model_path)
-        checkpoints = sorted(ckpt_dir.glob("*.pth"))
-        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-
-        state_dict = {}
-        for ckpt_path in checkpoints:
-            state_dict.update(
-                torch.load(
-                    ckpt_path,
-                    map_location=device,
-                    weights_only=True,
-                    mmap=True,
-                )
-            )
-
+        state_dict = torch.load(
+            ckpt_dir / "world_size_1_procr_0.pt",
+            map_location=device,
+            weights_only=True,
+            mmap=True,
+        )
         params = get_json(ckpt_dir / "params.json")
         model_args: ModelArgs = ModelArgs(
             max_seq_len=MAX_SEQ_LEN,
@@ -377,8 +348,15 @@ class Llama3_1:
 
         with torch.device("meta"):
             # device here specifies where to pre-allocate KV-cache
-            model = Transformer(model_args, device=device)
+            model = Transformer(model_args)
         model.load_state_dict(state_dict, assign=True, strict=True)
+        model.freqs_cis = precompute_freqs_cis(
+            model_args.dim // model_args.n_heads,
+            model_args.max_seq_len * 2,
+            device,
+            model_args.rope_theta,
+            model_args.use_scaled_rope,
+        )
 
         print(f"Loaded model in {time.time() - start_time:.2f} seconds")
         return Llama3_1(model, tokenizer, model_args)
@@ -387,6 +365,21 @@ class Llama3_1:
         self.args = args
         self.model = model
         self.tokenizer = tokenizer
+
+    def get_cache(self, params: ModelArgs, device=torch.device) -> list[torch.Tensor]:
+        return [
+            torch.empty(
+                (
+                    2,  # key and value
+                    params.max_batch_size,
+                    params.max_seq_len,
+                    params.n_kv_heads,
+                    params.head_dim,
+                ),
+                device=device,
+            )
+            for _ in range(params.n_layers)
+        ]
 
     @torch.inference_mode()
     def generate(
@@ -402,6 +395,7 @@ class Llama3_1:
 
         model = self.model.eval()
         params = model.params
+        cache = self.get_cache(params, cpu)
         bsz = len(prompts)
 
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
@@ -424,8 +418,15 @@ class Llama3_1:
         total_len = max_gen_len + max_prompt_len
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=cpu)
+        res_start_pos = []  # refer to notice below for its purpose
+        n_p_tkns = 0
         for k, t in enumerate(encoded_prompts):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=cpu)
+            res_start_pos.append(len(t) - min_prompt_len)
+            n_p_tkns += len(t)
+
+        # TODO: needs to move freqs_cis to tokens' device if we are doing
+        # attention calculation on GPU
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device=cpu)
@@ -433,7 +434,7 @@ class Llama3_1:
 
         # TODO: not sure what this is for
         if min_prompt_len == total_len:
-            logits = model.forward(tokens, prev_pos)
+            logits = model.forward(tokens, prev_pos, cache)
 
         stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
         gen_tokens = []
@@ -445,7 +446,7 @@ class Llama3_1:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_prompt_len, total_len):
-            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, cache)
 
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -453,14 +454,14 @@ class Llama3_1:
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
-            flat_next_token = next_token.reshape(-1)
+            next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            flat_next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], flat_next_token
+            next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
-            tokens[:, cur_pos] = flat_next_token
+            tokens[:, cur_pos] = next_token
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(flat_next_token, stop_tokens)
+                torch.isin(next_token, stop_tokens)
             )
 
             gen_tokens.append(next_token)
@@ -468,7 +469,8 @@ class Llama3_1:
             if all(eos_reached):
                 break
 
-        gen_tokens = torch.cat(gen_tokens, 1).tolist()
+        gen_tokens = torch.stack(gen_tokens, dim=1).tolist()
+        gen_tokens = [tkns[i:] for tkns, i in zip(gen_tokens, res_start_pos)]
         n_gen_tkns = sum(len(y) - 1 for y in gen_tokens)
         responses = [self.tokenizer.decode(y) for y in gen_tokens]
 
@@ -477,7 +479,7 @@ class Llama3_1:
         total_latency = start_time.elapsed_time(end_time) / 1000  # to seconds
 
         return (
-            sum(len(p) for p in encoded_prompts),
+            n_p_tkns,
             n_gen_tkns,
             responses,
             total_latency,
@@ -506,11 +508,11 @@ def main(
     model = Llama3_1.build(model_path, cpu)
 
     # warmup
-    model.generate(prompts=["hello, how are you?"], max_gen_len=1, gpu=gpu_0)
+    model.generate(prompts=["hello, how are you?"], max_gen_len=5, cpu=cpu, gpu=gpu_0)
     print("finished warming up")
 
     n_p_tkns, n_gen_tkns, responses, total_latency = model.generate(
-        prompts=prompts, max_gen_len=max_gen_len, gpu=gpu_0
+        prompts=prompts, max_gen_len=max_gen_len, cpu=cpu, gpu=gpu_0
     )
 
     print("=" * 20)
