@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from llama_models.llama3.api.tokenizer import Tokenizer
+from llama_models.llama3.api.chat_format import ChatFormat
+from llama_models.llama3.api.datatypes import UserMessage, ToolPromptFormat
 
 DEFAULT_SEED = 7
 MAX_BATCH_SIZE = 32
@@ -374,12 +376,40 @@ class Llama3_1:
         )
 
         print(f"Loaded model in {time.time() - start_time:.2f} seconds")
-        return Llama3_1(model, tokenizer, model_args)
+        return Llama3_1(model, model_path.endswith("-Instruct"), tokenizer, model_args)
 
-    def __init__(self, model: Transformer, tokenizer: Tokenizer, args: ModelArgs):
+    def __init__(
+        self,
+        model: Transformer,
+        is_instruct: bool,
+        tokenizer: Tokenizer,
+        args: ModelArgs,
+    ):
         self.args = args
         self.model = model
+        self.is_instruct = is_instruct
         self.tokenizer = tokenizer
+        self.formatter = ChatFormat(tokenizer)
+
+    def encode_prompts(
+        self, prompts: list[str], fixed_prompt_len: int = None
+    ) -> list[list[int]]:
+        encoded_prompts = []
+        for prompt in prompts:
+            if self.is_instruct:
+                self.formatter.encode_dialog_prompt(
+                    [UserMessage(content=prompt)], ToolPromptFormat.json
+                ).tokens
+            else:
+                tkns = self.tokenizer.encode(prompt, bos=True, eos=False)
+
+            # perf_analysis
+            if fixed_prompt_len is not None:
+                tkns = tkns[:fixed_prompt_len]
+
+            encoded_prompts.append(tkns)
+
+        return encoded_prompts
 
     def get_cache(self, params: ModelArgs, device=torch.device) -> list[torch.Tensor]:
         return [
@@ -420,12 +450,7 @@ class Llama3_1:
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-        encoded_prompts: list[list[int]] = []
-        for prompt in prompts:  # perf_analysis
-            tkns = self.tokenizer.encode(prompt, bos=True, eos=False)
-            if fixed_prompt_len is not None:
-                tkns = tkns[:fixed_prompt_len]
-            encoded_prompts.append(tkns)
+        encoded_prompts = self.encode_prompts(prompts)
         min_prompt_len = min(len(p) for p in encoded_prompts)
         max_prompt_len = max(len(p) for p in encoded_prompts)
 
@@ -469,8 +494,8 @@ class Llama3_1:
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, cache)
 
             if cur_pos == min_prompt_len:  # perf_analysis
-                prefill_attn = mean(LOGS["attn"])
-                prefill_ffn = mean(LOGS["ffn"])
+                prefill_attn = round(mean(LOGS["attn"]) * 1000, 2)
+                prefill_ffn = round(mean(LOGS["ffn"]) * 1000, 2)
                 reset_logs()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -492,9 +517,11 @@ class Llama3_1:
                 break
 
         # perf_analysis
-        decode_attn = mean(LOGS["attn"])
-        decode_ffn = mean(LOGS["ffn"])
+        decode_attn = round(mean(LOGS["attn"]) * 1000, 2)
+        decode_ffn = round(mean(LOGS["ffn"]) * 1000, 2)
 
+        # this part is from here:
+        # https://github.com/meta-llama/llama3/blob/main/llama/generation.py
         responses = []
         n_p_tkns, n_gen_tkns = 0, 0
         for bi, tkns in enumerate(tokens.tolist()):
@@ -517,14 +544,24 @@ class Llama3_1:
         total_latency = start_time.elapsed_time(end_time) / 1000  # to seconds
 
         if fixed_prompt_len is not None:  # perf_analysis
+            str_stats = [
+                str(v)
+                for v in [
+                    bsz,
+                    fixed_prompt_len,
+                    max_gen_len,
+                    prefill_attn,
+                    prefill_ffn,
+                    decode_attn,
+                    decode_ffn,
+                ]
+            ]
             print("=" * 20)
             print("ADDITIONAL PERFORMANCE STATS")
             print(
-                "batch_size, fixed_prompt_len, prefill_attn, prefill_ffn, decode_attn, decode_ffn"
+                "batch_size, fixed_prompt_len, max_gen_len, prefill_attn, prefill_ffn, decode_attn, decode_ffn"
             )
-            print(
-                f"{bsz}, {fixed_prompt_len}, {round(prefill_attn * 1000, 2)}, {round(prefill_ffn * 1000, 2)}, {round(decode_attn * 1000, 2)}, {round(decode_ffn * 1000, 2)}"
-            )
+            print(", ".join(str_stats))
 
         return (
             n_p_tkns,
