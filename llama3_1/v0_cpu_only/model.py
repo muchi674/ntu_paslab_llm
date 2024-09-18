@@ -4,6 +4,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import Optional, Tuple
 
 import torch
@@ -15,6 +16,12 @@ from llama_models.llama3.api.tokenizer import Tokenizer
 DEFAULT_SEED = 7
 MAX_BATCH_SIZE = 32
 MAX_SEQ_LEN = 512
+LOGS = {}  # perf_analysis
+
+
+def reset_logs():  # perf_analysis
+    global LOGS
+    LOGS = {"attn": [], "ffn": []}
 
 
 def get_json(file_path: Path) -> dict:
@@ -268,10 +275,18 @@ class TransformerBlock(nn.Module):
         cache: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        tic = time.time()
+
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, cache, mask
         )
+
+        LOGS["attn"].append(time.time() - tic)
+        tic = time.time()
+
         out = h + self.feed_forward(self.ffn_norm(h))
+
+        LOGS["ffn"].append(time.time() - tic)
         return out
 
 
@@ -388,9 +403,11 @@ class Llama3_1:
         max_gen_len: int,
         cpu: torch.device,
         gpu: torch.device,
+        fixed_prompt_len: int = None,
         temperature: float = 0.0,
         top_p: float = 0.0,
     ) -> tuple:
+        reset_logs()  # perf_analysis
         assert max_gen_len > 0
 
         model = self.model.eval()
@@ -403,9 +420,12 @@ class Llama3_1:
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-        encoded_prompts: list[list[int]] = [
-            self.tokenizer.encode(prompt, bos=True, eos=False) for prompt in prompts
-        ]
+        encoded_prompts: list[list[int]] = []
+        for prompt in prompts:  # perf_analysis
+            tkns = self.tokenizer.encode(prompt, bos=True, eos=False)
+            if fixed_prompt_len is not None:
+                tkns = tkns[:fixed_prompt_len]
+            encoded_prompts.append(tkns)
         min_prompt_len = min(len(p) for p in encoded_prompts)
         max_prompt_len = max(len(p) for p in encoded_prompts)
 
@@ -418,12 +438,8 @@ class Llama3_1:
         total_len = max_gen_len + max_prompt_len
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=cpu)
-        res_start_pos = []  # refer to notice below for its purpose
-        n_p_tkns = 0
         for k, t in enumerate(encoded_prompts):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=cpu)
-            res_start_pos.append(len(t) - min_prompt_len)
-            n_p_tkns += len(t)
 
         # TODO: needs to move freqs_cis to tokens' device if we are doing
         # attention calculation on GPU
@@ -431,13 +447,17 @@ class Llama3_1:
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device=cpu)
         input_text_mask = tokens != pad_id
-
-        # TODO: not sure what this is for
         if min_prompt_len == total_len:
+            # TODO: not sure what this is for
             logits = model.forward(tokens, prev_pos, cache)
 
         stop_tokens = torch.tensor(self.tokenizer.stop_tokens)
-        gen_tokens = []
+        prefill_attn, prefill_ffn, decode_attn, decode_ffn = (
+            None,
+            None,
+            None,
+            None,
+        )  # perf_analysis
 
         # notice:
         # 1. it seems that prompts with length < max will generate
@@ -448,6 +468,10 @@ class Llama3_1:
         for cur_pos in range(min_prompt_len, total_len):
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, cache)
 
+            if cur_pos == min_prompt_len:  # perf_analysis
+                prefill_attn = mean(LOGS["attn"])
+                prefill_ffn = mean(LOGS["ffn"])
+                reset_logs()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -463,20 +487,44 @@ class Llama3_1:
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 torch.isin(next_token, stop_tokens)
             )
-
-            gen_tokens.append(next_token)
             prev_pos = cur_pos
             if all(eos_reached):
                 break
 
-        gen_tokens = torch.stack(gen_tokens, dim=1).tolist()
-        gen_tokens = [tkns[i:] for tkns, i in zip(gen_tokens, res_start_pos)]
-        n_gen_tkns = sum(len(y) - 1 for y in gen_tokens)
-        responses = [self.tokenizer.decode(y) for y in gen_tokens]
+        # perf_analysis
+        decode_attn = mean(LOGS["attn"])
+        decode_ffn = mean(LOGS["ffn"])
+
+        responses = []
+        n_p_tkns, n_gen_tkns = 0, 0
+        for bi, tkns in enumerate(tokens.tolist()):
+            # cut to max_gen_len
+            p_len = len(encoded_prompts[bi])
+            tkns: list = tkns[p_len : p_len + max_gen_len]
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = tkns.index(stop_token)
+                    tkns = tkns[:eos_idx]
+                except ValueError:
+                    pass
+            responses.append(self.tokenizer.decode(tkns))
+            n_p_tkns += p_len
+            n_gen_tkns += len(tkns)
 
         end_time.record()
         torch.cuda.synchronize(device=gpu)
         total_latency = start_time.elapsed_time(end_time) / 1000  # to seconds
+
+        if fixed_prompt_len is not None:  # perf_analysis
+            print("=" * 20)
+            print("ADDITIONAL PERFORMANCE STATS")
+            print(
+                "batch_size, fixed_prompt_len, prefill_attn, prefill_ffn, decode_attn, decode_ffn"
+            )
+            print(
+                f"{bsz}, {fixed_prompt_len}, {round(prefill_attn * 1000, 2)}, {round(prefill_ffn * 1000, 2)}, {round(decode_attn * 1000, 2)}, {round(decode_ffn * 1000, 2)}"
+            )
 
         return (
             n_p_tkns,
@@ -491,6 +539,7 @@ def main(
     prompt: str,
     prompt_path: str,
     n_prompts: int,
+    fixed_prompt_len: int,
     max_gen_len: int,
     hide_resp: bool,
 ):
@@ -512,7 +561,13 @@ def main(
     print("finished warming up")
 
     n_p_tkns, n_gen_tkns, responses, total_latency = model.generate(
-        prompts=prompts, max_gen_len=max_gen_len, cpu=cpu, gpu=gpu_0
+        prompts=prompts,
+        max_gen_len=max_gen_len,
+        cpu=cpu,
+        gpu=gpu_0,
+        fixed_prompt_len=fixed_prompt_len,
+        temperature=0.6,
+        top_p=0.9,
     )
 
     print("=" * 20)
@@ -535,6 +590,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int)
+    parser.add_argument("--fixed-prompt-len", type=int)
     parser.add_argument("--max-gen-len", type=int)
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
@@ -544,6 +600,7 @@ if __name__ == "__main__":
         args.prompt,
         args.prompt_path,
         args.n_prompts,
+        args.fixed_prompt_len,
         args.max_gen_len,
         args.hide_resp,
     )
