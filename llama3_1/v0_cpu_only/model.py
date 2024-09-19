@@ -450,7 +450,7 @@ class Llama3_1:
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-        encoded_prompts = self.encode_prompts(prompts)
+        encoded_prompts = self.encode_prompts(prompts, fixed_prompt_len)
         min_prompt_len = min(len(p) for p in encoded_prompts)
         max_prompt_len = max(len(p) for p in encoded_prompts)
 
