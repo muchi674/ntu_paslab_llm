@@ -428,8 +428,12 @@ class MoeLayer(nn.Module):
         return jobs, worthy, unworthy
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        bsz = inputs.shape[0]
         gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        weights, selected_experts = torch.topk(gate_logits, 3)
+        idx = torch.tensor([[0, 2] for _ in range(bsz)], device=inputs.device)
+        weights = torch.gather(weights, dim=1, index=idx)
+        selected_experts = torch.gather(selected_experts, dim=1, index=idx)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
         jobs, worthy, unworthy = self.allocate(selected_experts, inputs)
