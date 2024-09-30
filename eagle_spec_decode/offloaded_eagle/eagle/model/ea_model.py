@@ -34,7 +34,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            draft_device,
     ):
 
         super().__init__()
@@ -66,8 +67,10 @@ class EaModel(nn.Module):
         else:
             self.ea_layer.diff_device = False
         self.ea_layer.load_state_dict(ea_layer_state_dict, strict=True)
-        self.ea_layer.to(self.base_model.dtype).to(device)
+        # self.ea_layer.to(self.base_model.dtype).to(device)
+        self.ea_layer.to(dtype=self.base_model.dtype, device=draft_device)
         self.ea_layer.init_tree()
+        self.kv_cache_device = draft_device
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -87,6 +90,7 @@ class EaModel(nn.Module):
             depth=5,
             top_k=10,
             threshold=1.0,
+            draft_device: torch.device = None,
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
@@ -113,7 +117,7 @@ class EaModel(nn.Module):
             if not os.path.exists(load_model_path):
                 load_model_path=hf_hub_download(ea_model_path, "pytorch_model.bin")
             ea_layer_state_dict = torch.load(load_model_path,
-                                             map_location=base_model.device)
+                                             map_location=draft_device or base_model.device)
         except:
             from safetensors.torch import load_file
             load_model_path = os.path.join(ea_model_path, "model.safetensors")
@@ -128,7 +132,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            draft_device,
         )
 
 
@@ -241,7 +246,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(self.base_model, self.kv_cache_device) # [CHECKPOINT]
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data

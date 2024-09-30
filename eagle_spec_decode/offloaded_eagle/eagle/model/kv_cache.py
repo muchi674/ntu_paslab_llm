@@ -66,7 +66,7 @@ class KVCache:
         return torch.narrow(self.data, 2, 0, self.current_length)
 
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model, device: torch.device):
     """
     Initialize past key and value states for a given transformer model.
 
@@ -90,10 +90,10 @@ def initialize_past_key_values(model):
 
     devices=[]
     for i in range(config.num_hidden_layers):
-        try:
-            device = model.model.layers[i].self_attn.q_proj.weight.device
-        except:
-            device=model.layers[i].self_attn.q_proj.weight.device
+        # try:
+        #     device = model.model.layers[i].self_attn.q_proj.weight.device
+        # except:
+        #     device=model.layers[i].self_attn.q_proj.weight.device
         devices.append(device)
     past_key_values_data_list=[]
     startnum=0
