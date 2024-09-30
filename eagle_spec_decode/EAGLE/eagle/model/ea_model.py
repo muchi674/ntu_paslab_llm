@@ -180,7 +180,14 @@ class EaModel(nn.Module):
                 position_ids=position_ids,
             )
             if output_orig:
+                # [muchi_mod]
+                torch.cuda.nvtx.range_push("target_head")
+
                 orig = self.base_model.lm_head(outputs[0])
+
+                # [muchi_mod]
+                torch.cuda.nvtx.range_pop()
+
             hidden_states = outputs[0]
 
         # [muchi_mod]

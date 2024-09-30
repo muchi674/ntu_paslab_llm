@@ -427,6 +427,9 @@ class LlamaDecoderLayer(nn.Module):
         if self.index != 0:
             hidden_states = self.input_layernorm(hidden_states)
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("draft_attn")
+
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -438,11 +441,18 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("draft_ffn")
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
 
         outputs = (hidden_states,)
 
@@ -573,7 +583,14 @@ class Model(nn.Module):
         past_key_values_length = 0
 
         with torch.no_grad():
+            # [muchi_mod]
+            torch.cuda.nvtx.range_push("draft_embed")
+
             inputs_embeds = self.embed_tokens(input_ids)
+
+            # [muchi_mod]
+            torch.cuda.nvtx.range_pop()
+
             # inputs_embeds = inputs_embeds.detach()
 
         # if std is not None:
@@ -607,7 +624,14 @@ class Model(nn.Module):
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("draft_fc")
+
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
 
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
@@ -688,7 +712,13 @@ class Model(nn.Module):
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("draft_head")
+
         last_headout = head(last_hidden)
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
 
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
@@ -718,7 +748,14 @@ class Model(nn.Module):
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
 
+            # [muchi_mod]
+            torch.cuda.nvtx.range_push("draft_head")
+
             last_headout = head(out_hidden[0])
+
+            # [muchi_mod]
+            torch.cuda.nvtx.range_pop()
+
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)

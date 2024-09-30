@@ -32,6 +32,8 @@ if __name__ == "__main__":
         messages, add_generation_prompt=True, return_tensors="pt"
     ).to(gpu)
 
+    # torch.compile(model)
+
     # warmup
     for _ in range(5):
         model.eagenerate(input_ids, temperature=0.5, max_new_tokens=512, is_llama3=True)

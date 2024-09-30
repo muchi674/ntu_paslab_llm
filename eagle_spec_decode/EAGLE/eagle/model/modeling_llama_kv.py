@@ -711,6 +711,9 @@ class LlamaDecoderLayer(nn.Module):
 
         residual = hidden_states
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("target_attn")
+
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -724,11 +727,18 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("target_ffn")
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
 
         outputs = (hidden_states,)
 
@@ -984,7 +994,14 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
+            # [muchi_mod]
+            torch.cuda.nvtx.range_push("target_embed")
+
             inputs_embeds = self.embed_tokens(input_ids)
+
+            # [muchi_mod]
+            torch.cuda.nvtx.range_pop()
+
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
