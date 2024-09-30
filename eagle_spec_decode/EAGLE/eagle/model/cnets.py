@@ -658,6 +658,8 @@ class Model(nn.Module):
 
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("draft_gen")
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -828,6 +830,10 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
+
+        # [muchi_mod]
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 

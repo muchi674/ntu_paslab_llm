@@ -168,6 +168,8 @@ class EaModel(nn.Module):
             output_orig=False,
             position_ids=None,
     ):
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("target_forward")
 
         with torch.inference_mode():
             # Pass input through the base model
@@ -180,6 +182,10 @@ class EaModel(nn.Module):
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0]
+
+        # [muchi_mod]
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         if output_orig:
             return outputs, orig, hidden_states
@@ -197,7 +203,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
-
+            profile: bool = False
     ):
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
@@ -235,11 +241,17 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+
+        # [muchi_mod]
+        if profile:
+            torch.cuda.cudart().cudaProfilerStart()
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
 
+        # [muchi_mod]
+        torch.cuda.nvtx.range_push("decode")
         for idx in range(max_length):
             #with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
@@ -288,6 +300,12 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+
+        # [muchi_mod]
+        torch.cuda.nvtx.range_pop()
+        if profile:
+            torch.cuda.cudart().cudaProfilerStop()
+
         if not log:
             return input_ids
         else:
