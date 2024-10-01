@@ -993,11 +993,15 @@ class LlamaModel(LlamaPreTrainedModel):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        main_storage = self.embed_tokens.weight.device
+
         if inputs_embeds is None:
             # [muchi_mod]
             torch.cuda.nvtx.range_push("target_embed")
 
+            self.embed_tokens.to(input_ids.device)
             inputs_embeds = self.embed_tokens(input_ids)
+            self.embed_tokens.to(main_storage)
 
             # [muchi_mod]
             torch.cuda.nvtx.range_pop()
@@ -1030,7 +1034,10 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        decoder_layer: LlamaDecoderLayer
         for idx, decoder_layer in enumerate(self.layers):
+            decoder_layer.to(hidden_states.device)
+
             # if idx==16:
             #     print(idx)
             if output_hidden_states:
@@ -1074,7 +1081,11 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            decoder_layer.to(main_storage)
+
+        self.norm.to(hidden_states.device)
         hidden_states = self.norm(hidden_states)
+        self.norm.to(main_storage)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

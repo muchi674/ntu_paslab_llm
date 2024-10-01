@@ -56,18 +56,18 @@ class EaModel(nn.Module):
 
         low_memory=False
 
-        device = base_model.model.layers[-1].self_attn.q_proj.weight.device
-        if device!=base_model.lm_head.weight.device:
-            self.ea_layer.diff_device = True
-            if not low_memory:
-                self.ea_layer.headweight = base_model.lm_head.weight.clone().to(device)
-            else:
-                self.ea_layer.layer_device = device
+        # device = base_model.model.layers[-1].self_attn.q_proj.weight.device
+        # if device!=base_model.lm_head.weight.device:
+        #     self.ea_layer.diff_device = True
+        #     if not low_memory:
+        #         self.ea_layer.headweight = base_model.lm_head.weight.clone().to(device)
+        #     else:
+        #         self.ea_layer.layer_device = device
+        # else:
+        #     self.ea_layer.diff_device = False
+        self.ea_layer.diff_device = False
 
-        else:
-            self.ea_layer.diff_device = False
         self.ea_layer.load_state_dict(ea_layer_state_dict, strict=True)
-        # self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.to(dtype=self.base_model.dtype, device=draft_device)
         self.ea_layer.init_tree()
         self.kv_cache_device = draft_device
@@ -188,6 +188,7 @@ class EaModel(nn.Module):
                 # [muchi_mod]
                 torch.cuda.nvtx.range_push("target_head")
 
+                self.base_model.lm_head.weight.to(outputs[0])
                 orig = self.base_model.lm_head(outputs[0])
 
                 # [muchi_mod]
@@ -246,7 +247,7 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model, self.kv_cache_device) # [CHECKPOINT]
+            ) = initialize_past_key_values(self.base_model, self.kv_cache_device)
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data

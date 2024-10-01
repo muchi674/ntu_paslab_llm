@@ -25,10 +25,6 @@ if __name__ == "__main__":
     )
     model.eval()
 
-    weight: torch.Tensor
-    for _, weight in model.ea_layer.state_dict().items():
-        assert weight.is_cuda
-
     # messages = [
     #     {
     #         "role": "system",
