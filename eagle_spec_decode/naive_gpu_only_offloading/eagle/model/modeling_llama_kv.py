@@ -999,9 +999,14 @@ class LlamaModel(LlamaPreTrainedModel):
             # [muchi_mod]
             torch.cuda.nvtx.range_push("target_embed")
 
-            self.embed_tokens.to(input_ids.device)
+            cpu_copy = self.embed_tokens.weight
+            gpu_copy = nn.Parameter(cpu_copy.to(input_ids.device))
+            self.embed_tokens.weight = gpu_copy
+
             inputs_embeds = self.embed_tokens(input_ids)
-            self.embed_tokens.to(main_storage)
+
+            self.embed_tokens.weight = cpu_copy
+            del gpu_copy
 
             # [muchi_mod]
             torch.cuda.nvtx.range_pop()
@@ -1083,9 +1088,14 @@ class LlamaModel(LlamaPreTrainedModel):
 
             decoder_layer.to(main_storage)
 
-        self.norm.to(hidden_states.device)
+        cpu_copy = self.norm.weight
+        gpu_copy = nn.Parameter(cpu_copy.to(hidden_states.device))
+        self.norm.weight = gpu_copy
+
         hidden_states = self.norm(hidden_states)
-        self.norm.to(main_storage)
+
+        self.norm.weight = cpu_copy
+        del gpu_copy
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

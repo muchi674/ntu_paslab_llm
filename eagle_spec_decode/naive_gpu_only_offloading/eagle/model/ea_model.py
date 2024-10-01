@@ -136,7 +136,7 @@ class EaModel(nn.Module):
             draft_device,
         )
 
-
+        base_model.lm_head.weight = nn.Parameter(base_model.lm_head.weight.to(draft_device))
 
         if total_token==-1:
             device = model.base_model.model.layers[0].self_attn.q_proj.weight.device
@@ -188,7 +188,6 @@ class EaModel(nn.Module):
                 # [muchi_mod]
                 torch.cuda.nvtx.range_push("target_head")
 
-                self.base_model.lm_head.weight.to(outputs[0])
                 orig = self.base_model.lm_head(outputs[0])
 
                 # [muchi_mod]
