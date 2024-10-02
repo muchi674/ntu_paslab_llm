@@ -255,13 +255,13 @@ def initialize_tree(
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
+    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
     with torch.cuda.stream(model.compute_stream):
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
             model.ea_layer.topK_genrate(
                 hidden_states, input_ids, model.base_model.lm_head, logits_processor
             )
         )
-    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
 
     return (
         draft_tokens,
@@ -487,6 +487,7 @@ def update_inference_inputs(
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
 
+    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
     with torch.cuda.stream(model.compute_stream):
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
             model.ea_layer.topK_genrate(
@@ -496,7 +497,6 @@ def update_inference_inputs(
                 logits_processor=logits_processor,
             )
         )
-    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
 
     new_token += accept_length + 1
 

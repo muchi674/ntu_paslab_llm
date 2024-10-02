@@ -15,24 +15,13 @@ if __name__ == "__main__":
     torch.set_default_device(gpu)
 
     tokenizer = AutoTokenizer.from_pretrained(target_model_path)
-    # model = EaModel.from_pretrained(
-    #     base_model_path=target_model_path,
-    #     ea_model_path=draft_model_path,
-    #     torch_dtype=torch.float16,
-    #     low_cpu_mem_usage=True,
-    #     device_map=cpu,
-    #     total_token=59,  # same as default
-    #     draft_device=gpu
-    # )
     model = EaModel.from_pretrained(
         base_model_path=target_model_path,
         ea_model_path=draft_model_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map=cpu,
-        depth=12,
-        top_k=24,
-        total_token=255,  # same as default
+        total_token=59,  # same as default
         draft_device=gpu
     )
     model.eval()
@@ -56,7 +45,7 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=16, is_llama3=True, profile=True)
+    output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=128, is_llama3=True, profile=True)
 
     torch.cuda.synchronize()
     total_time = time.time() - start_time
