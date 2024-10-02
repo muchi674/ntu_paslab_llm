@@ -495,7 +495,10 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim, max_position_embeddings=self.max_position_embeddings,base=self.config.rope_theta
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.config.rope_theta,
+                device="cuda:0" # makes offloading easier
             )
         else:
             scaling_type = self.config.rope_scaling["type"]
@@ -888,6 +891,9 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.compute_stream: torch.cuda.Stream
+        self.double_buffer: list[dict[str, torch.Tensor]]
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -930,6 +936,46 @@ class LlamaModel(LlamaPreTrainedModel):
                 ] = combined_attention_mask.min()
 
         return combined_attention_mask
+
+    def copy_layer_weights_to_gpu(self, li: int, buffer_idx: int) -> None:
+        layer: LlamaDecoderLayer = self.layers[li]
+        buffer: list[list[torch.Tensor]] = self.double_buffer[buffer_idx]
+
+        # populate buffer
+        wi: int
+        weight: torch.Tensor
+        for wi, weight in enumerate([
+            layer.self_attn.q_proj.weight,
+            layer.self_attn.k_proj.weight,
+            layer.self_attn.v_proj.weight,
+            layer.self_attn.o_proj.weight,
+            layer.mlp.gate_proj.weight,
+            layer.mlp.up_proj.weight,
+            layer.mlp.down_proj.weight,
+        ]):
+            buffer[0][wi].copy_(weight, non_blocking=True)
+            buffer[1][wi] = weight # save original cpu weight ptr for later recovery
+
+        # tell model to use gpu weights
+        layer.self_attn.q_proj.weight = buffer[0][0]
+        layer.self_attn.k_proj.weight = buffer[0][1]
+        layer.self_attn.v_proj.weight = buffer[0][2]
+        layer.self_attn.o_proj.weight = buffer[0][3]
+        layer.mlp.gate_proj.weight = buffer[0][4]
+        layer.mlp.up_proj.weight = buffer[0][5]
+        layer.mlp.down_proj.weight = buffer[0][6]
+
+    def recover_cpu_ptrs(self, li: int, buffer_idx: int) -> None:
+        layer: LlamaDecoderLayer = self.layers[li]
+        buffer: list[list[torch.Tensor]] = self.double_buffer[buffer_idx]
+
+        layer.self_attn.q_proj.weight = buffer[1][0]
+        layer.self_attn.k_proj.weight = buffer[1][1]
+        layer.self_attn.v_proj.weight = buffer[1][2]
+        layer.self_attn.o_proj.weight = buffer[1][3]
+        layer.mlp.gate_proj.weight = buffer[1][4]
+        layer.mlp.up_proj.weight = buffer[1][5]
+        layer.mlp.down_proj.weight = buffer[1][6]
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
@@ -999,14 +1045,7 @@ class LlamaModel(LlamaPreTrainedModel):
             # [muchi_mod]
             torch.cuda.nvtx.range_push("target_embed")
 
-            cpu_copy = self.embed_tokens.weight
-            gpu_copy = nn.Parameter(cpu_copy.to(input_ids.device))
-            self.embed_tokens.weight = gpu_copy
-
             inputs_embeds = self.embed_tokens(input_ids)
-
-            self.embed_tokens.weight = cpu_copy
-            del gpu_copy
 
             # [muchi_mod]
             torch.cuda.nvtx.range_pop()
@@ -1041,7 +1080,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         decoder_layer: LlamaDecoderLayer
         for idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.to(hidden_states.device)
+            decoder_layer.to(hidden_states.device) # [CHECKPOINT]
 
             # if idx==16:
             #     print(idx)

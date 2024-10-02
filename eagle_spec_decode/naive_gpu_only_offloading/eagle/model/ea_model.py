@@ -1,4 +1,5 @@
 import copy
+import gc
 import json
 import time
 
@@ -11,6 +12,7 @@ from transformers import PreTrainedModel, PretrainedConfig,AutoConfig
 
 
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from .modeling_llama_kv import LlamaDecoderLayer
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .utils import *
@@ -39,7 +41,7 @@ class EaModel(nn.Module):
     ):
 
         super().__init__()
-        self.base_model = base_model
+        self.base_model: KVLlamaForCausalLM = base_model
         self.config = base_model.config
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
@@ -72,6 +74,10 @@ class EaModel(nn.Module):
         self.ea_layer.init_tree()
         self.kv_cache_device = draft_device
 
+        self.reorg_cpu_weights(draft_device)
+        self.base_model.model.compute_stream = torch.cuda.Stream(device=draft_device)
+        self.base_model.model.double_buffer = self.init_double_buffer(draft_device)
+
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
 
@@ -79,6 +85,71 @@ class EaModel(nn.Module):
             Tokenizer: The tokenizer of the base model.
         """
         return self.tokenizer
+
+    def reorg_cpu_weights(self, draft_device: torch.device) -> None:
+        # assumes that base_model is offloaded to cpu memory
+        self.base_model: KVLlamaForCausalLM
+
+        self.base_model.model.embed_tokens.weight = nn.Parameter(
+            self.base_model.model.embed_tokens.weight.to(draft_device))
+
+        gc.collect()
+
+        layer: LlamaDecoderLayer
+        for layer in self.base_model.model.layers:
+            layer.input_layernorm.weight = nn.Parameter(
+                layer.input_layernorm.weight.to(draft_device))
+            
+            layer.self_attn.q_proj.weight = nn.Parameter(
+                layer.self_attn.q_proj.weight.pin_memory())
+            layer.self_attn.k_proj.weight = nn.Parameter(
+                layer.self_attn.k_proj.weight.pin_memory())
+            layer.self_attn.v_proj.weight = nn.Parameter(
+                layer.self_attn.v_proj.weight.pin_memory())
+            layer.self_attn.o_proj.weight = nn.Parameter(
+                layer.self_attn.o_proj.weight.pin_memory())
+
+            layer.post_attention_layernorm.weight = nn.Parameter(
+                layer.post_attention_layernorm.weight.to(draft_device))
+            
+            layer.mlp.gate_proj.weight = nn.Parameter(
+                layer.mlp.gate_proj.weight.pin_memory())
+            layer.mlp.up_proj.weight = nn.Parameter(
+                layer.mlp.up_proj.weight.pin_memory())
+            layer.mlp.down_proj.weight = nn.Parameter(
+                layer.mlp.down_proj.weight.pin_memory())
+
+            gc.collect()
+
+        self.base_model.model.norm.weight = nn.Parameter(
+            self.base_model.model.norm.weight.to(draft_device))
+        # lm_head is shared between base model and ea_layer
+        self.base_model.lm_head.weight = nn.Parameter(
+            self.base_model.lm_head.weight.to(draft_device))
+
+        gc.collect()
+
+    def init_double_buffer(
+        self, draft_device: torch.device
+    ) -> list[dict[str, torch.Tensor]]:
+        layer: LlamaDecoderLayer = self.base_model.model.layers[0]
+        double_buffer = [
+            [
+                [
+                    torch.zeros_like(layer.self_attn.q_proj).to(draft_device),
+                    torch.zeros_like(layer.self_attn.k_proj).to(draft_device),
+                    torch.zeros_like(layer.self_attn.v_proj).to(draft_device),
+                    torch.zeros_like(layer.self_attn.o_proj).to(draft_device),
+                    torch.zeros_like(layer.mlp.gate_proj).to(draft_device),
+                    torch.zeros_like(layer.mlp.up_proj).to(draft_device),
+                    torch.zeros_like(layer.mlp.down_proj).to(draft_device),
+                ],
+                [None] * 7, # for cpu weight ptrs
+            ]
+            for _ in range(2)
+        ]
+
+        return double_buffer
 
     @classmethod
     def from_pretrained(
@@ -135,8 +206,6 @@ class EaModel(nn.Module):
             ea_layer_state_dict,
             draft_device,
         )
-
-        base_model.lm_head.weight = nn.Parameter(base_model.lm_head.weight.to(draft_device))
 
         if total_token==-1:
             device = model.base_model.model.layers[0].self_attn.q_proj.weight.device

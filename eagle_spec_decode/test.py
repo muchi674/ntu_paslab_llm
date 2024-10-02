@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from transformers import AutoTokenizer
-from offloaded_eagle.eagle.model.ea_model import EaModel
+from naive_gpu_only_offloading.eagle.model.ea_model import EaModel
 
 if __name__ == "__main__":
     draft_model_path = Path("/home/joe/EAGLE-LLaMA3-Instruct-70B")
@@ -24,28 +24,29 @@ if __name__ == "__main__":
         draft_device=gpu
     )
     model.eval()
+    print("FINISHED INITIALIZING MODEL")
 
-    messages = [
-        {
-            "role": "system",
-            "content": "Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.",
-        }
-    ]
-    input_ids: torch.Tensor = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_tensors="pt"
-    ).to(gpu)
+    # messages = [
+    #     {
+    #         "role": "system",
+    #         "content": "Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.",
+    #     }
+    # ]
+    # input_ids: torch.Tensor = tokenizer.apply_chat_template(
+    #     messages, add_generation_prompt=True, return_tensors="pt"
+    # ).to(gpu)
 
-    # torch.compile(model)
+    # # torch.compile(model)
 
-    start_time = time.time()
+    # start_time = time.time()
 
-    output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=64, is_llama3=True, profile=True)
+    # output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=8, is_llama3=True, profile=True)
 
-    torch.cuda.synchronize()
-    total_time = time.time() - start_time
+    # torch.cuda.synchronize()
+    # total_time = time.time() - start_time
 
-    output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    # output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    print(f"TOTAL TIME: {total_time:.2f}")
-    print(f"RESPONSE:")
-    print(output)
+    # print(f"TOTAL TIME: {total_time:.2f}")
+    # print(f"RESPONSE:")
+    # print(output)
