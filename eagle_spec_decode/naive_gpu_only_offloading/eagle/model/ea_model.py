@@ -138,13 +138,13 @@ class EaModel(nn.Module):
         double_buffer = [
             [
                 [
-                    torch.zeros_like(layer.self_attn.q_proj).to(draft_device),
-                    torch.zeros_like(layer.self_attn.k_proj).to(draft_device),
-                    torch.zeros_like(layer.self_attn.v_proj).to(draft_device),
-                    torch.zeros_like(layer.self_attn.o_proj).to(draft_device),
-                    torch.zeros_like(layer.mlp.gate_proj).to(draft_device),
-                    torch.zeros_like(layer.mlp.up_proj).to(draft_device),
-                    torch.zeros_like(layer.mlp.down_proj).to(draft_device),
+                    torch.zeros_like(layer.self_attn.q_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.self_attn.k_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.self_attn.v_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.self_attn.o_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.mlp.gate_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.mlp.up_proj.weight).to(draft_device),
+                    torch.zeros_like(layer.mlp.down_proj.weight).to(draft_device),
                 ],
                 [None] * 7, # for cpu weight ptrs
             ]

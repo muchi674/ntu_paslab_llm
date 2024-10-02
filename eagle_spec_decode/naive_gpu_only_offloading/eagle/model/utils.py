@@ -6,8 +6,6 @@ from typing import List, Tuple
 import time
 import torch
 
-from .ea_model import EaModel
-
 # TODO
 # from transformers import LlamaTokenizer
 # tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
@@ -233,7 +231,7 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
 
 def initialize_tree(
     input_ids,
-    model: EaModel,
+    model,
     past_key_values,
     logits_processor,
 ):
@@ -441,7 +439,7 @@ def update_inference_inputs(
     new_token,
     past_key_values_data_list,
     current_length_data,
-    model: EaModel,
+    model,
     hidden_state_new,
     sample_p,
 ):
