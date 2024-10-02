@@ -891,6 +891,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.gpu: torch.device
         self.compute_stream: torch.cuda.Stream
         self.double_buffer: list[dict[str, torch.Tensor]]
 
@@ -989,7 +990,11 @@ class LlamaModel(LlamaPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            started_prefetch: bool = True,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        if not started_prefetch:
+            self.copy_layer_weights_to_gpu(0, 0)
+
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -1039,8 +1044,6 @@ class LlamaModel(LlamaPreTrainedModel):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
-        main_storage = self.embed_tokens.weight.device
-
         if inputs_embeds is None:
             # [muchi_mod]
             torch.cuda.nvtx.range_push("target_embed")
@@ -1078,10 +1081,11 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        # assume that layer_0 memcpy was issued along with drafting process
+        torch.cuda.synchronize(self.gpu)
+
         decoder_layer: LlamaDecoderLayer
         for idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.to(hidden_states.device) # [CHECKPOINT]
-
             # if idx==16:
             #     print(idx)
             if output_hidden_states:
@@ -1108,14 +1112,15 @@ class LlamaModel(LlamaPreTrainedModel):
                     None,
                 )
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+                with torch.cuda.stream(self.compute_stream):
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                    )
 
             hidden_states = layer_outputs[0]
 
@@ -1125,16 +1130,13 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-            decoder_layer.to(main_storage)
+            if idx < len(self.layers) - 1:
+                self.copy_layer_weights_to_gpu(idx + 1, (idx + 1) % 2)
 
-        cpu_copy = self.norm.weight
-        gpu_copy = nn.Parameter(cpu_copy.to(hidden_states.device))
-        self.norm.weight = gpu_copy
+            torch.cuda.synchronize(self.gpu)
+            self.recover_cpu_ptrs(idx, idx % 2)
 
         hidden_states = self.norm(hidden_states)
-
-        self.norm.weight = cpu_copy
-        del gpu_copy
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

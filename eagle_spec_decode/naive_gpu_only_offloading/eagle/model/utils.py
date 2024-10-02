@@ -6,6 +6,8 @@ from typing import List, Tuple
 import time
 import torch
 
+from .ea_model import EaModel
+
 # TODO
 # from transformers import LlamaTokenizer
 # tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
@@ -229,10 +231,18 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
+def initialize_tree(
+    input_ids,
+    model: EaModel,
+    past_key_values,
+    logits_processor,
+):
     torch.cuda.nvtx.range_push("prefill")
     outputs, orig, hidden_states = model(
-        input_ids, past_key_values=past_key_values, output_orig=True
+        input_ids,
+        past_key_values=past_key_values,
+        output_orig=True,
+        started_prefetch=False,
     )
     torch.cuda.nvtx.range_pop()
 
@@ -247,8 +257,23 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
+    with torch.cuda.stream(model.compute_stream):
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
+            model.ea_layer.topK_genrate(
+                hidden_states, input_ids, model.base_model.lm_head, logits_processor
+            )
+        )
+    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
+
+    return (
+        draft_tokens,
+        retrieve_indices,
+        tree_mask,
+        tree_position_ids,
+        orig,
+        hidden_states,
+        token,
+    )
 
 
 def reset_tree_mode(
@@ -407,34 +432,42 @@ def evaluate_posterior(
 
 @torch.no_grad()
 def update_inference_inputs(
-        input_ids,
-        candidates,
-        best_candidate,
-        accept_length,
-        retrieve_indices,
-        logits_processor,
-        new_token,
-        past_key_values_data_list,
-        current_length_data,
-        model,
-        hidden_state_new,
-        sample_p
+    input_ids,
+    candidates,
+    best_candidate,
+    accept_length,
+    retrieve_indices,
+    logits_processor,
+    new_token,
+    past_key_values_data_list,
+    current_length_data,
+    model: EaModel,
+    hidden_state_new,
+    sample_p,
 ):
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
-            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+        retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
-        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
+        [
+            input_ids,
+            candidates[None, best_candidate, : accept_length + 1].to(input_ids.device),
+        ],
+        dim=-1,
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
     for past_key_values_data in past_key_values_data_list:
-        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
+        tgt = past_key_values_data[
+            ..., select_indices.to(past_key_values_data.device), :
+        ]
         # Destination tensor where the relevant past information will be stored
-        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
+        dst = past_key_values_data[
+            ..., prev_input_len : prev_input_len + tgt.shape[-2], :
+        ]
         # Copy relevant past information from the source to the destination
         dst.copy_(tgt, non_blocking=True)
 
@@ -442,7 +475,9 @@ def update_inference_inputs(
     current_length_data.fill_(prev_input_len + tgt.shape[-2])
 
     retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]
-    accept_hidden_state_new = retrieve_hidden_state_new[:, best_candidate, : accept_length + 1]
+    accept_hidden_state_new = retrieve_hidden_state_new[
+        :, best_candidate, : accept_length + 1
+    ]
     # token=model.base_model.lm_head(accept_hidden_state_new[:,-1]).argmax()
     # token=token[None,None]
     prob = sample_p
@@ -453,14 +488,30 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
 
+    with torch.cuda.stream(model.compute_stream):
+        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
+            model.ea_layer.topK_genrate(
+                accept_hidden_state_new,
+                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                head=model.base_model.lm_head,
+                logits_processor=logits_processor,
+            )
+        )
+    model.base_model.model.copy_layer_weights_to_gpu(0, 0)
 
     new_token += accept_length + 1
 
-    return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
+    return (
+        input_ids,
+        draft_tokens,
+        retrieve_indices,
+        tree_mask,
+        tree_position_ids,
+        new_token,
+        None,
+        token,
+    )
 
 
 if __name__ == "__main__":

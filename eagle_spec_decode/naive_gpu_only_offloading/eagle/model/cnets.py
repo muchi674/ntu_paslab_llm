@@ -869,7 +869,6 @@ class Model(nn.Module):
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
         # [muchi_mod]
-        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids

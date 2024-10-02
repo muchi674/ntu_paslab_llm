@@ -75,7 +75,9 @@ class EaModel(nn.Module):
         self.kv_cache_device = draft_device
 
         self.reorg_cpu_weights(draft_device)
-        self.base_model.model.compute_stream = torch.cuda.Stream(device=draft_device)
+        self.base_model.model.gpu = draft_device
+        self.compute_stream = torch.cuda.Stream(device=draft_device)
+        self.base_model.model.compute_stream = self.compute_stream
         self.base_model.model.double_buffer = self.init_double_buffer(draft_device)
 
     def get_tokenizer(self):
@@ -241,6 +243,7 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            started_prefetch: bool = True,
     ):
         # [muchi_mod]
         torch.cuda.nvtx.range_push("target_forward")
@@ -252,6 +255,7 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                started_prefetch=started_prefetch,
             )
             if output_orig:
                 # [muchi_mod]
