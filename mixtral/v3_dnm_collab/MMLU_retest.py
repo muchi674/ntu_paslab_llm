@@ -49,23 +49,19 @@ def run_inference(model_path, prompt, max_tokens):
         output_lines.append(line)  # 收集输出
 
     process.wait()
-    #print(output_lines)
+
     clean_lines = [line.strip() for line in output_lines if line.strip()]
-    print(clean_lines[-1][0])
+    
     # 假设模型的输出为最后一行结果
-    return clean_lines[-1][0]  # 返回最后一行结果，作为模型推理的输出
+    return clean_lines[-1]  # 返回最后一行结果，作为模型推理的输出
 
 def evaluate_model(model_path, data_dir, split):
     datasets = load_mmlu_data(data_dir, split)
-    total_correct = 0
-    total_questions = 0
 
-    with open("MMLU.txt", "w") as f:
+    with open("MMLU_retest.txt", "w") as f:
         for subject, data in datasets.items():
-            correct_predictions = 0
-            error_count = 0
-            error_which = []
-            f.write(f"{subject}\n\n")
+            
+            f.write(f"{subject}\n")
 
             for i in range(data.shape[0]):
                 question = data.iloc[i, 0]
@@ -75,33 +71,12 @@ def evaluate_model(model_path, data_dir, split):
                 prompt = format_prompt(question, options)
                 
                 # 调用推理函数
-                predicted_answer = run_inference(model_path, prompt, 2)
+                predicted_answer = run_inference(model_path, prompt, 15)
                 print("The answer is",predicted_answer)
-                f.write(f"{predicted_answer}  ")
-                if predicted_answer not in choices:
-                    error_count += 1
-                    error_which.append((i+1))
+                f.write(f"{predicted_answer}\n")
 
-                # 检查预测结果是否与正确答案一致
-                if predicted_answer == correct_answer:
-                    correct_predictions += 1
-                
-                total_questions += 1
-            total_correct += correct_predictions
-            
-            accuracy = correct_predictions / data.shape[0]
-            print(f"{subject} Accuracy: {accuracy:.2%}")
-            if error_count != 0:
-                f.write(f"\nFuckkkk !!!! We have {error_count} errors, which are {error_which}\n\n")
-            f.write(f"{subject} Accuracy: {accuracy:.2%}\n")
-            f.write(f"correct_prediction: {correct_predictions}\n")
-            f.write("==========================================================================================================\n\n")
-
-        overall_accuracy = total_correct / total_questions
-        print(f"Overall Accuracy: {overall_accuracy:.2%}")
-        print("total_correct:",total_correct,"   ","total_questions",total_questions)
-        f.write(f"Overall Accuracy: {overall_accuracy:.2%}\n")
-        f.write(f"total_correct: {total_correct}  total_questions: {total_questions}\n")
+        
+            f.write("\n\n")
     f.close()
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
