@@ -49,7 +49,7 @@ def run_inference(model_path, prompt, max_tokens):
         output_lines.append(line)  # 收集输出
 
     process.wait()
-    print(output_lines)
+    #print(output_lines)
     clean_lines = [line.strip() for line in output_lines if line.strip()]
     print(clean_lines[-1][0])
     # 假设模型的输出为最后一行结果
@@ -85,15 +85,16 @@ def evaluate_model(model_path, data_dir, split):
             
             accuracy = correct_predictions / data.shape[0]
             print(f"{subject} Accuracy: {accuracy:.2%}")
+            f.write(f"\n{subject} Accuracy: {accuracy:.2%}")
             f.write(f"\ncorrect_prediction: {correct_predictions}\n")
-            f.write("=====================================================================\n")
+            f.write("=====================================================================\n\n")
 
         overall_accuracy = total_correct / total_questions
         print(f"Overall Accuracy: {overall_accuracy:.2%}")
         print("total_correct:",total_correct,"   ","total_questions",total_questions)
         f.write(f"Overall Accuracy: {overall_accuracy:.2%}\n")
         f.write(f"total_correct: {total_correct}  total_questions: {total_questions}\n")
-
+    f.close()
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True, help="模型的路径")
