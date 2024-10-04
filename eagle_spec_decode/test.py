@@ -6,7 +6,8 @@ import torch
 
 from transformers import AutoTokenizer
 from EAGLE.eagle.model.ea_model import EaModel as OnChipEaModel
-from naive_gpu_only_offloading.eagle.model.ea_model import EaModel as OffloadedEaModel
+from gpu_only_offloading.eagle.model.ea_model import EaModel as OffloadedEaModel
+from static_collab.eagle.model.ea_model import EaModel as StaticCollabEaModel
 
 def on_chip_test(gpu: torch.device):
     draft_model_path = Path("/home/joe/EAGLE-LLaMA3-Instruct-8B")
@@ -16,7 +17,7 @@ def on_chip_test(gpu: torch.device):
     model = OnChipEaModel.from_pretrained(
         base_model_path=target_model_path,
         ea_model_path=draft_model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map=gpu,  # same as default
         total_token=59
@@ -33,7 +34,25 @@ def gpu_only_offloading_test(cpu: torch.device, gpu: torch.device):
     model = OffloadedEaModel.from_pretrained(
         base_model_path=target_model_path,
         ea_model_path=draft_model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map=cpu,
+        total_token=59,  # same as default
+        draft_device=gpu
+    )
+
+    return tokenizer, model
+
+def static_collab_test(cpu: torch.device, gpu: torch.device):
+    draft_model_path = Path("/home/joe/EAGLE-LLaMA3-Instruct-70B")
+    target_model_path = Path("/home/joe/Meta-Llama-3-70B-Instruct")
+    torch.set_default_device(gpu)
+
+    tokenizer = AutoTokenizer.from_pretrained(target_model_path)
+    model = StaticCollabEaModel.from_pretrained(
+        base_model_path=target_model_path,
+        ea_model_path=draft_model_path,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map=cpu,
         total_token=59,  # same as default
@@ -46,7 +65,8 @@ if __name__ == "__main__":
     cpu = torch.device("cpu")
     gpu = torch.device("cuda:0")
     # tokenizer, model = on_chip_test(gpu)
-    tokenizer, model = gpu_only_offloading_test(cpu, gpu)
+    # tokenizer, model = gpu_only_offloading_test(cpu, gpu)
+    tokenizer, model = static_collab_test(cpu, gpu)
     model.eval()
     print("FINISHED INITIALIZING MODEL")
 
