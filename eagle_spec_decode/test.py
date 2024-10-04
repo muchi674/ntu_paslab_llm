@@ -45,8 +45,8 @@ def gpu_only_offloading_test(cpu: torch.device, gpu: torch.device):
 if __name__ == "__main__":
     cpu = torch.device("cpu")
     gpu = torch.device("cuda:0")
-    tokenizer, model = on_chip_test(gpu)
-    # tokenizer, model = gpu_only_offloading_test(cpu, gpu)
+    # tokenizer, model = on_chip_test(gpu)
+    tokenizer, model = gpu_only_offloading_test(cpu, gpu)
     model.eval()
     print("FINISHED INITIALIZING MODEL")
 
@@ -64,11 +64,11 @@ if __name__ == "__main__":
 
     # warmup
     for _ in range(3):
-        model.eagenerate(input_ids, temperature=0.5, max_new_tokens=512, is_llama3=True)
+        model.eagenerate(input_ids, temperature=0.5, max_new_tokens=1, is_llama3=True)
 
     start_time = time.time()
 
-    output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=512, is_llama3=True, profile=True)
+    output_ids = model.eagenerate(input_ids, temperature=0.5, max_new_tokens=128, is_llama3=True, profile=True)
 
     torch.cuda.synchronize()
     total_time = time.time() - start_time
