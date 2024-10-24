@@ -68,7 +68,7 @@ def max_fn(x):
 @torch.inference_mode()
 def TriForce(
     tokenizer,
-    graph_engine,
+    device,
     input_ids,
     gamma=4,
     max_len=256,
@@ -99,7 +99,7 @@ def TriForce(
         verify_tokens = torch.cat(
             [
                 next_token,
-                torch.LongTensor([generated_ids]).to(graph_engine.engine.model.device),
+                torch.LongTensor([generated_ids]).to(device),
             ],
             dim=1,
         )

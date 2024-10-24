@@ -406,15 +406,11 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        # weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-
-        # batch_size = inputs.shape[0]
-        weights, selected_experts = torch.topk(gate_logits, 1)
-        # idx = torch.tensor([[0, 2] for _ in range(batch_size)], device=inputs.device)
-        # weights = torch.gather(weights, dim=1, index=idx)
-        # selected_experts = torch.gather(selected_experts, dim=1, index=idx)
+        weights, selected_experts = torch.topk(
+            gate_logits, self.num_experts_per_tok if not drafting else 1
+        )
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
 
         results = torch.zeros_like(inputs)
@@ -458,11 +454,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[CacheView],
+        drafting: bool,
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward.forward(self.ffn_norm(h), drafting)
         out = h + r
         return out
 
@@ -513,6 +513,7 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
+        drafting: bool = False,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -523,7 +524,7 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, drafting)
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -655,26 +656,129 @@ def generate(
     )
 
 
-def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-    if temperature > 0:
-        probs = torch.softmax(logits / temperature, dim=-1)
-        next_token = sample_top_p(probs, top_p)
-    else:
-        next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
+def verify_greedy(
+    draft_tokens: torch.Tensor, verify_logits: torch.Tensor, draft_seq_len: int
+) -> list[torch.Tensor]:
+    # draft_tokens.shape = (batch_size, draft_seq_len)
+    # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
+    # Compare draft tokens against argmax(logits) for each position in the sequence
+    verify_tokens = sample(verify_logits[:, :-1], greedy=True)
+    acceptance = (draft_tokens == verify_tokens).to(torch.int32)
+    accept_lens = torch.cumprod(acceptance, dim=1).sum(dim=1)
+    accept_lens = torch.where(
+        accept_lens == draft_seq_len, accept_lens + 1, accept_lens
+    )
+    accept_lens = torch.where(accept_lens == 0, 1, accept_lens)
+    return [seq[: accept_lens[bi]] for bi, seq in enumerate(verify_tokens)]
 
-    return next_token.reshape(-1)
+
+def verify_non_greedy(
+    draft_tokens: torch.Tensor,
+    draft_probs: torch.Tensor,
+    verify_logits: torch.Tensor,
+    draft_seq_len: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+):
+    count = 0
+    verify_probs = []
+
+    probs = norm_logits(verify_logits, temperature=temperature, top_k=top_k, top_p=top_p)
+    for i in range(gamma2 + 1):
+        verify_probs.append(probs[i])
+
+    pass_tokens = torch.full(
+        (1, gamma2 + 2), 100, device=graph_engine.engine.model.device
+    )
+    pass_tokens[:, 0] = next_token
+
+    # tokens are indices in vocabulary
+    for i, draft_prob, verify_prob in zip(draft_tokens, draft_probs, verify_probs):
+        r = torch.rand(1, device=graph_engine.engine.model.device)
+        if r < torch.min(
+            torch.tensor([1], device=r.device),
+            (verify_prob[i] / speculation_prob[i]),
+        ):
+            count += 1
+            accepted_count += 1
+            n += 1
+            pred_token_idx = torch.tensor([[i]]).to(graph_engine.engine.model.device)
+            pass_tokens[:, count] = pred_token_idx
+            # if eos
+            if tokenizer.eos_token_id == i:
+                draft_count -= gamma2 - count
+                break
+        else:
+            resample_count += 1
+            n += 1
+            pred_token_idx = sample(max_fn(verify_prob - speculation_prob))
+            pass_tokens[:, count + 1] = pred_token_idx
+            break
+
+        if tokenizer.eos_token_id == pred_token_idx:
+            break
+
+    if count == len(generated_ids):
+        target_sample_count += 1
+        n += 1
+        pred_token_idx = sample(verify_probs[-1])
+        pass_tokens[:, count + 1] = pred_token_idx
+        count += 1
 
 
-def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    assert 0 <= p <= 1
+# copied from https://github.com/LeeSinLiang/microGPT/blob/ed40cf9780dbeb180adfe94c227d4aa97e69250e/gpt.py
+def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
+    # unlike Meta Llama's reference implementation,
+    # this version preserves the order of logits throughput computation
+    if top_k > 0:
+        filter = torch.topk(logits, min(top_k, logits.size(-1)))[0]
+        logits[logits < filter[:, [-1]]] = float("-inf")
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        filter = cumulative_probs > top_p
+        filter[..., 1:] = filter[..., :-1].clone()
+        filter[..., 0] = 0
+        indices_to_remove = filter.scatter(1, sorted_indices, filter)
+        logits[indices_to_remove] = float("-inf")
+    return logits
 
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    return torch.gather(probs_idx, -1, next_token)
+
+# copied from https://github.com/Infini-AI-Lab/TriForce/blob/main/utils/sampling.py
+# -----TriForce start-----
+
+
+def norm_logits(
+    logits: torch.Tensor, temperature: float = 0.6, top_k: int = -1, top_p: float = 0.9
+) -> torch.Tensor:
+    assert logits.dim() == 2  # (batch_size, vocab_dim)
+    if temperature == 0:
+        return logits
+
+    logits = logits / temperature
+    logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
+
+    probs = F.softmax(logits, dim=-1)
+    return probs
+
+
+def sample(probs: torch.Tensor, num_samples: int = 1, greedy: bool = False):
+    if greedy:
+        # input is actually logits (not yet normalized to probability distribution)
+        return torch.argmax(probs, dim=-1)
+    return torch.multinomial(probs, num_samples=num_samples, replacement=True)
+
+
+def max_fn(x: torch.Tensor):
+    x_max = torch.where(x > 0, x, torch.zeros_like(x))
+    x_max_sum = torch.sum(x_max, dim=-1, keepdim=True)
+    if x_max_sum == 0:
+        print(x.max(), x.min(), x.shape)
+    return x_max / x_max_sum
+
+
+# -----TriForce end-----
 
 
 def main(
