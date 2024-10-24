@@ -564,7 +564,10 @@ def generate(
     *,
     max_tokens: int,
     max_batch_size: int = 64,
-    temperature: float = 0.0,
+    draft_seq_len: int = 8,
+    temperature: float = 0.6,
+    top_k: int = -1,
+    top_p: float = 0.9,
     eos_id: Optional[int] = None,
     verbose: bool = False,
 ) -> Tuple[List[str], int, float, int, float]:
@@ -573,6 +576,7 @@ def generate(
     prefill_toc = torch.cuda.Event(enable_timing=True)
     prefill_tic.record()
 
+    greedy = temperature == 0
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
             ChatCompletionRequest(messages=[UserMessage(content=p)])
@@ -596,13 +600,15 @@ def generate(
 
     # prefill / prompt evaluation stage
     reset_perf_logs()  # perf_analysis
-    prelogits = model.forward(
+    logits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
     )
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-    last_token_prelogits = prelogits.index_select(0, last_positions)
+    last_positions = torch.tensor(seqlens, device=logits.device).cumsum(dim=0) - 1
+    logits = logits.index_select(0, last_positions)
+    verify_context = draft_context = sample(logits, greedy=greedy)
+
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
@@ -616,19 +622,56 @@ def generate(
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
-    generated_tensors = []
+    acceptance_lens = [[] for _ in range(B)]
+    accepted_tokens = [[] for _ in range(B)]
     is_finished = torch.tensor([False for _ in range(B)])
 
-    for _ in range(max_tokens):
-        next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        is_finished = is_finished | (next_token == eos_id).cpu()
+    while True:
+        # context.shape = (batch_size, vocab_dim)
+        draft_probs = []
+        draft_tokens = []
+        for _ in range(draft_seq_len):
+            logits = model.forward(
+                draft_context, seqlens=[1] * B, cache=cache, drafting=True
+            )
+            logits = norm_logits(logits, temperature=temperature, top_p=top_p)
+            draft_context = sample(logits, greedy=greedy)
+            draft_probs.append(logits)
+            draft_tokens.append(draft_context)
+
+        draft_tokens = torch.cat(draft_tokens, dim=1)
+        verify_context = torch.cat((verify_context, draft_tokens), dim=1)
+        # needs to adjust cache
+        verify_logits = model.forward(verify_context, seqlens=[1] * B, cache=cache)
+
+        if greedy:
+            verify_greedy(
+                draft_tokens,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                draft_seq_len,
+                eos_id,
+            )
+        else:
+            verify_non_greedy(
+                draft_tokens,
+                draft_probs,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                B,
+                draft_seq_len,
+                temperature,
+                top_k,
+                top_p,
+                eos_id,
+            )
+
+        # needs to adjust cache
 
         if is_finished.all():
             break
-
-        generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
