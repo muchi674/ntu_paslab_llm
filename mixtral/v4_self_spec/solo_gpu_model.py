@@ -657,102 +657,117 @@ def generate(
 
 
 def verify_greedy(
-    draft_tokens: torch.Tensor, verify_logits: torch.Tensor, draft_seq_len: int
+    draft_tokens: torch.Tensor,
+    verify_logits: torch.Tensor,
+    is_finished: torch.Tensor,
+    accepted_tokens: list,
+    draft_seq_len: int,
+    eos_id: int,
 ) -> list[torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
     # Compare draft tokens against argmax(logits) for each position in the sequence
     verify_tokens = sample(verify_logits[:, :-1], greedy=True)
     acceptance = (draft_tokens == verify_tokens).to(torch.int32)
-    accept_lens = torch.cumprod(acceptance, dim=1).sum(dim=1)
-    accept_lens = torch.where(
-        accept_lens == draft_seq_len, accept_lens + 1, accept_lens
-    )
-    accept_lens = torch.where(accept_lens == 0, 1, accept_lens)
-    return [seq[: accept_lens[bi]] for bi, seq in enumerate(verify_tokens)]
+    acceptance_lens = torch.cumprod(acceptance, dim=1).sum(dim=1).tolist()
+
+    for bi, accept_len in enumerate(acceptance_lens.copy()):
+        res = draft_tokens[bi, :accept_len]
+        if accept_len == 0:
+            res = verify_tokens[bi, 0]
+            acceptance_lens[bi] += 1
+        elif accept_len == draft_seq_len:
+            res = torch.cat((res, sample(verify_logits[bi, -1], greedy=True)))
+            acceptance_lens[bi] += 1
+
+        accepted_tokens[bi].append(res)
+        is_finished[bi] = is_finished[bi] | torch.any(res == eos_id)
+
+    return acceptance_lens
 
 
 def verify_non_greedy(
     draft_tokens: torch.Tensor,
     draft_probs: torch.Tensor,
     verify_logits: torch.Tensor,
+    is_finished: torch.Tensor,
+    accepted_tokens: list,
+    batch_size: int,
     draft_seq_len: int,
     temperature: float,
     top_k: int,
     top_p: float,
+    eos_id: int,
 ):
-    count = 0
-    verify_probs = []
+    def mark_if_finished(bi: int, tkn: torch.Tensor):
+        is_finished[bi] = is_finished[bi] | (tkn == eos_id)
 
-    probs = norm_logits(verify_logits, temperature=temperature, top_k=top_k, top_p=top_p)
-    for i in range(gamma2 + 1):
-        verify_probs.append(probs[i])
-
-    pass_tokens = torch.full(
-        (1, gamma2 + 2), 100, device=graph_engine.engine.model.device
+    # draft_tokens.shape = (batch_size, draft_seq_len)
+    # draft_probs.shape = (batch_size, draft_seq_len, vocab_dim)
+    # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
+    device = draft_tokens.device
+    verify_probs = norm_logits(
+        verify_logits, temperature=temperature, top_k=top_k, top_p=top_p
     )
-    pass_tokens[:, 0] = next_token
+    acceptance_lens = []
 
-    # tokens are indices in vocabulary
-    for i, draft_prob, verify_prob in zip(draft_tokens, draft_probs, verify_probs):
-        r = torch.rand(1, device=graph_engine.engine.model.device)
-        if r < torch.min(
-            torch.tensor([1], device=r.device),
-            (verify_prob[i] / speculation_prob[i]),
-        ):
-            count += 1
-            accepted_count += 1
-            n += 1
-            pred_token_idx = torch.tensor([[i]]).to(graph_engine.engine.model.device)
-            pass_tokens[:, count] = pred_token_idx
-            # if eos
-            if tokenizer.eos_token_id == i:
-                draft_count -= gamma2 - count
+    # for each in batch
+    for bi, dts, dps, vps in zip(
+        range(batch_size), draft_tokens, draft_probs, verify_probs
+    ):
+        # for each position in draft sequence
+        res = []
+        for i, draft_prob, verify_prob in zip(dts, dps, vps):
+            r = torch.rand(1, device=device)
+            if r < torch.min(
+                torch.tensor([1], device=device), (verify_prob[i] / draft_prob[i])
+            ):
+                res.append(i)
+                mark_if_finished(bi, i)
+            else:
+                resampled = sample(max_fn(verify_prob - draft_prob))
+                res.append(resampled)
+                mark_if_finished(bi, resampled)
                 break
-        else:
-            resample_count += 1
-            n += 1
-            pred_token_idx = sample(max_fn(verify_prob - speculation_prob))
-            pass_tokens[:, count + 1] = pred_token_idx
-            break
 
-        if tokenizer.eos_token_id == pred_token_idx:
-            break
+        if len(res) == draft_seq_len:
+            i = sample(vps[-1])
+            res.append(i)
+            mark_if_finished(bi, i)
 
-    if count == len(generated_ids):
-        target_sample_count += 1
-        n += 1
-        pred_token_idx = sample(verify_probs[-1])
-        pass_tokens[:, count + 1] = pred_token_idx
-        count += 1
+        accepted_tokens[bi].append(torch.cat(res))
+        acceptance_lens.append(len(res))
+
+    return acceptance_lens
 
 
-# copied from https://github.com/LeeSinLiang/microGPT/blob/ed40cf9780dbeb180adfe94c227d4aa97e69250e/gpt.py
+# modified from https://github.com/LeeSinLiang/microGPT/blob/ed40cf9780dbeb180adfe94c227d4aa97e69250e/gpt.py
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
+    # logits.shape = (batch_size, seq_len, vocab_dim)
     # unlike Meta Llama's reference implementation,
     # this version preserves the order of logits throughput computation
     if top_k > 0:
         filter = torch.topk(logits, min(top_k, logits.size(-1)))[0]
-        logits[logits < filter[:, [-1]]] = float("-inf")
+        logits[logits < filter[:, :, [-1]]] = float("-inf")
     if top_p > 0.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
         filter = cumulative_probs > top_p
         filter[..., 1:] = filter[..., :-1].clone()
         filter[..., 0] = 0
-        indices_to_remove = filter.scatter(1, sorted_indices, filter)
+        indices_to_remove = filter.scatter(2, sorted_indices, filter)
         logits[indices_to_remove] = float("-inf")
     return logits
 
 
-# copied from https://github.com/Infini-AI-Lab/TriForce/blob/main/utils/sampling.py
+# modified from https://github.com/Infini-AI-Lab/TriForce/blob/main/utils/sampling.py
 # -----TriForce start-----
 
 
 def norm_logits(
     logits: torch.Tensor, temperature: float = 0.6, top_k: int = -1, top_p: float = 0.9
 ) -> torch.Tensor:
-    assert logits.dim() == 2  # (batch_size, vocab_dim)
+    assert logits.dim() == 3  # (batch_size, seq_len, vocab_dim)
     if temperature == 0:
         return logits
 
