@@ -18,6 +18,7 @@ from xformers.ops.fmha.attn_bias import (  # type: ignore
     AttentionBias,
     BlockDiagonalCausalMask,
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
+    BlockDiagonalMask,
 )
 
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
@@ -248,9 +249,12 @@ class BufferCache:
 
         return self
 
-    def update_seqlens(self, seqlens: List[int]) -> None:
+    def update_seqlens(self, seqlens: List[int], deducts: bool = False) -> None:
         assert self.kv_seqlens is not None
-        self.kv_seqlens += torch.tensor(seqlens, device=self.device, dtype=torch.long)
+        adjustments = torch.tensor(seqlens, device=self.device, dtype=torch.long)
+        if deducts:
+            adjustments *= -1
+        self.kv_seqlens += adjustments
 
     def get_input_metadata(self, seqlens: List[int]) -> CacheInputMetadata:
         """
@@ -278,12 +282,21 @@ class BufferCache:
         )
         cache_positions = positions + batch_idx * self.max_seq_len
 
-        during_prefill = seqpos[0] == 0
-        if during_prefill:
+        first_prefill = seqpos[0] == 0
+        subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
+        if first_prefill:
             assert all([pos == 0 for pos in seqpos]), seqpos
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(
                 self.max_seq_len
             )
+        elif subsequent_prefill:
+            mask = BlockDiagonalMask.from_seqlens(
+                q_seqlen=seqlens,
+                kv_seqlen=[
+                    s + cached_s.clamp(max=self.max_seq_len).item()
+                    for (s, cached_s) in zip(seqlens, self.kv_seqlens)
+                ],
+            ).make_local_attention_from_bottomright(self.max_seq_len)
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
@@ -296,7 +309,7 @@ class BufferCache:
         return CacheInputMetadata(
             positions=positions,
             cache_positions=cache_positions,
-            prefill=during_prefill,
+            prefill=first_prefill or subsequent_prefill,
             mask=mask,
             seqlens=seqlens,
         )
@@ -587,7 +600,7 @@ def generate(
     seqlens = [len(x) for x in encoded_prompts]
 
     # Cache
-    cache_window = max(seqlens) + max_tokens
+    cache_window = max(seqlens) + max_tokens + draft_seq_len
     cache = BufferCache(
         model.args.n_layers,
         max_batch_size,
@@ -624,11 +637,13 @@ def generate(
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
 
+    curr_gen_lens = [0] * B
     acceptance_lens = []
     accepted_tokens = [[] for _ in range(B)]
     is_finished = torch.tensor([False for _ in range(B)], device=model.device)
+    is_finished = is_finished | (verify_context == eos_id)
 
-    while True:
+    while min(curr_gen_lens) < max_tokens and not is_finished.all():
         # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
@@ -646,8 +661,10 @@ def generate(
 
         draft_tokens = torch.cat(draft_tokens, dim=1)
         verify_context = torch.cat((verify_context, draft_tokens), dim=1)
-        # needs to adjust cache
-        verify_logits = model.forward(verify_context, seqlens=[1] * B, cache=cache)
+        cache.update_seqlens([draft_seq_len] * B, deducts=True)
+        verify_logits = model.forward(
+            verify_context, seqlens=[1 + draft_seq_len] * B, cache=cache
+        )
 
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
@@ -673,19 +690,21 @@ def generate(
                 eos_id,
             )
 
-        # needs to adjust cache
+        acceptance_lens.append(curr_accept_lens)
+        cache.update_seqlens(
+            [1 + draft_seq_len - val for val in curr_accept_lens], deducts=True
+        )
+        for bi, val in enumerate(curr_accept_lens):
+            curr_gen_lens[bi] += val
 
-        if is_finished.all():
-            break
-
-    generated_tokens: List[List[int]]
+    responses = []
     n_gen_tkns = 0
-    if generated_tensors:
-        generated_tokens = torch.cat(generated_tensors, 1).tolist()
-        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-    else:
-        generated_tokens = []
-    responses = [tokenizer.decode(y) for y in generated_tokens]
+    for tkns in accepted_tokens:
+        if len(tkns) > 0:
+            tkns = torch.cat(tkns, dim=0).tolist()
+            n_gen_tkns += len(tkns) - 1
+        responses.append(tokenizer.decode(tkns))
+
     decode_toc.record()
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
@@ -765,18 +784,20 @@ def verify_non_greedy(
     ):
         # for each position in draft sequence
         res = []
+        count = 0
         for i, draft_prob, verify_prob in zip(dts, dps, vps):
             r = torch.rand(1, device=device)
             if r < torch.min(
                 torch.tensor([1], device=device), (verify_prob[i] / draft_prob[i])
             ):
+                count += 1
                 res.append(i[None])
             else:
                 resampled = sample(max_fn(verify_prob - draft_prob))
                 res.append(resampled)
                 break
 
-        if len(res) == draft_seq_len:
+        if count == draft_seq_len:
             i = sample(vps[-1])
             res.append(i)
 
