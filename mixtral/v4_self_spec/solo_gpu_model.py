@@ -600,6 +600,7 @@ def generate(
 
     # prefill / prompt evaluation stage
     reset_perf_logs()  # perf_analysis
+
     logits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
@@ -607,7 +608,7 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=logits.device).cumsum(dim=0) - 1
     logits = logits.index_select(0, last_positions)
-    verify_context = draft_context = sample(logits, greedy=greedy)
+    verify_context = sample(logits, greedy=greedy)
 
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
@@ -622,19 +623,23 @@ def generate(
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
-    acceptance_lens = [[] for _ in range(B)]
+
+    acceptance_lens = []
     accepted_tokens = [[] for _ in range(B)]
-    is_finished = torch.tensor([False for _ in range(B)])
+    is_finished = torch.tensor([False for _ in range(B)], device=model.device)
 
     while True:
-        # context.shape = (batch_size, vocab_dim)
+        # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
+        draft_context = verify_context
         for _ in range(draft_seq_len):
             logits = model.forward(
                 draft_context, seqlens=[1] * B, cache=cache, drafting=True
             )
-            logits = norm_logits(logits, temperature=temperature, top_p=top_p)
+            logits = norm_logits(
+                logits, temperature=temperature, top_k=top_k, top_p=top_p
+            )  # .shape = (batch_size, vocab_dim)
             draft_context = sample(logits, greedy=greedy)
             draft_probs.append(logits)
             draft_tokens.append(draft_context)
@@ -645,7 +650,7 @@ def generate(
         verify_logits = model.forward(verify_context, seqlens=[1] * B, cache=cache)
 
         if greedy:
-            verify_greedy(
+            curr_accept_lens, verify_context = verify_greedy(
                 draft_tokens,
                 verify_logits,
                 is_finished,
@@ -654,7 +659,7 @@ def generate(
                 eos_id,
             )
         else:
-            verify_non_greedy(
+            curr_accept_lens, verify_context = verify_non_greedy(
                 draft_tokens,
                 draft_probs,
                 verify_logits,
@@ -706,13 +711,14 @@ def verify_greedy(
     accepted_tokens: list,
     draft_seq_len: int,
     eos_id: int,
-) -> list[torch.Tensor]:
+) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
     # Compare draft tokens against argmax(logits) for each position in the sequence
     verify_tokens = sample(verify_logits[:, :-1], greedy=True)
     acceptance = (draft_tokens == verify_tokens).to(torch.int32)
     acceptance_lens = torch.cumprod(acceptance, dim=1).sum(dim=1).tolist()
+    next_verify_context = []
 
     for bi, accept_len in enumerate(acceptance_lens.copy()):
         res = draft_tokens[bi, :accept_len]
@@ -724,9 +730,10 @@ def verify_greedy(
             acceptance_lens[bi] += 1
 
         accepted_tokens[bi].append(res)
+        next_verify_context.append(res[None, -1])
         is_finished[bi] = is_finished[bi] | torch.any(res == eos_id)
 
-    return acceptance_lens
+    return acceptance_lens, torch.stack(next_verify_context, dim=0)
 
 
 def verify_non_greedy(
@@ -741,10 +748,7 @@ def verify_non_greedy(
     top_k: int,
     top_p: float,
     eos_id: int,
-):
-    def mark_if_finished(bi: int, tkn: torch.Tensor):
-        is_finished[bi] = is_finished[bi] | (tkn == eos_id)
-
+) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # draft_probs.shape = (batch_size, draft_seq_len, vocab_dim)
     # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
@@ -753,6 +757,7 @@ def verify_non_greedy(
         verify_logits, temperature=temperature, top_k=top_k, top_p=top_p
     )
     acceptance_lens = []
+    next_verify_context = []
 
     # for each in batch
     for bi, dts, dps, vps in zip(
@@ -765,23 +770,24 @@ def verify_non_greedy(
             if r < torch.min(
                 torch.tensor([1], device=device), (verify_prob[i] / draft_prob[i])
             ):
-                res.append(i)
-                mark_if_finished(bi, i)
+                res.append(i[None])
             else:
                 resampled = sample(max_fn(verify_prob - draft_prob))
                 res.append(resampled)
-                mark_if_finished(bi, resampled)
                 break
 
         if len(res) == draft_seq_len:
             i = sample(vps[-1])
             res.append(i)
-            mark_if_finished(bi, i)
 
-        accepted_tokens[bi].append(torch.cat(res))
         acceptance_lens.append(len(res))
+        next_verify_context.append(res[-1])
 
-    return acceptance_lens
+        res = torch.cat(res, dim=0)
+        accepted_tokens[bi].append(res)
+        is_finished[bi] = is_finished[bi] | torch.any(res == eos_id)
+
+    return acceptance_lens, torch.stack(next_verify_context, dim=0)
 
 
 # modified from https://github.com/LeeSinLiang/microGPT/blob/ed40cf9780dbeb180adfe94c227d4aa97e69250e/gpt.py
