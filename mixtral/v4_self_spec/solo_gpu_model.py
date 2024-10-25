@@ -551,9 +551,13 @@ class Transformer(nn.Module):
             model_path / "non-experts.pt",
             map_location=gpu,
             mmap=True,
+            weights_only=True,
         )
         experts = torch.load(
-            model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
+            model_path / "experts.pt",
+            map_location=torch.device("cpu"),
+            mmap=True,
+            weights_only=True,
         )
 
         for li in range(model_args.n_layers):
@@ -621,6 +625,8 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=logits.device).cumsum(dim=0) - 1
     logits = logits.index_select(0, last_positions)
+    logits = norm_logits(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+    print(logits.shape)
     verify_context = sample(logits, greedy=greedy)
 
     prefill_toc.record()
@@ -649,6 +655,7 @@ def generate(
         draft_tokens = []
         draft_context = verify_context
         for _ in range(draft_seq_len):
+            print(draft_context.shape)
             logits = model.forward(
                 draft_context, seqlens=[1] * B, cache=cache, drafting=True
             )
@@ -660,7 +667,7 @@ def generate(
             draft_tokens.append(draft_context)
 
         draft_tokens = torch.cat(draft_tokens, dim=1)
-        verify_context = torch.cat((verify_context, draft_tokens), dim=1)
+        verify_context = torch.flatten(torch.cat((verify_context, draft_tokens), dim=1))
         cache.update_seqlens([draft_seq_len] * B, deducts=True)
         verify_logits = model.forward(
             verify_context, seqlens=[1 + draft_seq_len] * B, cache=cache
@@ -672,6 +679,7 @@ def generate(
                 verify_logits,
                 is_finished,
                 accepted_tokens,
+                B,
                 draft_seq_len,
                 eos_id,
             )
@@ -728,12 +736,16 @@ def verify_greedy(
     verify_logits: torch.Tensor,
     is_finished: torch.Tensor,
     accepted_tokens: list,
+    batch_size: int,
     draft_seq_len: int,
     eos_id: int,
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
-    # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
+    # verify_logits.shape = (batch_size * (draft_seq_len + 1), vocab_dim)
     # Compare draft tokens against argmax(logits) for each position in the sequence
+    verify_logits = verify_logits.unflatten(
+        dim=0, sizes=(batch_size, draft_seq_len + 1)
+    )
     verify_tokens = sample(verify_logits[:, :-1], greedy=True)
     acceptance = (draft_tokens == verify_tokens).to(torch.int32)
     acceptance_lens = torch.cumprod(acceptance, dim=1).sum(dim=1).tolist()
@@ -752,7 +764,7 @@ def verify_greedy(
         next_verify_context.append(res[None, -1])
         is_finished[bi] = is_finished[bi] | torch.any(res == eos_id)
 
-    return acceptance_lens, torch.stack(next_verify_context, dim=0)
+    return acceptance_lens, torch.cat(next_verify_context, dim=0)
 
 
 def verify_non_greedy(
@@ -770,11 +782,11 @@ def verify_non_greedy(
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # draft_probs.shape = (batch_size, draft_seq_len, vocab_dim)
-    # verify_logits.shape = (batch_size, draft_seq_len + 1, vocab_dim)
+    # verify_logits.shape = (batch_size * (draft_seq_len + 1), vocab_dim)
     device = draft_tokens.device
     verify_probs = norm_logits(
         verify_logits, temperature=temperature, top_k=top_k, top_p=top_p
-    )
+    ).unflatten(dim=0, sizes=(batch_size, draft_seq_len + 1))
     acceptance_lens = []
     next_verify_context = []
 
@@ -808,24 +820,23 @@ def verify_non_greedy(
         accepted_tokens[bi].append(res)
         is_finished[bi] = is_finished[bi] | torch.any(res == eos_id)
 
-    return acceptance_lens, torch.stack(next_verify_context, dim=0)
+    return acceptance_lens, torch.cat(next_verify_context, dim=0)
 
 
 # modified from https://github.com/LeeSinLiang/microGPT/blob/ed40cf9780dbeb180adfe94c227d4aa97e69250e/gpt.py
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0):
-    # logits.shape = (batch_size, seq_len, vocab_dim)
     # unlike Meta Llama's reference implementation,
     # this version preserves the order of logits throughput computation
     if top_k > 0:
         filter = torch.topk(logits, min(top_k, logits.size(-1)))[0]
-        logits[logits < filter[:, :, [-1]]] = float("-inf")
+        logits[logits < filter[:, [-1]]] = float("-inf")
     if top_p > 0.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
         filter = cumulative_probs > top_p
         filter[..., 1:] = filter[..., :-1].clone()
         filter[..., 0] = 0
-        indices_to_remove = filter.scatter(2, sorted_indices, filter)
+        indices_to_remove = filter.scatter(1, sorted_indices, filter)
         logits[indices_to_remove] = float("-inf")
     return logits
 
@@ -837,7 +848,6 @@ def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0)
 def norm_logits(
     logits: torch.Tensor, temperature: float = 0.6, top_k: int = -1, top_p: float = 0.9
 ) -> torch.Tensor:
-    assert logits.dim() == 3  # (batch_size, seq_len, vocab_dim)
     if temperature == 0:
         return logits
 
