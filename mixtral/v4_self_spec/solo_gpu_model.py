@@ -626,7 +626,6 @@ def generate(
     last_positions = torch.tensor(seqlens, device=logits.device).cumsum(dim=0) - 1
     logits = logits.index_select(0, last_positions)
     logits = norm_logits(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-    print(logits.shape)
     verify_context = sample(logits, greedy=greedy)
 
     prefill_toc.record()
@@ -643,9 +642,9 @@ def generate(
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
 
-    curr_gen_lens = [0] * B
+    curr_gen_lens = [1] * B
     acceptance_lens = []
-    accepted_tokens = [[] for _ in range(B)]
+    accepted_tokens = [[verify_context[None, i]] for i in range(B)]
     is_finished = torch.tensor([False for _ in range(B)], device=model.device)
     is_finished = is_finished | (verify_context == eos_id)
 
@@ -655,7 +654,6 @@ def generate(
         draft_tokens = []
         draft_context = verify_context
         for _ in range(draft_seq_len):
-            print(draft_context.shape)
             logits = model.forward(
                 draft_context, seqlens=[1] * B, cache=cache, drafting=True
             )
@@ -664,10 +662,13 @@ def generate(
             )  # .shape = (batch_size, vocab_dim)
             draft_context = sample(logits, greedy=greedy)
             draft_probs.append(logits)
-            draft_tokens.append(draft_context)
+            draft_tokens.append(draft_context[:, None])
 
+        draft_probs = torch.stack(draft_probs, dim=1)
         draft_tokens = torch.cat(draft_tokens, dim=1)
-        verify_context = torch.flatten(torch.cat((verify_context, draft_tokens), dim=1))
+        verify_context = torch.flatten(
+            torch.cat((verify_context[:, None], draft_tokens), dim=1)
+        )
         cache.update_seqlens([draft_seq_len] * B, deducts=True)
         verify_logits = model.forward(
             verify_context, seqlens=[1 + draft_seq_len] * B, cache=cache
@@ -720,6 +721,13 @@ def generate(
         on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
         print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
         print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
+        print(
+            "AVG ACCEPTANCE LENGTH BY BATCH:\n",
+            torch.tensor(acceptance_lens, device="cpu")
+            .to(torch.float32)
+            .mean(dim=0)
+            .tolist(),
+        )
 
     return (
         seqlens,
@@ -859,10 +867,13 @@ def norm_logits(
 
 
 def sample(probs: torch.Tensor, num_samples: int = 1, greedy: bool = False):
+    # probs.shape = (batch_size, vocab_dim)
     if greedy:
         # input is actually logits (not yet normalized to probability distribution)
-        return torch.argmax(probs, dim=-1)
-    return torch.multinomial(probs, num_samples=num_samples, replacement=True)
+        return torch.argmax(probs, dim=-1)  # lowers one dimension
+    return torch.multinomial(probs, num_samples=num_samples, replacement=True).reshape(
+        -1
+    )
 
 
 def max_fn(x: torch.Tensor):
@@ -904,6 +915,7 @@ def main(
         gpu_0,
         max_tokens=1,
         max_batch_size=len(prompts),
+        draft_seq_len=8,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
@@ -914,6 +926,7 @@ def main(
         gpu_0,
         max_tokens=max_tokens,
         max_batch_size=len(prompts),
+        draft_seq_len=8,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         verbose=True,  # perf_analysis
     )
