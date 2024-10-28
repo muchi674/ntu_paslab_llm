@@ -25,13 +25,6 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-# ACT_STATS = None
-
-
-# def reset_perf_logs():
-#     global ACT_STATS
-#     ACT_STATS = {li: [] for li in range(32)}
-
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -377,22 +370,6 @@ class Attention(nn.Module):
         return self.wo(output)  # type: ignore
 
 
-# class Experts:
-#     # tmp design:
-#     # 1. shared across layers
-#     # 2. CPU and GPU computations are not overlapped
-
-#     def __init__(self, ws: dict):
-#         self.ws = ws
-
-#     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-#         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-#         ex = x.to(w.device)
-#         ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-#         return ey.to(x.device)  # type: ignore
-
-
-# perf_analysis
 class Experts:
     # tmp design:
     # 1. shared across layers
@@ -401,13 +378,11 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws = ws
 
-    def forward(self, li: int, ei: int, x: torch.Tensor, on_gpu_cnt: int):
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        if w.is_cuda:
-            on_gpu_cnt += x.shape[0]
         ex = x.to(w.device)
         ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device), on_gpu_cnt  # type: ignore
+        return ey.to(x.device)  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -427,7 +402,6 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
 
         results = torch.zeros_like(inputs)
-        on_gpu_cnt = 0  # perf_analysis
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
@@ -435,11 +409,8 @@ class MoeLayer(nn.Module):
             if torch.numel(batch_idx) == 0:
                 continue
 
-            ey, on_gpu_cnt = self.experts.forward(
-                self.li, ei, inputs[batch_idx], on_gpu_cnt
-            )  # perf_analysis
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        # ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))  # perf_analysis
         return results
 
 
@@ -950,7 +921,7 @@ def main(
             max_tokens=1,
             max_batch_size=len(prompt_batch),
             # temperature=0,
-            draft_seq_len=8,
+            draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
@@ -962,7 +933,7 @@ def main(
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
-            draft_seq_len=8,
+            draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
             verbose=True,  # perf_analysis
         )
