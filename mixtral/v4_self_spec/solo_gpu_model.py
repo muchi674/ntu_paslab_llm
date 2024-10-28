@@ -896,7 +896,7 @@ def main(
     hide_resp: bool,
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    gpu_0 = torch.device("cuda:0")
+    gpu = torch.device("cuda:0")
     prompts: list[str] = None
     if prompt:
         prompts = [prompt]
@@ -905,14 +905,14 @@ def main(
         n_repeats = -(n_prompts // -len(dataset))  # ceil division
         prompts = (dataset * n_repeats)[:n_prompts]
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu_0)
+    model = Transformer.load(Path(model_path), gpu)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        gpu_0,
+        gpu,
         max_tokens=1,
         max_batch_size=len(prompts),
         # temperature=0,
@@ -924,7 +924,7 @@ def main(
         prompts,
         tokenizer,
         model,
-        gpu_0,
+        gpu,
         max_tokens=max_tokens,
         max_batch_size=len(prompts),
         # temperature=0,
