@@ -25,12 +25,12 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-ACT_STATS = None
+# ACT_STATS = None
 
 
-def reset_perf_logs():
-    global ACT_STATS
-    ACT_STATS = {li: [] for li in range(32)}
+# def reset_perf_logs():
+#     global ACT_STATS
+#     ACT_STATS = {li: [] for li in range(32)}
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
@@ -435,7 +435,7 @@ class MoeLayer(nn.Module):
                 self.li, ei, inputs[batch_idx], on_gpu_cnt
             )  # perf_analysis
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))  # perf_analysis
+        # ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))  # perf_analysis
         return results
 
 
@@ -616,7 +616,7 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
-    reset_perf_logs()  # perf_analysis
+    # reset_perf_logs()  # perf_analysis
 
     logits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
@@ -631,13 +631,13 @@ def generate(
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
-    if verbose:  # perf_analysis
-        on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
-        print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}")
+    # if verbose:  # perf_analysis
+    #     on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
+    #     print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
+    #     print(f"AVG: {round(mean(on_gpu_pct), 3)}")
 
     # decode
-    reset_perf_logs()  # perf_analysis
+    # reset_perf_logs()  # perf_analysis
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
@@ -648,7 +648,7 @@ def generate(
     is_finished = torch.tensor([False for _ in range(B)], device=model.device)
     is_finished = is_finished | (verify_context == eos_id)
 
-    while min(curr_gen_lens) < max_tokens and not is_finished.all():
+    while max(curr_gen_lens) < max_tokens and not is_finished.all():
         # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
@@ -718,9 +718,9 @@ def generate(
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
     if verbose:  # perf_analysis
-        on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
-        print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
+        # on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
+        # print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
+        # print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
         print(
             "AVG ACCEPTANCE LENGTH BY BATCH:\n",
             torch.tensor(acceptance_lens, device="cpu")
@@ -762,10 +762,10 @@ def verify_greedy(
     for bi, accept_len in enumerate(acceptance_lens.copy()):
         res = draft_tokens[bi, :accept_len]
         if accept_len == 0:
-            res = verify_tokens[bi, 0]
+            res = verify_tokens[bi, 0][None]
             acceptance_lens[bi] += 1
         elif accept_len == draft_seq_len:
-            res = torch.cat((res, sample(verify_logits[bi, -1], greedy=True)))
+            res = torch.cat((res, sample(verify_logits[None, bi, -1], greedy=True)))
             acceptance_lens[bi] += 1
 
         accepted_tokens[bi].append(res)
@@ -915,7 +915,8 @@ def main(
         gpu_0,
         max_tokens=1,
         max_batch_size=len(prompts),
-        draft_seq_len=8,
+        # temperature=0,
+        draft_seq_len=6,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
@@ -926,7 +927,8 @@ def main(
         gpu_0,
         max_tokens=max_tokens,
         max_batch_size=len(prompts),
-        draft_seq_len=8,
+        # temperature=0,
+        draft_seq_len=6,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         verbose=True,  # perf_analysis
     )
