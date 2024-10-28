@@ -431,6 +431,10 @@ class MoeLayer(nn.Module):
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+
+            if torch.numel(batch_idx) == 0:
+                continue
+
             ey, on_gpu_cnt = self.experts.forward(
                 self.li, ei, inputs[batch_idx], on_gpu_cnt
             )  # perf_analysis
@@ -640,6 +644,11 @@ def generate(
     # reset_perf_logs()  # perf_analysis
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
+    sub_tic = torch.cuda.Event(enable_timing=True)
+    sub_toc = torch.cuda.Event(enable_timing=True)
+    draft_lats = []
+    target_lats = []
+    verify_lats = []
     decode_tic.record()
 
     curr_gen_lens = [1] * B
@@ -649,6 +658,8 @@ def generate(
     is_finished = is_finished | (verify_context == eos_id)
 
     while max(curr_gen_lens) < max_tokens and not is_finished.all():
+        sub_tic.record()
+
         # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
@@ -664,6 +675,11 @@ def generate(
             draft_probs.append(logits)
             draft_tokens.append(draft_context[:, None])
 
+        sub_toc.record()
+        torch.cuda.synchronize(device=gpu)
+        draft_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+        sub_tic.record()
+
         draft_probs = torch.stack(draft_probs, dim=1)
         draft_tokens = torch.cat(draft_tokens, dim=1)
         verify_context = torch.flatten(
@@ -673,6 +689,11 @@ def generate(
         verify_logits = model.forward(
             verify_context, seqlens=[1 + draft_seq_len] * B, cache=cache
         )
+
+        sub_toc.record()
+        torch.cuda.synchronize(device=gpu)
+        target_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+        sub_tic.record()
 
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
@@ -699,6 +720,10 @@ def generate(
                 eos_id,
             )
 
+        sub_toc.record()
+        torch.cuda.synchronize(device=gpu)
+        verify_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+
         acceptance_lens.append(curr_accept_lens)
         cache.update_seqlens(
             [1 + draft_seq_len - val for val in curr_accept_lens], deducts=True
@@ -721,6 +746,9 @@ def generate(
         # on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
         # print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
         # print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
+        print(f"AVG draft latency: {mean(draft_lats)} secs")
+        print(f"AVG target latency: {mean(target_lats)} secs")
+        print(f"AVG verify latency: {mean(verify_lats)} secs")
         print(
             "AVG ACCEPTANCE LENGTH BY BATCH:\n",
             torch.tensor(acceptance_lens, device="cpu")
@@ -892,10 +920,12 @@ def main(
     prompt: str,
     prompt_path: str,
     n_prompts: int,
+    batch_size: int,
     max_tokens: int,
     hide_resp: bool,
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    assert n_prompts % batch_size == 0
     gpu = torch.device("cuda:0")
     prompts: list[str] = None
     if prompt:
@@ -907,52 +937,58 @@ def main(
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), gpu)
 
-    # warmup
-    generate(
-        ["hello, how are you?"],
-        tokenizer,
-        model,
-        gpu,
-        max_tokens=1,
-        max_batch_size=len(prompts),
-        # temperature=0,
-        draft_seq_len=6,
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-    )
+    start = 0
+    for end in range(batch_size, n_prompts + 1, batch_size):
+        prompt_batch = prompts[start:end]
 
-    seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
-        prompts,
-        tokenizer,
-        model,
-        gpu,
-        max_tokens=max_tokens,
-        max_batch_size=len(prompts),
-        # temperature=0,
-        draft_seq_len=6,
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        verbose=True,  # perf_analysis
-    )
-    print("=" * 20)
-    print("PERFORMANCE BREAKDOWN\n")
-    print("PROMPT EVALUATION:")
-    print(f"token count: {n_p_tkns}")
-    print(f"total time in sec(s): {prefill_time:.2f}")
-    print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
-    print("TOKEN GENERATION:")
-    print(f"token count: {n_gen_tkns}")
-    print(f"total time in sec(s): {decode_time:.2f}")
-    if n_gen_tkns > 0:
-        print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
-    else:
-        responses = ["" for _ in prompts]
-    if not hide_resp:
+        # warmup
+        generate(
+            ["hello, how are you?"],
+            tokenizer,
+            model,
+            gpu,
+            max_tokens=1,
+            max_batch_size=len(prompt_batch),
+            # temperature=0,
+            draft_seq_len=8,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        )
+
+        seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
+            prompt_batch,
+            tokenizer,
+            model,
+            gpu,
+            max_tokens=max_tokens,
+            max_batch_size=len(prompt_batch),
+            # temperature=0,
+            draft_seq_len=8,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            verbose=True,  # perf_analysis
+        )
         print("=" * 20)
-        print("In-n-Outs")
-        print(f"AVG seqlen: {mean(seqlens)}")
-        print(f"seqlens: {seqlens}\n")
-        for p, resp in zip(prompts, responses):
-            print(f"PROMPT:\n{p}")
-            print(f"RESPONSE:\n{resp}\n")
+        print("PERFORMANCE BREAKDOWN\n")
+        print("PROMPT EVALUATION:")
+        print(f"token count: {n_p_tkns}")
+        print(f"total time in sec(s): {prefill_time:.2f}")
+        print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
+        print("TOKEN GENERATION:")
+        print(f"token count: {n_gen_tkns}")
+        print(f"total time in sec(s): {decode_time:.2f}")
+        if n_gen_tkns > 0:
+            print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
+        else:
+            responses = ["" for _ in prompt_batch]
+        if not hide_resp:
+            print("=" * 20)
+            print("In-n-Outs")
+            print(f"AVG seqlen: {mean(seqlens)}")
+            print(f"seqlens: {seqlens}\n")
+            for p, resp in zip(prompt_batch, responses):
+                print(f"PROMPT:\n{p}")
+                print(f"RESPONSE:\n{resp}\n")
+
+        start = end
 
 
 if __name__ == "__main__":
@@ -961,6 +997,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
@@ -970,6 +1007,7 @@ if __name__ == "__main__":
         args.prompt,
         args.prompt_path,
         args.n_prompts,
+        args.batch_size,
         args.max_tokens,
         args.hide_resp,
     )
