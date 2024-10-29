@@ -4,6 +4,7 @@
 import argparse
 import inspect
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -561,8 +562,7 @@ def generate(
     top_k: int = -1,
     top_p: float = 0.9,
     eos_id: Optional[int] = None,
-    verbose: bool = False,
-) -> Tuple[List[str], int, float, int, float]:
+) -> tuple[list[int], list[str], int, float, int, float, float, float, float, float]:
     model = model.eval()
     prefill_tic = torch.cuda.Event(enable_timing=True)
     prefill_toc = torch.cuda.Event(enable_timing=True)
@@ -591,8 +591,6 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
-    # reset_perf_logs()  # perf_analysis
-
     logits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
@@ -606,13 +604,8 @@ def generate(
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
-    # if verbose:  # perf_analysis
-    #     on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
-    #     print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
-    #     print(f"AVG: {round(mean(on_gpu_pct), 3)}")
 
     # decode
-    # reset_perf_logs()  # perf_analysis
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     sub_tic = torch.cuda.Event(enable_timing=True)
@@ -648,7 +641,7 @@ def generate(
 
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
-        draft_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+        draft_lats.append(sub_tic.elapsed_time(sub_toc))
         sub_tic.record()
 
         draft_probs = torch.stack(draft_probs, dim=1)
@@ -663,7 +656,7 @@ def generate(
 
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
-        target_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+        target_lats.append(sub_tic.elapsed_time(sub_toc))
         sub_tic.record()
 
         if greedy:
@@ -693,7 +686,7 @@ def generate(
 
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
-        verify_lats.append(sub_tic.elapsed_time(sub_toc) / 1000)
+        verify_lats.append(sub_tic.elapsed_time(sub_toc))
 
         acceptance_lens.append(curr_accept_lens)
         cache.update_seqlens(
@@ -713,20 +706,6 @@ def generate(
     decode_toc.record()
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
-    if verbose:  # perf_analysis
-        # on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
-        # print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
-        # print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
-        print(f"AVG draft latency: {mean(draft_lats)} secs")
-        print(f"AVG target latency: {mean(target_lats)} secs")
-        print(f"AVG verify latency: {mean(verify_lats)} secs")
-        print(
-            "AVG ACCEPTANCE LENGTH BY BATCH:\n",
-            torch.tensor(acceptance_lens, device="cpu")
-            .to(torch.float32)
-            .mean(dim=0)
-            .tolist(),
-        )
 
     return (
         seqlens,
@@ -735,6 +714,18 @@ def generate(
         prefill_time,
         n_gen_tkns,
         decode_time,
+        mean(draft_lats) if len(draft_lats) > 0 else None,  # in ms
+        mean(target_lats) if len(target_lats) > 0 else None,  # in ms
+        mean(verify_lats) if len(verify_lats) > 0 else None,  # in ms
+        (
+            torch.tensor(acceptance_lens, device="cpu")
+            .to(torch.float32)
+            .flatten()
+            .mean(dim=0)
+            .item()
+            if len(acceptance_lens) > 0
+            else None
+        ),
     )
 
 
@@ -908,6 +899,13 @@ def main(
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), gpu)
 
+    prefill_tps = []
+    decode_tps = []
+    avg_draft_lats = []
+    avg_target_lats = []
+    avg_verify_lats = []
+    avg_accept_lens = []
+
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
@@ -925,7 +923,18 @@ def main(
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
-        seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
+        (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+            avg_draft_lat,
+            avg_target_lat,
+            avg_verify_lat,
+            avg_accept_len,
+        ) = generate(
             prompt_batch,
             tokenizer,
             model,
@@ -935,24 +944,42 @@ def main(
             # temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-            verbose=True,  # perf_analysis
         )
+
+        prefill_tp = n_p_tkns / prefill_time
+        decode_tp = n_gen_tkns / decode_time
+        prefill_tps.append(prefill_tp)
+        decode_tps.append(decode_tp)
+        if avg_draft_lat is not None:
+            avg_draft_lats.append(avg_draft_lat)
+            avg_target_lats.append(avg_target_lat)
+            avg_verify_lats.append(avg_verify_lat)
+            avg_accept_lens.append(avg_accept_len)
+
         print("=" * 20)
         print("PERFORMANCE BREAKDOWN\n")
         print("PROMPT EVALUATION:")
         print(f"token count: {n_p_tkns}")
         print(f"total time in sec(s): {prefill_time:.2f}")
-        print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
+        print(f"throughput: {prefill_tp:.2f} t/s")
         print("TOKEN GENERATION:")
         print(f"token count: {n_gen_tkns}")
         print(f"total time in sec(s): {decode_time:.2f}")
         if n_gen_tkns > 0:
-            print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
+            print(f"throughput: {decode_tp:.2f} t/s")
         else:
             responses = ["" for _ in prompt_batch]
+        print("SPECULATIVE DECODING")
+        if avg_draft_lat is not None:
+            print(f"avg draft latency: {avg_draft_lat:.2f} ms")
+            print(f"avg target latency: {avg_target_lat:.2f} ms")
+            print(f"avg verify latency: {avg_verify_lat:.2f} ms")
+            print(f"avg acceptance length: {avg_accept_len:.2f}")
+        else:
+            print("skipped")
         if not hide_resp:
             print("=" * 20)
-            print("In-n-Outs")
+            print("INS-N-OUTS")
             print(f"AVG seqlen: {mean(seqlens)}")
             print(f"seqlens: {seqlens}\n")
             for p, resp in zip(prompt_batch, responses):
@@ -960,6 +987,17 @@ def main(
                 print(f"RESPONSE:\n{resp}\n")
 
         start = end
+        time.sleep(45)
+
+    print("=" * 20)
+    print("RUN STATISTICS")
+    print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+    print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if len(avg_draft_lats) > 0:
+        print(f"avg draft latency: {mean(avg_draft_lats):.2f} ms")
+        print(f"avg target latency: {mean(avg_target_lats):.2f} ms")
+        print(f"avg verify latency: {mean(avg_verify_lats):.2f} ms")
+        print(f"avg acceptance length: {mean(avg_accept_lens):.2f}")
 
 
 if __name__ == "__main__":
