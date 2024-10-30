@@ -327,12 +327,35 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
+    def get_attention_score(
+        self,
+        key: torch.tensor,
+        val: torch.tensor,
+        seqlen_sum: int,
+        cache: Optional[CacheView],
+    ):
+        # Repeat keys and values to match number of query heads
+        key, val = repeat_kv(key, val, self.repeats, dim=1)
+
+        # xformers requires (B=1, S, H, D)
+        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
+        output = memory_efficient_attention(
+            xq, key, val, None if cache is None else cache.mask
+        )
+        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
+
+        assert isinstance(output, torch.Tensor)
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
+        draft_x: torch.Tensor = None,
     ) -> torch.Tensor:
+        if draft_x:
+            x = torch.cat((x, draft_x), dim=0)
         seqlen_sum, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -347,7 +370,8 @@ class Attention(nn.Module):
             key, val = cache.interleave_kv(xk, xv)
             cache.update(xk, xv)
         else:
-            cache.update(xk, xv)
+            # draft_x should only appear here
+            cache.update(xk[1:], xv[1:])
             key, val = cache.key, cache.value
             key = key.view(
                 seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
@@ -356,18 +380,7 @@ class Attention(nn.Module):
                 seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
             )
 
-        # Repeat keys and values to match number of query heads
-        key, val = repeat_kv(key, val, self.repeats, dim=1)
-
-        # xformers requires (B=1, S, H, D)
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(
-            xq, key, val, None if cache is None else cache.mask
-        )
-        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
-
-        assert isinstance(output, torch.Tensor)
-
+        output = self.get_attention_score(key, val, seqlen_sum, cache)
         return self.wo(output)  # type: ignore
 
 
@@ -420,11 +433,8 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-
             if torch.numel(batch_idx) == 0:
                 continue
-
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         return results
