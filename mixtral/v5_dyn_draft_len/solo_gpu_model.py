@@ -327,13 +327,27 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
+    def reshape_cache(
+        self,
+        xk: torch.tensor,
+        xv: torch.tensor,
+        seqlen_sum: int,
+        cache: Optional[CacheView],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache.update(xk, xv)
+        key, val = cache.key, cache.value
+        key = key.view(seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim)
+        val = val.view(seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim)
+        return key, val
+
     def get_attention_score(
         self,
+        xq: torch.tensor,
         key: torch.tensor,
         val: torch.tensor,
         seqlen_sum: int,
         cache: Optional[CacheView],
-    ):
+    ) -> torch.Tensor:
         # Repeat keys and values to match number of query heads
         key, val = repeat_kv(key, val, self.repeats, dim=1)
 
@@ -343,8 +357,6 @@ class Attention(nn.Module):
             xq, key, val, None if cache is None else cache.mask
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
-
-        assert isinstance(output, torch.Tensor)
         return output
 
     def forward(
@@ -354,11 +366,26 @@ class Attention(nn.Module):
         cache: Optional[CacheView],
         draft_x: torch.Tensor = None,
     ) -> torch.Tensor:
-        if draft_x:
-            x = torch.cat((x, draft_x), dim=0)
         seqlen_sum, _ = x.shape
 
+        if draft_x:
+            x = torch.cat((x, draft_x), dim=0)
+
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        if draft_x:
+            # wq.shape = (seqlen_sum * 2, args.n_heads * args.head_dim)
+            d_xq = xq[seqlen_sum:].view(seqlen_sum, self.n_heads, self.head_dim)
+            d_xk = xk[seqlen_sum:].view(seqlen_sum, self.n_kv_heads, self.head_dim)
+            d_xv = xv[seqlen_sum:].view(seqlen_sum, self.n_kv_heads, self.head_dim)
+            d_xq, d_xk = apply_rotary_emb(d_xq, d_xk, freqs_cis=freqs_cis)
+            d_key, d_val = self.reshape_cache(d_xk, d_xv, seqlen_sum, cache)
+            d_out = self.get_attention_score(d_xq, d_key, d_val, seqlen_sum, cache)
+
+            xq = xq[:seqlen_sum]
+            xk = xk[:seqlen_sum]
+            xv = xv[:seqlen_sum]
+
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
         xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
@@ -370,17 +397,11 @@ class Attention(nn.Module):
             key, val = cache.interleave_kv(xk, xv)
             cache.update(xk, xv)
         else:
-            # draft_x should only appear here
-            cache.update(xk[1:], xv[1:])
-            key, val = cache.key, cache.value
-            key = key.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
-            val = val.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
+            key, val = self.reshape_cache(xk, xv, seqlen_sum, cache)
 
-        output = self.get_attention_score(key, val, seqlen_sum, cache)
+        output = self.get_attention_score(xq, key, val, seqlen_sum, cache)
+        if draft_x:
+            output = torch.cat((output, d_out), dim=0)
         return self.wo(output)  # type: ignore
 
 
@@ -407,29 +428,36 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.n_layers_cached = 25
+        self.n_experts_cached = 2
 
     def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_tok if not drafting else 1
+            gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
         )
 
-        # weights, selected_experts = torch.topk(
-        #     gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
-        # )
-        # # hardcoded logic
-        # if drafting:
-        #     bi = torch.where(selected_experts[:, 0, None] != 0)[0]
-        #     selected_experts[bi, 1] = 0
-        #     weights[bi, 1] = gate_logits[bi, 0]
-        #     weights = weights[:,:2]
-        #     selected_experts = selected_experts[:,:2]
+        # hardcoded logic
+        if drafting:
+            if self.li >= self.n_layers_cached:
+                weights = weights[:, :2]
+                selected_experts = selected_experts[:, :2]
+            else:
+                # top1 cached AND top2 cached -> ignore
+                # top1 cached AND top2 NOT cached
+                # top1 NOT cached AND top2 cached -> ignore
+                # top1 NOT cached AND top2 NOT cached
 
-        # weights, selected_experts = torch.topk(
-        #     gate_logits, self.num_experts_per_tok if not drafting or self.li < 7 else 1
-        # )
+                selected_experts[:, 0] >= self.n_experts_cached
+                selected_experts[:, 1] >= self.n_experts_cached
+
+                bi = torch.where()[0]
+                selected_experts[bi, 1] = 0
+                weights[bi, 1] = gate_logits[bi, 0]
+                weights = weights[:, :2]
+                selected_experts = selected_experts[:, :2]
+
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-
         results = torch.zeros_like(inputs)
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
@@ -561,12 +589,9 @@ class Transformer(nn.Module):
             weights_only=True,
         )
 
-        for li in range(model_args.n_layers):
+        for li in range(25):
             experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
-
-        # for li in range(7):
-        #     for ei in range(8):
-        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+            experts[f"{li}.1"] = experts[f"{li}.1"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))

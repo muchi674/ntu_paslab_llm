@@ -397,9 +397,9 @@ class MoeLayer(nn.Module):
 
     def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        # weights, selected_experts = torch.topk(
-        #     gate_logits, self.num_experts_per_tok if not drafting else 1
-        # )
+        weights, selected_experts = torch.topk(
+            gate_logits, self.num_experts_per_tok if not drafting else 1
+        )
 
         # weights, selected_experts = torch.topk(
         #     gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
@@ -412,9 +412,9 @@ class MoeLayer(nn.Module):
         #     weights = weights[:,:2]
         #     selected_experts = selected_experts[:,:2]
 
-        weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_tok if not drafting or self.li >= 25 else 1
-        )
+        # weights, selected_experts = torch.topk(
+        #     gate_logits, self.num_experts_per_tok if not drafting or self.li < 7 else 1
+        # )
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
 
         results = torch.zeros_like(inputs)
@@ -551,12 +551,13 @@ class Transformer(nn.Module):
             weights_only=True,
         )
 
-        # for li in range(model_args.n_layers):
-        #     experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
+        for li in range(25):
+            experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
+            experts[f"{li}.1"] = experts[f"{li}.1"].to(gpu)
 
-        for li in range(25, 32):
-            for ei in range(8):
-                experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
+        # for li in range(7):
+        #     for ei in range(8):
+        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -935,7 +936,7 @@ def main(
             gpu,
             max_tokens=1,
             max_batch_size=len(prompt_batch),
-            temperature=0,
+            # temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
@@ -958,7 +959,7 @@ def main(
             gpu,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
-            temperature=0,
+            # temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
