@@ -1,3 +1,4 @@
+'''
 import pandas as pd
 import argparse
 import os
@@ -24,7 +25,7 @@ def format_prompt(question, choices):
     prompt = f"Question: {question}\n"
     for i, choice in enumerate(choices):
         prompt += f"{chr(65+i)}) {choice}\n"
-    prompt += "Using only one token to answer (choose A, B, C, or D):"
+    prompt += "Give me your conclusion (choose A, B, C or D) directly!! Do not explain!!"
     return prompt
 
 def run_inference(model_path, prompt, max_tokens):
@@ -53,7 +54,7 @@ def run_inference(model_path, prompt, max_tokens):
     clean_lines = [line.strip() for line in output_lines if line.strip()]
     
     # 假设模型的输出为最后一行结果
-    return clean_lines[-1]  # 返回最后一行结果，作为模型推理的输出
+    return clean_lines[-15:]  # 返回最后一行结果，作为模型推理的输出
 
 def evaluate_model(model_path, data_dir, split):
     datasets = load_mmlu_data(data_dir, split)
@@ -61,7 +62,7 @@ def evaluate_model(model_path, data_dir, split):
     with open("MMLU_retest.txt", "w") as f:
         for subject, data in datasets.items():
             
-            f.write(f"{subject}\n")
+            #f.write(f"{subject}\n")
 
             for i in range(data.shape[0]):
                 question = data.iloc[i, 0]
@@ -71,12 +72,11 @@ def evaluate_model(model_path, data_dir, split):
                 prompt = format_prompt(question, options)
                 
                 # 调用推理函数
-                predicted_answer = run_inference(model_path, prompt, 15)
-                print("The answer is",predicted_answer)
-                f.write(f"{predicted_answer}\n")
+                predicted_answer = run_inference(model_path, prompt, 512)
+                for i in range (len(predicted_answer)):
+                    f.write(f"{predicted_answer[i]}\n")
+                f.write("\n\n\n")
 
-        
-            f.write("\n\n")
     f.close()
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -87,3 +87,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     evaluate_model(args.model_path, args.data_dir, args.split)
+
+    # python MMLU_retest.py --model-path ~/Mixtral-8x7B-Instruct-v0.1-Official/ --data-dir ~/ntu_paslab_llm/mixtral/MMLU/ --split 
+'''
