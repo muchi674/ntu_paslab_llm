@@ -697,7 +697,6 @@ def generate(
     p_draft_lats = []
     draft_lats = []
     target_lats = []
-    verify_lats = []
     decode_tic.record()
 
     curr_gen_lens = [1] * B
@@ -715,8 +714,8 @@ def generate(
         verify_logits = blended_logits[: B // 2]
         draft_probs = norm_logits(
             blended_logits[B // 2 :], temperature=temperature, top_k=top_k, top_p=top_p
-        ) # .shape = (batch_size, vocab_dim)
-        draft_tokens = sample(probs, greedy=greedy)[:, None]
+        )  # .shape = (batch_size, vocab_dim)
+        draft_tokens = sample(draft_probs, greedy=greedy)[:, None]
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
                 draft_tokens,
@@ -742,11 +741,16 @@ def generate(
                 eos_id,
             )
 
-        # continue if verification fails
-
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
         p_draft_lats.append(sub_tic.elapsed_time(sub_toc))
+
+        for bi in range(B):
+            curr_gen_lens[bi] += 1
+        # should include cases where max_tokens is reached
+        if min(curr_accept_lens) == 0:
+            continue
+
         sub_tic.record()
 
         # context.shape = (batch_size, 1)
@@ -780,7 +784,6 @@ def generate(
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
         target_lats.append(sub_tic.elapsed_time(sub_toc))
-        sub_tic.record()
 
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
@@ -789,8 +792,9 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                draft_seq_len,
+                1,
                 eos_id,
+                parallel=True,
             )
         else:
             curr_accept_lens, verify_context = verify_non_greedy(
@@ -800,16 +804,13 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                draft_seq_len,
+                1,
                 temperature,
                 top_k,
                 top_p,
                 eos_id,
+                parallel=True,
             )
-
-        sub_toc.record()
-        torch.cuda.synchronize(device=gpu)
-        verify_lats.append(sub_tic.elapsed_time(sub_toc))
 
         acceptance_lens.append(curr_accept_lens)
         cache.update_seqlens(
@@ -860,14 +861,19 @@ def verify_greedy(
     batch_size: int,
     draft_seq_len: int,
     eos_id: int,
+    parallel: bool = False,
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # verify_logits.shape = (batch_size * (draft_seq_len + 1), vocab_dim)
     # Compare draft tokens against argmax(logits) for each position in the sequence
-    verify_logits = verify_logits.unflatten(
-        dim=0, sizes=(batch_size, draft_seq_len + 1)
-    )
-    verify_tokens = sample(verify_logits[:, :-1], greedy=True)
+    if parallel:
+        verify_logits = verify_logits.unflatten(dim=0, sizes=(batch_size, 1))
+        verify_tokens = sample(verify_logits, greedy=True)
+    else:
+        verify_logits = verify_logits.unflatten(
+            dim=0, sizes=(batch_size, draft_seq_len + 1)
+        )
+        verify_tokens = sample(verify_logits[:, :-1], greedy=True)
     acceptance = (draft_tokens == verify_tokens).to(torch.int32)
     acceptance_lens = torch.cumprod(acceptance, dim=1).sum(dim=1).tolist()
     next_verify_context = []
@@ -876,8 +882,9 @@ def verify_greedy(
         res = draft_tokens[bi, :accept_len]
         if accept_len == 0:
             res = verify_tokens[bi, 0][None]
-            acceptance_lens[bi] += 1
-        elif accept_len == draft_seq_len:
+            if not parallel:
+                acceptance_lens[bi] += 1
+        elif accept_len == draft_seq_len and not parallel:
             res = torch.cat((res, sample(verify_logits[None, bi, -1], greedy=True)))
             acceptance_lens[bi] += 1
 
@@ -900,6 +907,7 @@ def verify_non_greedy(
     top_k: int,
     top_p: float,
     eos_id: int,
+    parallel: bool = False,
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # draft_probs.shape = (batch_size, draft_seq_len, vocab_dim)
@@ -907,7 +915,7 @@ def verify_non_greedy(
     device = draft_tokens.device
     verify_probs = norm_logits(
         verify_logits, temperature=temperature, top_k=top_k, top_p=top_p
-    ).unflatten(dim=0, sizes=(batch_size, draft_seq_len + 1))
+    ).unflatten(dim=0, sizes=(batch_size, draft_seq_len + 1 if not parallel else 1))
     acceptance_lens = []
     next_verify_context = []
 
@@ -918,6 +926,7 @@ def verify_non_greedy(
         # for each position in draft sequence
         res = []
         count = 0
+        adjustment = 0
         for i, draft_prob, verify_prob in zip(dts, dps, vps):
             r = torch.rand(1, device=device)
             if r < torch.min(
@@ -928,13 +937,15 @@ def verify_non_greedy(
             else:
                 resampled = sample(max_fn(verify_prob - draft_prob))
                 res.append(resampled)
+                if parallel:
+                    adjustment -= 1
                 break
 
-        if count == draft_seq_len:
+        if count == draft_seq_len and not parallel:
             i = sample(vps[-1])
             res.append(i)
 
-        acceptance_lens.append(len(res))
+        acceptance_lens.append(len(res) + adjustment)
         next_verify_context.append(res[-1])
 
         res = torch.cat(res, dim=0)
