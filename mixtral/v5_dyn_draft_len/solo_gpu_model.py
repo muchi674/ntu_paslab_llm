@@ -438,18 +438,27 @@ class MoeLayer(nn.Module):
         # hardcoded logic
         if mode > 0:
             if self.li < self.n_layers_cached:
-                if mode == 2:
-                    pass
-                
+                batch_size = inputs.shape[0]
+                exempted = torch.zeros(
+                    batch_size // 2 if mode == 1 else 0,
+                    dtype=torch.bool,
+                    device=inputs.device,
+                )
+                candidates = torch.ones(
+                    batch_size // 2 if mode == 1 else batch_size,
+                    dtype=torch.bool,
+                    device=inputs.device,
+                )
+                parallel_mask = torch.cat((exempted, candidates), dim=0)
                 top2_not_cached = selected_experts[:, 1] >= self.n_experts_cached
                 conflicts = selected_experts[:, 0] == 0
 
-                bi = torch.where(top2_not_cached & ~conflicts)[0]
+                bi = torch.where(parallel_mask & top2_not_cached & ~conflicts)[0]
                 selected_experts[bi, 1] = 0
                 weights[bi, 1] = gate_logits[bi, 0]
 
                 # asserts self.n_experts_cached >= 2
-                bi = torch.where(top2_not_cached & conflicts)[0]
+                bi = torch.where(parallel_mask & top2_not_cached & conflicts)[0]
                 selected_experts[bi, 1] = 1
                 weights[bi, 1] = gate_logits[bi, 1]
 
@@ -521,11 +530,11 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
-        drafting: bool,
+        mode: int = 0,
     ) -> torch.Tensor:
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache, mode)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h), drafting)
+        r = self.feed_forward.forward(self.ffn_norm(h), mode)
         out = h + r
         return out
 
@@ -576,21 +585,23 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
-        drafting: bool = False,
+        mode: int = 0,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
         input_metadata = cache.get_input_metadata(seqlens)
-        h = self.tok_embeddings(input_ids)
+        h: torch.Tensor = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
+        if mode == 2:
+            h = h.repeat(2, 1)
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view, drafting)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, mode)
 
         cache.update_seqlens(seqlens)
-        outs = self.output(self.norm(h))
+        outs: torch.Tensor = self.output(self.norm(h))
         return outs.float()
 
     @staticmethod
@@ -683,6 +694,7 @@ def generate(
     decode_toc = torch.cuda.Event(enable_timing=True)
     sub_tic = torch.cuda.Event(enable_timing=True)
     sub_toc = torch.cuda.Event(enable_timing=True)
+    p_draft_lats = []
     draft_lats = []
     target_lats = []
     verify_lats = []
@@ -697,19 +709,57 @@ def generate(
     while max(curr_gen_lens) < max_tokens and not is_finished.all():
         sub_tic.record()
 
+        blended_logits = model.forward(
+            verify_context, seqlens=[1] * B, cache=cache, mode=1
+        )
+        verify_logits = blended_logits[: B // 2]
+        draft_probs = norm_logits(
+            blended_logits[B // 2 :], temperature=temperature, top_k=top_k, top_p=top_p
+        ) # .shape = (batch_size, vocab_dim)
+        draft_tokens = sample(probs, greedy=greedy)[:, None]
+        if greedy:
+            curr_accept_lens, verify_context = verify_greedy(
+                draft_tokens,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                B,
+                draft_seq_len,
+                eos_id,
+            )
+        else:
+            curr_accept_lens, verify_context = verify_non_greedy(
+                draft_tokens,
+                draft_probs,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                B,
+                draft_seq_len,
+                temperature,
+                top_k,
+                top_p,
+                eos_id,
+            )
+
+        # continue if verification fails
+
+        sub_toc.record()
+        torch.cuda.synchronize(device=gpu)
+        p_draft_lats.append(sub_tic.elapsed_time(sub_toc))
+        sub_tic.record()
+
         # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
         draft_context = verify_context
         for _ in range(draft_seq_len):
-            logits = model.forward(
-                draft_context, seqlens=[1] * B, cache=cache, drafting=True
-            )
-            logits = norm_logits(
+            logits = model.forward(draft_context, seqlens=[1] * B, cache=cache, mode=2)
+            probs = norm_logits(
                 logits, temperature=temperature, top_k=top_k, top_p=top_p
             )  # .shape = (batch_size, vocab_dim)
-            draft_context = sample(logits, greedy=greedy)
-            draft_probs.append(logits)
+            draft_context = sample(probs, greedy=greedy)
+            draft_probs.append(probs)
             draft_tokens.append(draft_context[:, None])
 
         sub_toc.record()

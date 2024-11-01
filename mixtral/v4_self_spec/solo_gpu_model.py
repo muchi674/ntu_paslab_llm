@@ -996,7 +996,7 @@ def main(
             max_tokens=1,
             max_batch_size=len(prompt_batch),
             temperature=0,
-            draft_seq_len=6,
+            draft_seq_len=8,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
@@ -1019,7 +1019,7 @@ def main(
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             temperature=0,
-            draft_seq_len=6,
+            draft_seq_len=8,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
