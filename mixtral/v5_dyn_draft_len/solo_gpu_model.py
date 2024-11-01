@@ -364,16 +364,14 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
-        draft_x: torch.Tensor = None,
+        mode: int = 0,  # 0: verify, 1: parallel_draft, 2: sequential_draft
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
-
-        if draft_x:
-            x = torch.cat((x, draft_x), dim=0)
-
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        if draft_x:
+        # should only occur during decode stage
+        if mode == 1:
+            seqlen_sum //= 2
             # wq.shape = (seqlen_sum * 2, args.n_heads * args.head_dim)
             d_xq = xq[seqlen_sum:].view(seqlen_sum, self.n_heads, self.head_dim)
             d_xk = xk[seqlen_sum:].view(seqlen_sum, self.n_kv_heads, self.head_dim)
@@ -400,7 +398,7 @@ class Attention(nn.Module):
             key, val = self.reshape_cache(xk, xv, seqlen_sum, cache)
 
         output = self.get_attention_score(xq, key, val, seqlen_sum, cache)
-        if draft_x:
+        if mode == 1:
             output = torch.cat((output, d_out), dim=0)
         return self.wo(output)  # type: ignore
 
@@ -415,9 +413,7 @@ class Experts:
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        ex = x.to(w.device)
-        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device)  # type: ignore
+        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]
 
 
 class MoeLayer(nn.Module):
@@ -431,40 +427,65 @@ class MoeLayer(nn.Module):
         self.n_layers_cached = 25
         self.n_experts_cached = 2
 
-    def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, mode: int = 0) -> torch.Tensor:
+        # possible modes:
+        # 0: verify, 1: parallel_draft, 2: sequential_draft
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
+            gate_logits, self.num_experts_per_tok if mode == 0 else self.num_experts
         )
 
         # hardcoded logic
-        if drafting:
-            if self.li >= self.n_layers_cached:
-                weights = weights[:, :2]
-                selected_experts = selected_experts[:, :2]
-            else:
-                # top1 cached AND top2 cached -> ignore
-                # top1 cached AND top2 NOT cached
-                # top1 NOT cached AND top2 cached -> ignore
-                # top1 NOT cached AND top2 NOT cached
+        if mode > 0:
+            if self.li < self.n_layers_cached:
+                if mode == 2:
+                    pass
+                
+                top2_not_cached = selected_experts[:, 1] >= self.n_experts_cached
+                conflicts = selected_experts[:, 0] == 0
 
-                selected_experts[:, 0] >= self.n_experts_cached
-                selected_experts[:, 1] >= self.n_experts_cached
-
-                bi = torch.where()[0]
+                bi = torch.where(top2_not_cached & ~conflicts)[0]
                 selected_experts[bi, 1] = 0
                 weights[bi, 1] = gate_logits[bi, 0]
-                weights = weights[:, :2]
-                selected_experts = selected_experts[:, :2]
+
+                # asserts self.n_experts_cached >= 2
+                bi = torch.where(top2_not_cached & conflicts)[0]
+                selected_experts[bi, 1] = 1
+                weights[bi, 1] = gate_logits[bi, 1]
+
+            selected_experts = selected_experts[:, :2]
+            weights = weights[:, :2]
 
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
+        expert_ins: list[tuple[torch.Tensor]] = []
+        expert_outs: list[torch.Tensor] = []
+
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) == 0:
+                expert_ins.append(None)
                 continue
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+            if self.li >= self.n_layers_cached or ei >= self.n_experts_cached:
+                x = inputs[batch_idx].to("cpu")
+            else:
+                x = inputs[batch_idx]
+            expert_ins.append((x, batch_idx, nth_expert))
+
+        for ei in range(self.num_experts):
+            if expert_ins[ei] is None:
+                expert_outs.append(None)
+                continue
+            x = expert_ins[ei][0]
+            expert_outs.append(self.experts.forward(self.li, ei, x))
+
+        for ei in range(self.num_experts):
+            if expert_outs[ei] is None:
+                continue
+            ew = weights[expert_ins[ei][1], expert_ins[ei][2], None]
+            ey = expert_outs[ei].to(inputs.device)
+            results[expert_ins[ei][1]] += ew * ey
+
         return results
 
 

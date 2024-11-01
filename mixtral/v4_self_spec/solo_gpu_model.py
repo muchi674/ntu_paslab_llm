@@ -371,6 +371,21 @@ class Attention(nn.Module):
         return self.wo(output)  # type: ignore
 
 
+# class Experts:
+#     # tmp design:
+#     # 1. shared across layers
+#     # 2. CPU and GPU computations are not overlapped
+
+#     def __init__(self, ws: dict):
+#         self.ws = ws
+
+#     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+#         w: torch.Tensor = self.ws[f"{li}.{ei}"]
+#         ex = x.to(w.device)
+#         ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
+#         return ey.to(x.device)  # type: ignore
+
+
 class Experts:
     # tmp design:
     # 1. shared across layers
@@ -381,9 +396,7 @@ class Experts:
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        ex = x.to(w.device)
-        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device)  # type: ignore
+        return (nn.functional.silu(x @ w[0].T) * (x @ w[2].T)) @ w[1]
 
 
 class MoeLayer(nn.Module):
@@ -394,40 +407,86 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.n_layers_cached = 25
+        self.n_experts_cached = 2
 
     def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_tok if not drafting else 1
+            gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
         )
 
-        # weights, selected_experts = torch.topk(
-        #     gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
-        # )
-        # # hardcoded logic
-        # if drafting:
-        #     bi = torch.where(selected_experts[:, 0, None] != 0)[0]
-        #     selected_experts[bi, 1] = 0
-        #     weights[bi, 1] = gate_logits[bi, 0]
-        #     weights = weights[:,:2]
-        #     selected_experts = selected_experts[:,:2]
+        # hardcoded logic
+        if drafting:
+            if self.li >= self.n_layers_cached:
+                weights = weights[:, :2]
+                selected_experts = selected_experts[:, :2]
+            else:
+                top2_not_cached = selected_experts[:, 1] >= self.n_experts_cached
+                conflicts = selected_experts[:, 0] == 0
 
-        # weights, selected_experts = torch.topk(
-        #     gate_logits, self.num_experts_per_tok if not drafting or self.li < 7 else 1
-        # )
+                bi = torch.where(top2_not_cached & ~conflicts)[0]
+                selected_experts[bi, 1] = 0
+                weights[bi, 1] = gate_logits[bi, 0]
+
+                # asserts self.n_experts_cached >= 2
+                bi = torch.where(top2_not_cached & conflicts)[0]
+                selected_experts[bi, 1] = 1
+                weights[bi, 1] = gate_logits[bi, 1]
+
+                selected_experts = selected_experts[:, :2]
+                weights = weights[:, :2]
+
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-
         results = torch.zeros_like(inputs)
+        expert_ins: list[tuple[torch.Tensor]] = []
+        expert_outs: list[torch.Tensor] = []
+
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-
             if torch.numel(batch_idx) == 0:
+                expert_ins.append(None)
                 continue
+            if self.li >= self.n_layers_cached or ei >= self.n_experts_cached:
+                x = inputs[batch_idx].to("cpu")
+            else:
+                x = inputs[batch_idx]
+            expert_ins.append((x, batch_idx, nth_expert))
 
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        for ei in range(self.num_experts):
+            if expert_ins[ei] is None:
+                expert_outs.append(None)
+                continue
+            x = expert_ins[ei][0]
+            expert_outs.append(self.experts.forward(self.li, ei, x))
+
+        for ei in range(self.num_experts):
+            if expert_outs[ei] is None:
+                continue
+            ew = weights[expert_ins[ei][1], expert_ins[ei][2], None]
+            ey = expert_outs[ei].to(inputs.device)
+            results[expert_ins[ei][1]] += ew * ey
+
         return results
+
+    # def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
+    #     gate_logits = self.gate(inputs)
+    #     weights, selected_experts = torch.topk(
+    #         gate_logits, self.num_experts_per_tok if not drafting else 1
+    #     )
+    #     # weights, selected_experts = torch.topk(
+    #     #     gate_logits, self.num_experts_per_tok if not drafting or self.li < 7 else 1
+    #     # )
+    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+
+    #     results = torch.zeros_like(inputs)
+    #     for ei in range(self.num_experts):
+    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
+    #         if torch.numel(batch_idx) == 0:
+    #             continue
+    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+    #     return results
 
 
 class RMSNorm(torch.nn.Module):
@@ -936,7 +995,7 @@ def main(
             gpu,
             max_tokens=1,
             max_batch_size=len(prompt_batch),
-            # temperature=0,
+            temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
@@ -959,7 +1018,7 @@ def main(
             gpu,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
-            # temperature=0,
+            temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
