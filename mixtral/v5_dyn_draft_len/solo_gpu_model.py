@@ -593,7 +593,7 @@ class Transformer(nn.Module):
         input_metadata = cache.get_input_metadata(seqlens)
         h: torch.Tensor = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
-        if mode == 2:
+        if mode == 1:
             h = h.repeat(2, 1)
 
         for li in range(self.args.n_layers):
@@ -711,11 +711,12 @@ def generate(
         blended_logits = model.forward(
             verify_context, seqlens=[1] * B, cache=cache, mode=1
         )
-        verify_logits = blended_logits[: B // 2]
+        verify_logits = blended_logits[:B]
         draft_probs = norm_logits(
-            blended_logits[B // 2 :], temperature=temperature, top_k=top_k, top_p=top_p
-        )  # .shape = (batch_size, vocab_dim)
+            blended_logits[B:], temperature=temperature, top_k=top_k, top_p=top_p
+        ) # .shape = (batch_size, vocab_dim)
         draft_tokens = sample(draft_probs, greedy=greedy)[:, None]
+        draft_probs = draft_probs[:, None, :]
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
                 draft_tokens,
@@ -723,8 +724,9 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                draft_seq_len,
+                1,
                 eos_id,
+                parallel=True,
             )
         else:
             curr_accept_lens, verify_context = verify_non_greedy(
@@ -734,11 +736,12 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                draft_seq_len,
+                1,
                 temperature,
                 top_k,
                 top_p,
                 eos_id,
+                parallel=True,
             )
 
         sub_toc.record()
@@ -747,9 +750,11 @@ def generate(
 
         for bi in range(B):
             curr_gen_lens[bi] += 1
-        # should include cases where max_tokens is reached
-        if min(curr_accept_lens) == 0:
+        # skip sequential drafting
+        if 0 in curr_accept_lens:
             continue
+        elif max(curr_gen_lens) >= max_tokens or is_finished.all():
+            break
 
         sub_tic.record()
 
@@ -792,9 +797,8 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                1,
+                draft_seq_len,
                 eos_id,
-                parallel=True,
             )
         else:
             curr_accept_lens, verify_context = verify_non_greedy(
@@ -804,12 +808,11 @@ def generate(
                 is_finished,
                 accepted_tokens,
                 B,
-                1,
+                draft_seq_len,
                 temperature,
                 top_k,
                 top_p,
                 eos_id,
-                parallel=True,
             )
 
         acceptance_lens.append(curr_accept_lens)
@@ -838,9 +841,9 @@ def generate(
         prefill_time,
         n_gen_tkns,
         decode_time,
+        mean(p_draft_lats) if len(p_draft_lats) > 0 else None,  # in ms
         mean(draft_lats) if len(draft_lats) > 0 else None,  # in ms
         mean(target_lats) if len(target_lats) > 0 else None,  # in ms
-        mean(verify_lats) if len(verify_lats) > 0 else None,  # in ms
         (
             torch.tensor(acceptance_lens, device="cpu")
             .to(torch.float32)
@@ -926,7 +929,6 @@ def verify_non_greedy(
         # for each position in draft sequence
         res = []
         count = 0
-        adjustment = 0
         for i, draft_prob, verify_prob in zip(dts, dps, vps):
             r = torch.rand(1, device=device)
             if r < torch.min(
@@ -937,15 +939,13 @@ def verify_non_greedy(
             else:
                 resampled = sample(max_fn(verify_prob - draft_prob))
                 res.append(resampled)
-                if parallel:
-                    adjustment -= 1
                 break
 
         if count == draft_seq_len and not parallel:
             i = sample(vps[-1])
             res.append(i)
 
-        acceptance_lens.append(len(res) + adjustment)
+        acceptance_lens.append(len(res) if not parallel else count)
         next_verify_context.append(res[-1])
 
         res = torch.cat(res, dim=0)
@@ -1035,9 +1035,9 @@ def main(
 
     prefill_tps = []
     decode_tps = []
+    avg_p_draft_lats = []
     avg_draft_lats = []
     avg_target_lats = []
-    avg_verify_lats = []
     avg_accept_lens = []
 
     start = 0
@@ -1052,7 +1052,7 @@ def main(
             gpu,
             max_tokens=1,
             max_batch_size=len(prompt_batch),
-            temperature=0,
+            # temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
@@ -1064,9 +1064,9 @@ def main(
             prefill_time,
             n_gen_tkns,
             decode_time,
+            avg_p_draft_lat,
             avg_draft_lat,
             avg_target_lat,
-            avg_verify_lat,
             avg_accept_len,
         ) = generate(
             prompt_batch,
@@ -1075,7 +1075,7 @@ def main(
             gpu,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
-            temperature=0,
+            # temperature=0,
             draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
@@ -1084,10 +1084,11 @@ def main(
         decode_tp = n_gen_tkns / decode_time
         prefill_tps.append(prefill_tp)
         decode_tps.append(decode_tp)
+        if avg_p_draft_lat is not None:
+            avg_p_draft_lats.append(avg_p_draft_lat)
         if avg_draft_lat is not None:
             avg_draft_lats.append(avg_draft_lat)
             avg_target_lats.append(avg_target_lat)
-            avg_verify_lats.append(avg_verify_lat)
             avg_accept_lens.append(avg_accept_len)
 
         print("=" * 20)
@@ -1103,14 +1104,13 @@ def main(
             print(f"throughput: {decode_tp:.2f} t/s")
         else:
             responses = ["" for _ in prompt_batch]
-        print("SPECULATIVE DECODING")
+        print("SPECULATIVE DECODING:")
+        if avg_p_draft_lat is not None:
+            print(f"avg verify latency: {avg_p_draft_lat:.2f} ms")
         if avg_draft_lat is not None:
             print(f"avg draft latency: {avg_draft_lat:.2f} ms")
             print(f"avg target latency: {avg_target_lat:.2f} ms")
-            print(f"avg verify latency: {avg_verify_lat:.2f} ms")
             print(f"avg acceptance length: {avg_accept_len:.2f}")
-        else:
-            print("skipped")
         if not hide_resp:
             print("=" * 20)
             print("INS-N-OUTS")
@@ -1127,10 +1127,11 @@ def main(
     print("RUN STATISTICS")
     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if len(avg_p_draft_lats) > 0:
+        print(f"avg verify latency: {mean(avg_p_draft_lats):.2f} ms")
     if len(avg_draft_lats) > 0:
         print(f"avg draft latency: {mean(avg_draft_lats):.2f} ms")
         print(f"avg target latency: {mean(avg_target_lats):.2f} ms")
-        print(f"avg verify latency: {mean(avg_verify_lats):.2f} ms")
         print(f"avg acceptance length: {mean(avg_accept_lens):.2f}")
 
 
