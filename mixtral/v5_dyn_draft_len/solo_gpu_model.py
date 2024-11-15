@@ -327,15 +327,63 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
+    def reshape_cache(
+        self,
+        xk: torch.tensor,
+        xv: torch.tensor,
+        seqlen_sum: int,
+        cache: Optional[CacheView],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache.update(xk, xv)
+        key, val = cache.key, cache.value
+        key = key.view(seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim)
+        val = val.view(seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim)
+        return key, val
+
+    def get_attention_score(
+        self,
+        xq: torch.tensor,
+        key: torch.tensor,
+        val: torch.tensor,
+        seqlen_sum: int,
+        cache: Optional[CacheView],
+    ) -> torch.Tensor:
+        # Repeat keys and values to match number of query heads
+        key, val = repeat_kv(key, val, self.repeats, dim=1)
+
+        # xformers requires (B=1, S, H, D)
+        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
+        output = memory_efficient_attention(
+            xq, key, val, None if cache is None else cache.mask
+        )
+        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
+        mode: int = 0,  # 0: verify, 1: parallel_draft, 2: sequential_draft
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
-
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        # should only occur during decode stage
+        if mode == 1:
+            seqlen_sum //= 2
+            # wq.shape = (seqlen_sum * 2, args.n_heads * args.head_dim)
+            d_xq = xq[seqlen_sum:].view(seqlen_sum, self.n_heads, self.head_dim)
+            d_xk = xk[seqlen_sum:].view(seqlen_sum, self.n_kv_heads, self.head_dim)
+            d_xv = xv[seqlen_sum:].view(seqlen_sum, self.n_kv_heads, self.head_dim)
+            d_xq, d_xk = apply_rotary_emb(d_xq, d_xk, freqs_cis=freqs_cis)
+            d_key, d_val = self.reshape_cache(d_xk, d_xv, seqlen_sum, cache)
+            d_out = self.get_attention_score(d_xq, d_key, d_val, seqlen_sum, cache)
+
+            xq = xq[:seqlen_sum]
+            xk = xk[:seqlen_sum]
+            xv = xv[:seqlen_sum]
+
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
         xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
@@ -347,43 +395,12 @@ class Attention(nn.Module):
             key, val = cache.interleave_kv(xk, xv)
             cache.update(xk, xv)
         else:
-            cache.update(xk, xv)
-            key, val = cache.key, cache.value
-            key = key.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
-            val = val.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
+            key, val = self.reshape_cache(xk, xv, seqlen_sum, cache)
 
-        # Repeat keys and values to match number of query heads
-        key, val = repeat_kv(key, val, self.repeats, dim=1)
-
-        # xformers requires (B=1, S, H, D)
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(
-            xq, key, val, None if cache is None else cache.mask
-        )
-        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
-
-        assert isinstance(output, torch.Tensor)
-
+        output = self.get_attention_score(xq, key, val, seqlen_sum, cache)
+        if mode == 1:
+            output = torch.cat((output, d_out), dim=0)
         return self.wo(output)  # type: ignore
-
-
-# class Experts:
-#     # tmp design:
-#     # 1. shared across layers
-#     # 2. CPU and GPU computations are not overlapped
-
-#     def __init__(self, ws: dict):
-#         self.ws = ws
-
-#     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-#         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-#         ex = x.to(w.device)
-#         ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-#         return ey.to(x.device)  # type: ignore
 
 
 class Experts:
@@ -410,32 +427,43 @@ class MoeLayer(nn.Module):
         self.n_layers_cached = 25
         self.n_experts_cached = 2
 
-    def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, mode: int = 0) -> torch.Tensor:
+        # possible modes:
+        # 0: verify, 1: parallel_draft, 2: sequential_draft
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(
-            gate_logits, self.num_experts_per_tok if not drafting else self.num_experts
+            gate_logits, self.num_experts_per_tok if mode == 0 else self.num_experts
         )
 
         # hardcoded logic
-        if drafting:
-            if self.li >= self.n_layers_cached:
-                weights = weights[:, :2]
-                selected_experts = selected_experts[:, :2]
-            else:
+        if mode > 0:
+            if self.li < self.n_layers_cached:
+                batch_size = inputs.shape[0]
+                exempted = torch.zeros(
+                    batch_size // 2 if mode == 1 else 0,
+                    dtype=torch.bool,
+                    device=inputs.device,
+                )
+                candidates = torch.ones(
+                    batch_size // 2 if mode == 1 else batch_size,
+                    dtype=torch.bool,
+                    device=inputs.device,
+                )
+                parallel_mask = torch.cat((exempted, candidates), dim=0)
                 top2_not_cached = selected_experts[:, 1] >= self.n_experts_cached
                 conflicts = selected_experts[:, 0] == 0
 
-                bi = torch.where(top2_not_cached & ~conflicts)[0]
+                bi = torch.where(parallel_mask & top2_not_cached & ~conflicts)[0]
                 selected_experts[bi, 1] = 0
                 weights[bi, 1] = gate_logits[bi, 0]
 
                 # asserts self.n_experts_cached >= 2
-                bi = torch.where(top2_not_cached & conflicts)[0]
+                bi = torch.where(parallel_mask & top2_not_cached & conflicts)[0]
                 selected_experts[bi, 1] = 1
                 weights[bi, 1] = gate_logits[bi, 1]
 
-                selected_experts = selected_experts[:, :2]
-                weights = weights[:, :2]
+            selected_experts = selected_experts[:, :2]
+            weights = weights[:, :2]
 
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
@@ -468,25 +496,6 @@ class MoeLayer(nn.Module):
             results[expert_ins[ei][1]] += ew * ey
 
         return results
-
-    # def forward(self, inputs: torch.Tensor, drafting: bool) -> torch.Tensor:
-    #     gate_logits = self.gate(inputs)
-    #     weights, selected_experts = torch.topk(
-    #         gate_logits, self.num_experts_per_tok if not drafting else 1
-    #     )
-    #     # weights, selected_experts = torch.topk(
-    #     #     gate_logits, self.num_experts_per_tok if not drafting or self.li < 7 else 1
-    #     # )
-    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-
-    #     results = torch.zeros_like(inputs)
-    #     for ei in range(self.num_experts):
-    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
-    #         if torch.numel(batch_idx) == 0:
-    #             continue
-    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-    #     return results
 
 
 class RMSNorm(torch.nn.Module):
@@ -521,11 +530,11 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
-        drafting: bool,
+        mode: int = 0,
     ) -> torch.Tensor:
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache, mode)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h), drafting)
+        r = self.feed_forward.forward(self.ffn_norm(h), mode)
         out = h + r
         return out
 
@@ -576,21 +585,23 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
-        drafting: bool = False,
+        mode: int = 0,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
         input_metadata = cache.get_input_metadata(seqlens)
-        h = self.tok_embeddings(input_ids)
+        h: torch.Tensor = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
+        if mode == 1:
+            h = h.repeat(2, 1)
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view, drafting)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, mode)
 
         cache.update_seqlens(seqlens)
-        outs = self.output(self.norm(h))
+        outs: torch.Tensor = self.output(self.norm(h))
         return outs.float()
 
     @staticmethod
@@ -613,10 +624,6 @@ class Transformer(nn.Module):
         for li in range(25):
             experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
             experts[f"{li}.1"] = experts[f"{li}.1"].to(gpu)
-
-        # for li in range(7):
-        #     for ei in range(8):
-        #         experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -687,9 +694,9 @@ def generate(
     decode_toc = torch.cuda.Event(enable_timing=True)
     sub_tic = torch.cuda.Event(enable_timing=True)
     sub_toc = torch.cuda.Event(enable_timing=True)
+    p_draft_lats = []
     draft_lats = []
     target_lats = []
-    verify_lats = []
     decode_tic.record()
 
     curr_gen_lens = [1] * B
@@ -701,19 +708,67 @@ def generate(
     while max(curr_gen_lens) < max_tokens and not is_finished.all():
         sub_tic.record()
 
+        blended_logits = model.forward(
+            verify_context, seqlens=[1] * B, cache=cache, mode=1
+        )
+        verify_logits = blended_logits[:B]
+        draft_probs = norm_logits(
+            blended_logits[B:], temperature=temperature, top_k=top_k, top_p=top_p
+        ) # .shape = (batch_size, vocab_dim)
+        draft_tokens = sample(draft_probs, greedy=greedy)[:, None]
+        draft_probs = draft_probs[:, None, :]
+        if greedy:
+            curr_accept_lens, verify_context = verify_greedy(
+                draft_tokens,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                B,
+                1,
+                eos_id,
+                parallel=True,
+            )
+        else:
+            curr_accept_lens, verify_context = verify_non_greedy(
+                draft_tokens,
+                draft_probs,
+                verify_logits,
+                is_finished,
+                accepted_tokens,
+                B,
+                1,
+                temperature,
+                top_k,
+                top_p,
+                eos_id,
+                parallel=True,
+            )
+
+        sub_toc.record()
+        torch.cuda.synchronize(device=gpu)
+        p_draft_lats.append(sub_tic.elapsed_time(sub_toc))
+
+        for bi in range(B):
+            curr_gen_lens[bi] += 1
+        # skip sequential drafting
+        if 0 in curr_accept_lens:
+            continue
+        elif max(curr_gen_lens) >= max_tokens or is_finished.all():
+            break
+
+        sub_tic.record()
+
         # context.shape = (batch_size, 1)
         draft_probs = []
         draft_tokens = []
         draft_context = verify_context
         for _ in range(draft_seq_len):
-            logits = model.forward(
-                draft_context, seqlens=[1] * B, cache=cache, drafting=True
-            )
-            logits = norm_logits(
+            logits = model.forward(draft_context, seqlens=[1] * B, cache=cache, mode=2)
+            probs = norm_logits(
                 logits, temperature=temperature, top_k=top_k, top_p=top_p
             )  # .shape = (batch_size, vocab_dim)
-            draft_context = sample(logits, greedy=greedy)
-            draft_probs.append(logits)
+            draft_context = sample(probs, greedy=greedy)
+            draft_probs.append(probs)
             draft_tokens.append(draft_context[:, None])
 
         sub_toc.record()
@@ -734,7 +789,6 @@ def generate(
         sub_toc.record()
         torch.cuda.synchronize(device=gpu)
         target_lats.append(sub_tic.elapsed_time(sub_toc))
-        sub_tic.record()
 
         if greedy:
             curr_accept_lens, verify_context = verify_greedy(
@@ -760,10 +814,6 @@ def generate(
                 top_p,
                 eos_id,
             )
-
-        sub_toc.record()
-        torch.cuda.synchronize(device=gpu)
-        verify_lats.append(sub_tic.elapsed_time(sub_toc))
 
         acceptance_lens.append(curr_accept_lens)
         cache.update_seqlens(
@@ -791,9 +841,9 @@ def generate(
         prefill_time,
         n_gen_tkns,
         decode_time,
+        mean(p_draft_lats) if len(p_draft_lats) > 0 else None,  # in ms
         mean(draft_lats) if len(draft_lats) > 0 else None,  # in ms
         mean(target_lats) if len(target_lats) > 0 else None,  # in ms
-        mean(verify_lats) if len(verify_lats) > 0 else None,  # in ms
         (
             torch.tensor(acceptance_lens, device="cpu")
             .to(torch.float32)
@@ -814,14 +864,19 @@ def verify_greedy(
     batch_size: int,
     draft_seq_len: int,
     eos_id: int,
+    parallel: bool = False,
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # verify_logits.shape = (batch_size * (draft_seq_len + 1), vocab_dim)
     # Compare draft tokens against argmax(logits) for each position in the sequence
-    verify_logits = verify_logits.unflatten(
-        dim=0, sizes=(batch_size, draft_seq_len + 1)
-    )
-    verify_tokens = sample(verify_logits[:, :-1], greedy=True)
+    if parallel:
+        verify_logits = verify_logits.unflatten(dim=0, sizes=(batch_size, 1))
+        verify_tokens = sample(verify_logits, greedy=True)
+    else:
+        verify_logits = verify_logits.unflatten(
+            dim=0, sizes=(batch_size, draft_seq_len + 1)
+        )
+        verify_tokens = sample(verify_logits[:, :-1], greedy=True)
     acceptance = (draft_tokens == verify_tokens).to(torch.int32)
     acceptance_lens = torch.cumprod(acceptance, dim=1).sum(dim=1).tolist()
     next_verify_context = []
@@ -830,8 +885,9 @@ def verify_greedy(
         res = draft_tokens[bi, :accept_len]
         if accept_len == 0:
             res = verify_tokens[bi, 0][None]
-            acceptance_lens[bi] += 1
-        elif accept_len == draft_seq_len:
+            if not parallel:
+                acceptance_lens[bi] += 1
+        elif accept_len == draft_seq_len and not parallel:
             res = torch.cat((res, sample(verify_logits[None, bi, -1], greedy=True)))
             acceptance_lens[bi] += 1
 
@@ -854,6 +910,7 @@ def verify_non_greedy(
     top_k: int,
     top_p: float,
     eos_id: int,
+    parallel: bool = False,
 ) -> tuple[list, torch.Tensor]:
     # draft_tokens.shape = (batch_size, draft_seq_len)
     # draft_probs.shape = (batch_size, draft_seq_len, vocab_dim)
@@ -861,7 +918,7 @@ def verify_non_greedy(
     device = draft_tokens.device
     verify_probs = norm_logits(
         verify_logits, temperature=temperature, top_k=top_k, top_p=top_p
-    ).unflatten(dim=0, sizes=(batch_size, draft_seq_len + 1))
+    ).unflatten(dim=0, sizes=(batch_size, draft_seq_len + 1 if not parallel else 1))
     acceptance_lens = []
     next_verify_context = []
 
@@ -884,11 +941,11 @@ def verify_non_greedy(
                 res.append(resampled)
                 break
 
-        if count == draft_seq_len:
+        if count == draft_seq_len and not parallel:
             i = sample(vps[-1])
             res.append(i)
 
-        acceptance_lens.append(len(res))
+        acceptance_lens.append(len(res) if not parallel else count)
         next_verify_context.append(res[-1])
 
         res = torch.cat(res, dim=0)
@@ -978,9 +1035,9 @@ def main(
 
     prefill_tps = []
     decode_tps = []
+    avg_p_draft_lats = []
     avg_draft_lats = []
     avg_target_lats = []
-    avg_verify_lats = []
     avg_accept_lens = []
 
     start = 0
@@ -995,8 +1052,8 @@ def main(
             gpu,
             max_tokens=1,
             max_batch_size=len(prompt_batch),
-            temperature=0,
-            draft_seq_len=8,
+            # temperature=0,
+            draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
@@ -1007,9 +1064,9 @@ def main(
             prefill_time,
             n_gen_tkns,
             decode_time,
+            avg_p_draft_lat,
             avg_draft_lat,
             avg_target_lat,
-            avg_verify_lat,
             avg_accept_len,
         ) = generate(
             prompt_batch,
@@ -1018,8 +1075,8 @@ def main(
             gpu,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
-            temperature=0,
-            draft_seq_len=8,
+            # temperature=0,
+            draft_seq_len=6,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
@@ -1027,10 +1084,11 @@ def main(
         decode_tp = n_gen_tkns / decode_time
         prefill_tps.append(prefill_tp)
         decode_tps.append(decode_tp)
+        if avg_p_draft_lat is not None:
+            avg_p_draft_lats.append(avg_p_draft_lat)
         if avg_draft_lat is not None:
             avg_draft_lats.append(avg_draft_lat)
             avg_target_lats.append(avg_target_lat)
-            avg_verify_lats.append(avg_verify_lat)
             avg_accept_lens.append(avg_accept_len)
 
         print("=" * 20)
@@ -1046,14 +1104,13 @@ def main(
             print(f"throughput: {decode_tp:.2f} t/s")
         else:
             responses = ["" for _ in prompt_batch]
-        print("SPECULATIVE DECODING")
+        print("SPECULATIVE DECODING:")
+        if avg_p_draft_lat is not None:
+            print(f"avg p_draft latency: {avg_p_draft_lat:.2f} ms")
         if avg_draft_lat is not None:
             print(f"avg draft latency: {avg_draft_lat:.2f} ms")
             print(f"avg target latency: {avg_target_lat:.2f} ms")
-            print(f"avg verify latency: {avg_verify_lat:.2f} ms")
             print(f"avg acceptance length: {avg_accept_len:.2f}")
-        else:
-            print("skipped")
         if not hide_resp:
             print("=" * 20)
             print("INS-N-OUTS")
@@ -1070,10 +1127,11 @@ def main(
     print("RUN STATISTICS")
     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if len(avg_p_draft_lats) > 0:
+        print(f"avg p_draft latency: {mean(avg_p_draft_lats):.2f} ms")
     if len(avg_draft_lats) > 0:
         print(f"avg draft latency: {mean(avg_draft_lats):.2f} ms")
         print(f"avg target latency: {mean(avg_target_lats):.2f} ms")
-        print(f"avg verify latency: {mean(avg_verify_lats):.2f} ms")
         print(f"avg acceptance length: {mean(avg_accept_lens):.2f}")
 
 
