@@ -1106,7 +1106,7 @@ def main(
             responses = ["" for _ in prompt_batch]
         print("SPECULATIVE DECODING:")
         if avg_p_draft_lat is not None:
-            print(f"avg verify latency: {avg_p_draft_lat:.2f} ms")
+            print(f"avg p_draft latency: {avg_p_draft_lat:.2f} ms")
         if avg_draft_lat is not None:
             print(f"avg draft latency: {avg_draft_lat:.2f} ms")
             print(f"avg target latency: {avg_target_lat:.2f} ms")
@@ -1128,7 +1128,7 @@ def main(
     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
     if len(avg_p_draft_lats) > 0:
-        print(f"avg verify latency: {mean(avg_p_draft_lats):.2f} ms")
+        print(f"avg p_draft latency: {mean(avg_p_draft_lats):.2f} ms")
     if len(avg_draft_lats) > 0:
         print(f"avg draft latency: {mean(avg_draft_lats):.2f} ms")
         print(f"avg target latency: {mean(avg_target_lats):.2f} ms")
