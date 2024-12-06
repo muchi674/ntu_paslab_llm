@@ -12,8 +12,8 @@ WORLD_RANK = int(os.environ["RANK"])
 
 def expert(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, group):
     """Simple collective communication."""
-    res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
-    dist.all_reduce(res, op=dist.ReduceOp.SUM, group=group)
+    # res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
+    dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
 
 def run():
     device = torch.device(f"cuda:{LOCAL_RANK}")
@@ -33,7 +33,6 @@ def run():
         expert(x, w1, w2, w3, group)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 100000} ms")
-    return
 
 def init_processes():
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
