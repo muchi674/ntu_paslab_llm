@@ -11,10 +11,10 @@ WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
 # def expert(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, group):
-def expert(x: torch.Tensor, group):
-    """Simple collective communication."""
-    # res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
-    dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+# def expert(x: torch.Tensor, group):
+#     """Simple collective communication."""
+#     # res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
+#     dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
 
 def run():
     device = torch.device(f"cuda:{LOCAL_RANK}")
@@ -26,12 +26,12 @@ def run():
 
     # warmup
     for _ in range(1000):
-        expert(x, group)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
 
     tic = time.time()
 
     for _ in range(100000):
-        expert(x, group)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 100000} ms")
 
