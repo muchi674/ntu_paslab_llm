@@ -9,6 +9,7 @@ WORLD_SIZE = int(os.environ['WORLD_SIZE'])
 WORLD_RANK = int(os.environ['RANK'])
 
 def run():
+    print("here1")
     tensor = torch.zeros(1)
     device = torch.device("cuda:{}".format(LOCAL_RANK))
     tensor = tensor.to(device)
@@ -22,8 +23,8 @@ def run():
         print('worker_{} has received data from rank {}\n'.format(WORLD_RANK, 0))
 
 def init_processes():
+    print("here0")
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
     run()
 
-if __name__ == "__main__":
-    init_processes()
+init_processes()
