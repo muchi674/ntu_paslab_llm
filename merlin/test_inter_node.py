@@ -33,6 +33,7 @@ def run():
         expert(x, w1, w2, w3, group)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 100000} ms")
+    return
 
 def init_processes():
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
