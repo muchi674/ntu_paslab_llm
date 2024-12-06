@@ -10,18 +10,11 @@ WORLD_RANK = int(os.environ["RANK"])
 
 
 def run():
-    tensor = torch.zeros(1)
     device = torch.device(f"cuda:{LOCAL_RANK}")
-    tensor = tensor.to(device)
-
-    if WORLD_RANK == 0:
-        for rank_recv in range(1, WORLD_SIZE):
-            dist.send(tensor=tensor, dst=rank_recv)
-            print(f"rank_0 sent data to rank_{rank_recv}")
-    else:
-        dist.recv(tensor=tensor, src=0)
-        print(f"rank_{WORLD_RANK} has received data from rank_0")
-
+    tensor = torch.ones((1, 4096), dtype=torch.bfloat16, device=device)
+    group = dist.new_group(list(range(WORLD_SIZE)))
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+    print(tensor)
 
 def init_processes():
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
@@ -30,3 +23,4 @@ def init_processes():
 
 
 init_processes()
+# torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
