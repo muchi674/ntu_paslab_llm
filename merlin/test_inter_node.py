@@ -23,5 +23,6 @@ def init_processes():
     dist.destroy_process_group()
 
 
-init_processes()
-# torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
+if __name__ == "__main__":
+    init_processes()
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
