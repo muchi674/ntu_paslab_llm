@@ -28,11 +28,9 @@ WORLD_RANK = int(os.environ["RANK"])
 def init_processes():
     dist.init_process_group(
         "nccl",
-        init_method="tcp://10.10.10.1:9091",
         rank=WORLD_RANK,
         world_size=WORLD_SIZE,
     )
-    print(WORLD_RANK, WORLD_SIZE)
 
     device = torch.device(f"cuda:{LOCAL_RANK}")
     # group = dist.new_group(list(range(WORLD_SIZE)))
@@ -58,9 +56,9 @@ def init_processes():
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 100} ms")
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     init_processes()
+    dist.destroy_process_group()
     # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
