@@ -113,7 +113,8 @@ def main():
         )
         print(f"node {url}")
         base_cmd = (
-            f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} && "
+            f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
+            + "'export PATH=\"$PATH:/home/muchichen/miniconda3/condabin/\" "
             + "cd /home/muchichen/ntu_paslab_llm && "
             + "git pull origin merlin && "
             + "conda activate merlin && "
@@ -121,7 +122,7 @@ def main():
         )
 
         if args.terminate:
-            rc, out, err = Cmd(base_cmd + " --terminate")
+            rc, out, err = Cmd(base_cmd + " --terminate'")
             if rc != 0:
                 print(err.strip())
             else:
@@ -135,7 +136,7 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + f"--target-script={target_script}"
+            + f"--target-script={target_script}'"
         )
         if rc != 0:
             print(err.strip())
