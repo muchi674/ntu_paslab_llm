@@ -109,7 +109,7 @@ def main():
     if args.terminate:
         return
 
-    rc, out, err = Cmd("tmux -f /dev/null new-session -s merlin -d zsh \;")
+    rc, out, err = Cmd("tmux -f /dev/null new-session -s merlin -d bash\;")
 
     if rc != 0:
         print(err, file=sys.stderr)

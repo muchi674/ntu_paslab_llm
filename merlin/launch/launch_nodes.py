@@ -114,7 +114,7 @@ def main():
         print(f"node {url}")
         base_cmd = (
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
-            + "'export PATH=\"$PATH:/home/muchichen/miniconda3/condabin/\" "
+            + "'export PATH=\"$PATH:/home/muchichen/miniconda3/condabin/\" && "
             + "cd /home/muchichen/ntu_paslab_llm && "
             + "git pull origin merlin && "
             + "conda activate merlin && "
