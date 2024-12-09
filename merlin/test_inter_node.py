@@ -26,6 +26,7 @@ WORLD_RANK = int(os.environ["RANK"])
 
 def init_processes():
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
+    print(WORLD_RANK, WORLD_SIZE)
 
     device = torch.device(f"cuda:{WORLD_RANK}")
     group = dist.new_group(list(range(WORLD_SIZE)))
