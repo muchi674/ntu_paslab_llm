@@ -28,8 +28,8 @@ def init_processes():
     dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
     print(WORLD_RANK, WORLD_SIZE)
 
-    device = torch.device(f"cuda:{WORLD_RANK}")
-    group = dist.new_group([0, 1, 2, 3])
+    device = torch.device(f"cuda:{LOCAL_RANK}")
+    group = dist.new_group(list(range(WORLD_SIZE)))
     x = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
     w1 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 1)
     w2 = torch.ones((4096, 14336), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 2)
