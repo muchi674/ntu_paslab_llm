@@ -24,25 +24,38 @@ WORLD_RANK = int(os.environ["RANK"])
 #     res = x
 #     dist.all_reduce(res, op=dist.ReduceOp.SUM, group=group)
 
+
 def init_processes():
-    dist.init_process_group("nccl", rank=WORLD_RANK, world_size=WORLD_SIZE)
+    dist.init_process_group(
+        "nccl",
+        init_method="tcp://10.10.10.1:9091",
+        rank=WORLD_RANK,
+        world_size=WORLD_SIZE,
+    )
     print(WORLD_RANK, WORLD_SIZE)
 
     device = torch.device(f"cuda:{LOCAL_RANK}")
-    group = dist.new_group(list(range(WORLD_SIZE)))
-    x = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
-    w1 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 1)
-    w2 = torch.ones((4096, 14336), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 2)
-    w3 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 3)
+    # group = dist.new_group(list(range(WORLD_SIZE)))
+    x = torch.ones((1, 4096), dtype=torch.bfloat16, device=device)
+    w1 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (
+        WORLD_RANK + 1
+    )
+    w2 = torch.ones((4096, 14336), dtype=torch.bfloat16, device=device) * (
+        WORLD_RANK + 2
+    )
+    w3 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (
+        WORLD_RANK + 3
+    )
 
     # warmup
     for _ in range(10):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        print(x)
 
     tic = time.time()
 
     for _ in range(100):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 100} ms")
     dist.destroy_process_group()
