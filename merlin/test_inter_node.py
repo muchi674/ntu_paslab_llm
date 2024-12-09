@@ -43,16 +43,15 @@ def init_processes():
     )
 
     # warmup
-    for _ in range(10):
+    for _ in range(100):
         run(x, w1, w2, w3, group)
-        print(x)
 
-    # tic = time.time()
+    tic = time.time()
 
-    # for _ in range(100):
-    #     dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    for _ in range(10000):
+        run(x, w1, w2, w3, group)
 
-    # print(f"AVG run latency: {((time.time() - tic) * 1000) / 100} ms")
+    print(f"AVG run latency: {((time.time() - tic) * 1000) / 10000} ms")
     dist.destroy_process_group()
 
 
