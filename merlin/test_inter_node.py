@@ -12,7 +12,7 @@ WORLD_RANK = int(os.environ["RANK"])
 
 
 def run(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, group):
-    res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
+    res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2.T
     dist.all_reduce(res, op=dist.ReduceOp.SUM, group=group)
 
 
