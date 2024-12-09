@@ -11,18 +11,9 @@ WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
 
-# def run():
-#     device = torch.device(f"cuda:{WORLD_RANK}")
-#     tensor = torch.ones((1, 4096), dtype=torch.bfloat16, device=device)
-#     group = dist.new_group(list(range(WORLD_SIZE)))
-#     dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-#     print(tensor)
-
-# def run(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, group):
-#     """Simple collective communication."""
-#     # res = (nn.functional.silu(x @ w1.T) * (x @ w3.T)) @ w2
-#     res = x
-#     dist.all_reduce(res, op=dist.ReduceOp.SUM, group=group)
+def run(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, group):
+    res = (F.silu(x @ w1.T) * (x @ w3.T)) @ w2
+    dist.all_reduce(res, op=dist.ReduceOp.SUM, group=group)
 
 
 def init_processes():
@@ -33,32 +24,38 @@ def init_processes():
     )
 
     device = torch.device(f"cuda:{LOCAL_RANK}")
-    # group = dist.new_group(list(range(WORLD_SIZE)))
+    group = dist.new_group(list(range(WORLD_SIZE)))
     x = torch.ones((1, 4096), dtype=torch.bfloat16, device=device)
-    w1 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (
-        WORLD_RANK + 1
+    w1 = (
+        torch.ones((14336, 4096), dtype=torch.bfloat16, device=device)
+        * (WORLD_RANK + 1)
+        / 10**6
     )
-    w2 = torch.ones((4096, 14336), dtype=torch.bfloat16, device=device) * (
-        WORLD_RANK + 2
+    w2 = (
+        torch.ones((4096, 14336), dtype=torch.bfloat16, device=device)
+        * (WORLD_RANK + 2)
+        / 10**6
     )
-    w3 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (
-        WORLD_RANK + 3
+    w3 = (
+        torch.ones((14336, 4096), dtype=torch.bfloat16, device=device)
+        * (WORLD_RANK + 3)
+        / 10**6
     )
 
     # warmup
     for _ in range(10):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        run(x, w1, w2, w3, group)
         print(x)
 
-    tic = time.time()
+    # tic = time.time()
 
-    for _ in range(100):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    # for _ in range(100):
+    #     dist.all_reduce(x, op=dist.ReduceOp.SUM)
 
-    print(f"AVG run latency: {((time.time() - tic) * 1000) / 100} ms")
+    # print(f"AVG run latency: {((time.time() - tic) * 1000) / 100} ms")
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     init_processes()
-    dist.destroy_process_group()
     # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
