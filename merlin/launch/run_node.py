@@ -120,9 +120,9 @@ def main():
     Cmd("tmux send-keys -t 0 'conda activate merlin' Enter \;")
     Cmd(
         "tmux send-keys -t 0 'torchrun "
-        + f"--nnodes={args.world_size} "
+        + f"--nnodes={args.nnodes} "
         + f"--node-rank={args.node_rank} "
-        + f"--nproc-per-node={args.ngpus} "
+        + f"--nproc-per-node={args.nproc_per_node} "
         + f"--master-addr={args.master_addr} "
         + f"--master-port={args.master_port} "
         + f"{args.target_script}' Enter \;"
