@@ -1,10 +1,8 @@
-from operator import itemgetter
-from pathlib import Path
-from types import SimpleNamespace
-import argparse
-import json
 import subprocess
+import argparse
 import time
+from types import SimpleNamespace
+import sys
 
 """terminal color"""
 TC = SimpleNamespace(
@@ -20,7 +18,7 @@ TC = SimpleNamespace(
 
 class Cmd:
     def __new__(
-        self, cmd: str, cwd="./", timeout_duration=None, suppress=True
+        self, cmd: str, cwd="./", timeout_duration=None, suppress=False
     ) -> tuple[int, str, str]:
         self.cmd = cmd
         self.cwd = cwd
@@ -92,55 +90,43 @@ class Cmd:
         return self.returncode, str(out, encoding="utf8"), str(err, encoding="utf8")
 
 
+def list_of_strings(arg):
+    return arg.split(",")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--launch-config", required=True, type=str)
+    parser.add_argument("--nnodes", type=int)
+    parser.add_argument("--node-rank", type=int)
+    parser.add_argument("--nproc-per-node", type=int)
+    parser.add_argument("--master-addr", type=str)
+    parser.add_argument("--master-port", type=int)
+    parser.add_argument("--target-script", type=str)
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
-    try:
-        with open(Path(args.launch_config), "r") as f:
-            config: dict = json.load(f)
-    except FileNotFoundError:
-        raise
 
-    world_size, master_addr, master_port, target_script, nodes = itemgetter(
-        "world_size", "master_addr", "master_port", "target_script", "nodes"
-    )(config)
+    Cmd("""tmux kill-session -t merlin || true""")
+    if args.terminate:
+        return
 
-    for url, node_info in nodes.items():
-        ssh_port, node_rank, ngpus = itemgetter("ssh_port", "node_rank", "ngpus")(
-            node_info
-        )
-        print(f"node {url}")
-        base_cmd = (
-            f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} && "
-            + "cd /home/muchichen/ntu_paslab_llm && "
-            + "git pull origin merlin && "
-            + "conda activate merlin && "
-            + "python /home/muchichen/ntu_paslab_llm/merlin/launch/run_node.py "
-        )
+    rc, out, err = Cmd("tmux -f /dev/null new-session -s merlin -d zsh \;")
 
-        if args.terminate:
-            rc, out, err = Cmd(base_cmd + " --terminate")
-            if rc != 0:
-                print(err.strip())
-            else:
-                print("[terminated successfully]")
-            continue
+    if rc != 0:
+        print(err, file=sys.stderr)
+        sys.exit(1)
 
-        rc, out, err = Cmd(
-            base_cmd
-            + f"--nnodes={world_size} "
-            + f"--node-rank={node_rank} "
-            + f"--nproc-per-node={ngpus} "
-            + f"--master-addr={master_addr} "
-            + f"--master-port={master_port} "
-            + f"--target-script={target_script}"
-        )
-        if rc != 0:
-            print(err.strip())
-        else:
-            print("[launched successfully]")
+    Cmd("tmux set-option -g mouse on")
+    Cmd("tmux send-keys -t 0 'clear' Enter \;")
+    Cmd("tmux send-keys -t 0 'conda activate merlin' Enter \;")
+    Cmd(
+        "tmux send-keys -t 0 'torchrun "
+        + f"--nnodes={args.world_size} "
+        + f"--node-rank={args.node_rank} "
+        + f"--nproc-per-node={args.ngpus} "
+        + f"--master-addr={args.master_addr} "
+        + f"--master-port={args.master_port} "
+        + f"{args.target_script}' Enter \;"
+    )
 
 
 if __name__ == "__main__":
