@@ -52,6 +52,7 @@ def init_processes():
         run(x, w1, w2, w3, group)
 
     print(f"AVG run latency: {((time.time() - tic) * 1000) / 10000} ms")
+    dist.barrier()
     dist.destroy_process_group()
 
 
