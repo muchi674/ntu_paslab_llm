@@ -22,6 +22,7 @@ def init_processes():
         rank=WORLD_RANK,
         world_size=WORLD_SIZE,
     )
+    print(int(os.environ["GROUP_RANK"]))
 
     device = torch.device(f"cuda:{LOCAL_RANK}")
     group = dist.new_group(list(range(WORLD_SIZE)))
