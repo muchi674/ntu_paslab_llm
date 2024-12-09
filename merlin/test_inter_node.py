@@ -29,7 +29,7 @@ def init_processes():
     print(WORLD_RANK, WORLD_SIZE)
 
     device = torch.device(f"cuda:{WORLD_RANK}")
-    group = dist.new_group(list(range(WORLD_SIZE)))
+    group = dist.new_group([0, 1, 2, 3])
     x = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
     w1 = torch.ones((14336, 4096), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 1)
     w2 = torch.ones((4096, 14336), dtype=torch.bfloat16, device=device) * (WORLD_RANK + 2)
