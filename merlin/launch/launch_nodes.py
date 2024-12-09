@@ -113,7 +113,7 @@ def main():
         rc, out, err = Cmd(
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} &&"
             + "cd /home/muchichen/ntu_paslab_llm &&"
-            + "git pull &&"
+            + "git pull origin merlin &&"
             + "conda activate merlin &&"
             + "torchrun "
             + f"--nnodes={world_size} "
