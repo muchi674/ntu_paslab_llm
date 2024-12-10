@@ -4,14 +4,16 @@
 import argparse
 import inspect
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import List, Optional, Tuple
 
 import torch
-from torch import nn
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
 
 from xformers.ops.fmha import memory_efficient_attention  # type: ignore
 from xformers.ops.fmha.attn_bias import (  # type: ignore
@@ -24,12 +26,10 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-ACT_STATS = None
-
-
-def reset_perf_logs():
-    global ACT_STATS
-    ACT_STATS = {li: [] for li in range(32)}
+# Environment variables set by torch.distributed.launch
+LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+WORLD_RANK = int(os.environ["RANK"])
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
@@ -82,6 +82,24 @@ class ModelArgs:
     def from_dict(cls, params: dict):
         cls_params = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in params.items() if k in cls_params})
+
+    @classmethod
+    def from_hf_config(cls, params: dict):
+        return cls(
+            dim=params["hidden_size"],
+            n_layers=params["num_hidden_layers"],
+            head_dim=params["hidden_size"] // params["num_attention_heads"],
+            hidden_dim=params["intermediate_size"],
+            n_heads=params["num_attention_heads"],
+            n_kv_heads=params["num_key_value_heads"],
+            norm_eps=params["rms_norm_eps"],
+            vocab_size=params["vocab_size"],
+            rope_theta=params["rope_theta"],
+            moe={
+                "num_experts_per_tok": params["num_experts_per_tok"],
+                "num_experts": params["num_local_experts"],
+            },
+        )
 
 
 @dataclass
@@ -364,37 +382,19 @@ class Attention(nn.Module):
         return self.wo(output)  # type: ignore
 
 
-# class Experts:
-#     # tmp design:
-#     # 1. shared across layers
-#     # 2. CPU and GPU computations are not overlapped
-
-#     def __init__(self, ws: dict):
-#         self.ws = ws
-
-#     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-#         w: torch.Tensor = self.ws[f"{li}.{ei}"]
-#         ex = x.to(w.device)
-#         ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-#         return ey.to(x.device)  # type: ignore
-
-
-# perf_analysis
 class Experts:
-    # tmp design:
-    # 1. shared across layers
-    # 2. CPU and GPU computations are not overlapped
 
-    def __init__(self, ws: dict):
+    def __init__(self, ws: dict, group):
         self.ws = ws
+        self.group = group
+        self.step = ws["0.w1"].shape[0] // 8
 
-    def forward(self, li: int, ei: int, x: torch.Tensor, on_gpu_cnt: int):
-        w: torch.Tensor = self.ws[f"{li}.{ei}"]
-        if w.is_cuda:
-            on_gpu_cnt += x.shape[0]
-        ex = x.to(w.device)
-        ey = (nn.functional.silu(ex @ w[0].T) * (ex @ w[2].T)) @ w[1]
-        return ey.to(x.device), on_gpu_cnt  # type: ignore
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        el, er = ei * self.step, (ei + 1) * self.step
+        w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
+        w2: torch.Tensor = self.ws[f"{li}.w2"][el:er].T
+        w3: torch.Tensor = self.ws[f"{li}.w3"][el:er]
+        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -411,15 +411,13 @@ class MoeLayer(nn.Module):
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
-        on_gpu_cnt = 0  # perf_analysis
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            # ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            ey, on_gpu_cnt = self.experts.forward(
-                self.li, ei, inputs[batch_idx], on_gpu_cnt
-            )  # perf_analysis
+            if torch.numel(batch_idx) == 0:
+                continue
+
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        ACT_STATS[self.li].append(on_gpu_cnt / (inputs.shape[0] * 2))  # perf_analysis
         return results
 
 
@@ -524,7 +522,7 @@ class Transformer(nn.Module):
 
     @staticmethod
     def load(model_path: Path, gpu: torch.device) -> "Transformer":
-        model_args = ModelArgs.from_dict(get_json(model_path / "params.json"))
+        model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
 
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -532,13 +530,8 @@ class Transformer(nn.Module):
             mmap=True,
         )
         experts = torch.load(
-            model_path / "experts.pt", map_location=torch.device("cpu"), mmap=True
+            model_path / f"experts-tp-{WORLD_RANK}.pt", map_location=gpu, mmap=True
         )
-
-        for li in range(model_args.n_layers):
-            # ei = li % 8
-            # experts[f"{li}.{ei}"] = experts[f"{li}.{ei}"].to(gpu)
-            experts[f"{li}.0"] = experts[f"{li}.0"].to(gpu)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -558,7 +551,6 @@ def generate(
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
-    verbose: bool = False,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
     prefill_tic = torch.cuda.Event(enable_timing=True)
@@ -587,7 +579,6 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
-    reset_perf_logs()  # perf_analysis
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
@@ -598,13 +589,8 @@ def generate(
     prefill_toc.record()
     torch.cuda.synchronize(device=gpu)
     prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
-    if verbose:  # perf_analysis
-        on_gpu_pct = [round(ACT_STATS[li][0], 3) for li in range(32)]
-        print("PCT OF EXPERT CALCS ON GPU DURING PREFILL:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}")
 
     # decode
-    reset_perf_logs()  # perf_analysis
     decode_tic = torch.cuda.Event(enable_timing=True)
     decode_toc = torch.cuda.Event(enable_timing=True)
     decode_tic.record()
@@ -633,10 +619,6 @@ def generate(
     decode_toc.record()
     torch.cuda.synchronize(device=gpu)
     decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
-    if verbose:  # perf_analysis
-        on_gpu_pct = [round(mean(ACT_STATS[li]), 3) for li in range(32)]
-        print("PCT OF EXPERT CALCS ON GPU DURING DECODE:\n", on_gpu_pct)
-        print(f"AVG: {round(mean(on_gpu_pct), 3)}")  # average of averages
 
     return (
         seqlens,
@@ -675,11 +657,12 @@ def main(
     prompt: str,
     prompt_path: str,
     n_prompts: int,
+    batch_size: int,
     max_tokens: int,
     hide_resp: bool,
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    gpu_0 = torch.device("cuda:0")
+    assert n_prompts % batch_size == 0
     prompts: list[str] = None
     if prompt:
         prompts = [prompt]
@@ -687,51 +670,87 @@ def main(
         dataset: list[str] = get_json(Path(prompt_path))["prompts"]
         n_repeats = -(n_prompts // -len(dataset))  # ceil division
         prompts = (dataset * n_repeats)[:n_prompts]
+
+    gpu = torch.device(f"cuda:{LOCAL_RANK}")
+    dist.init_process_group(
+        "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
+    )
+    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu_0)
+    model = Transformer.load(Path(model_path), gpu)
 
-    # warmup
-    generate(
-        ["hello, how are you?"],
-        tokenizer,
-        model,
-        gpu_0,
-        max_tokens=1,
-        max_batch_size=len(prompts),
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-    )
+    prefill_tps = []
+    decode_tps = []
+    start = 0
+    for end in range(batch_size, n_prompts + 1, batch_size):
+        prompt_batch = prompts[start:end]
 
-    seqlens, responses, n_p_tkns, prefill_time, n_gen_tkns, decode_time = generate(
-        prompts,
-        tokenizer,
-        model,
-        gpu_0,
-        max_tokens=max_tokens,
-        max_batch_size=len(prompts),
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        verbose=True,  # perf_analysis
-    )
-    print("=" * 20)
-    print("PERFORMANCE BREAKDOWN\n")
-    print("PROMPT EVALUATION:")
-    print(f"token count: {n_p_tkns}")
-    print(f"total time in sec(s): {prefill_time:.2f}")
-    print(f"throughput: {(n_p_tkns / prefill_time):.2f} t/s")
-    print("TOKEN GENERATION:")
-    print(f"token count: {n_gen_tkns}")
-    print(f"total time in sec(s): {decode_time:.2f}")
-    if n_gen_tkns > 0:
-        print(f"throughput: {(n_gen_tkns / decode_time):.2f} t/s")
-    else:
-        responses = ["" for _ in prompts]
-    if not hide_resp:
+        # warmup
+        generate(
+            ["hello, how are you?"],
+            tokenizer,
+            model,
+            gpu,
+            max_tokens=1,
+            max_batch_size=len(prompt_batch),
+            # temperature=0,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        )
+
+        (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+        ) = generate(
+            prompt_batch,
+            tokenizer,
+            model,
+            gpu,
+            max_tokens=max_tokens,
+            max_batch_size=len(prompt_batch),
+            # temperature=0,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        )
+
+        prefill_tp = n_p_tkns / prefill_time
+        decode_tp = n_gen_tkns / decode_time
+        prefill_tps.append(prefill_tp)
+        decode_tps.append(decode_tp)
+
         print("=" * 20)
-        print("In-n-Outs")
-        print(f"AVG seqlen: {mean(seqlens)}")
-        print(f"seqlens: {seqlens}\n")
-        for p, resp in zip(prompts, responses):
-            print(f"PROMPT:\n{p}")
-            print(f"RESPONSE:\n{resp}\n")
+        print("PERFORMANCE BREAKDOWN\n")
+        print("PROMPT EVALUATION:")
+        print(f"token count: {n_p_tkns}")
+        print(f"total time in sec(s): {prefill_time:.2f}")
+        print(f"throughput: {prefill_tp:.2f} t/s")
+        print("TOKEN GENERATION:")
+        print(f"token count: {n_gen_tkns}")
+        print(f"total time in sec(s): {decode_time:.2f}")
+        if n_gen_tkns > 0:
+            print(f"throughput: {decode_tp:.2f} t/s")
+        else:
+            responses = ["" for _ in prompt_batch]
+        if not hide_resp:
+            print("=" * 20)
+            print("INS-N-OUTS")
+            print(f"AVG seqlen: {mean(seqlens)}")
+            print(f"seqlens: {seqlens}\n")
+            for p, resp in zip(prompt_batch, responses):
+                print(f"PROMPT:\n{p}")
+                print(f"RESPONSE:\n{resp}\n")
+
+        start = end
+
+    print("=" * 20)
+    print("RUN STATISTICS")
+    print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+    print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+    dist.barrier(group=group)
+    dist.destroy_process_group(group=group)
 
 
 if __name__ == "__main__":
@@ -740,6 +759,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
@@ -749,6 +769,7 @@ if __name__ == "__main__":
         args.prompt,
         args.prompt_path,
         args.n_prompts,
+        args.batch_size,
         args.max_tokens,
         args.hide_resp,
     )
