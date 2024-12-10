@@ -1,0 +1,18 @@
+{
+    "world_size": 2,
+    "master_addr": "10.10.10.1",
+    "master_port": "9091",
+    "target_script": "/home/muchichen/ntu_paslab_llm/merlin/misc_tests/test_inter_node.py",
+    "nodes": {
+        "10.10.10.1": {
+            "ssh_port": 9051,
+            "node_rank": 0,
+            "ngpus": 2
+        },
+        "10.10.10.2": {
+            "ssh_port": 9046,
+            "node_rank": 1,
+            "ngpus": 2
+        }
+    }
+}
