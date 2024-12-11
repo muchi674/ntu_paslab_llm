@@ -300,9 +300,11 @@ class BufferCache:
         during_prefill = seqpos[0] == 0
         if during_prefill:
             assert all([pos == 0 for pos in seqpos]), seqpos
-            mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(
-                self.max_seq_len
-            ).to(self.device)
+            mask = (
+                BlockDiagonalCausalMask.from_seqlens(seqlens)
+                .make_local_attention(self.max_seq_len)
+                .to(self.device)
+            )
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
@@ -681,25 +683,24 @@ def main(
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), gpu, group)
 
+    # warmup
+    generate(
+        ["hello, how are you?"],
+        tokenizer,
+        model,
+        gpu,
+        group,
+        max_tokens=1,
+        max_batch_size=len(prompt_batch),
+        # temperature=0,
+        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    )
+
     prefill_tps = []
     decode_tps = []
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
-
-        # warmup
-        generate(
-            ["hello, how are you?"],
-            tokenizer,
-            model,
-            gpu,
-            group,
-            max_tokens=1,
-            max_batch_size=len(prompt_batch),
-            # temperature=0,
-            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        )
-
         (
             seqlens,
             responses,
@@ -719,35 +720,33 @@ def main(
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
-        if WORLD_RANK > 0:
-            continue
+        if WORLD_RANK == 0:
+            prefill_tp = n_p_tkns / prefill_time
+            decode_tp = n_gen_tkns / decode_time
+            prefill_tps.append(prefill_tp)
+            decode_tps.append(decode_tp)
 
-        prefill_tp = n_p_tkns / prefill_time
-        decode_tp = n_gen_tkns / decode_time
-        prefill_tps.append(prefill_tp)
-        decode_tps.append(decode_tp)
-
-        print("=" * 20)
-        print("PERFORMANCE BREAKDOWN\n")
-        print("PROMPT EVALUATION:")
-        print(f"token count: {n_p_tkns}")
-        print(f"total time in sec(s): {prefill_time:.2f}")
-        print(f"throughput: {prefill_tp:.2f} t/s")
-        print("TOKEN GENERATION:")
-        print(f"token count: {n_gen_tkns}")
-        print(f"total time in sec(s): {decode_time:.2f}")
-        if n_gen_tkns > 0:
-            print(f"throughput: {decode_tp:.2f} t/s")
-        else:
-            responses = ["" for _ in prompt_batch]
-        if not hide_resp:
             print("=" * 20)
-            print("INS-N-OUTS")
-            print(f"AVG seqlen: {mean(seqlens)}")
-            print(f"seqlens: {seqlens}\n")
-            for p, resp in zip(prompt_batch, responses):
-                print(f"PROMPT:\n{p}")
-                print(f"RESPONSE:\n{resp}\n")
+            print("PERFORMANCE BREAKDOWN\n")
+            print("PROMPT EVALUATION:")
+            print(f"token count: {n_p_tkns}")
+            print(f"total time in sec(s): {prefill_time:.2f}")
+            print(f"throughput: {prefill_tp:.2f} t/s")
+            print("TOKEN GENERATION:")
+            print(f"token count: {n_gen_tkns}")
+            print(f"total time in sec(s): {decode_time:.2f}")
+            if n_gen_tkns > 0:
+                print(f"throughput: {decode_tp:.2f} t/s")
+            else:
+                responses = ["" for _ in prompt_batch]
+            if not hide_resp:
+                print("=" * 20)
+                print("INS-N-OUTS")
+                print(f"AVG seqlen: {mean(seqlens)}")
+                print(f"seqlens: {seqlens}\n")
+                for p, resp in zip(prompt_batch, responses):
+                    print(f"PROMPT:\n{p}")
+                    print(f"RESPONSE:\n{resp}\n")
 
         start = end
 
