@@ -101,7 +101,15 @@ def main():
     parser.add_argument("--nproc-per-node", type=int)
     parser.add_argument("--master-addr", type=str)
     parser.add_argument("--master-port", type=int)
-    parser.add_argument("--target-script", type=str)
+    parser.add_argument("--script", type=str)
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompt-path", type=str)
+    parser.add_argument("--n-prompts", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--hide-resp", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
 
@@ -115,17 +123,38 @@ def main():
         print(err, file=sys.stderr)
         sys.exit(1)
 
+    header = "torchrun "
+    if args.profile:
+        header = (
+            "nsys profile "
+            + "--capture-range=cudaProfilerApi --capture-range-end=stop "
+            + header
+        )
+    exec_target = f"{args.script} --model-path={args.model_path} "
+    if args.prompt is not None:
+        exec_target += f'--prompt="{args.prompt}" '
+    else:
+        exec_target += f"--prompt-path={args.prompt_path} "
+    exec_target += (
+        f"--n-prompts={args.n_prompts} "
+        + f"--batch-size={args.batch_size} "
+        + f"--max-tokens={args.max_tokens} "
+    )
+    if args.hide_resp:
+        exec_target += "--hide-resp "
+
     Cmd("tmux set-option -g mouse on")
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
     Cmd("tmux send-keys -t 0 'conda activate merlin' Enter \;")
     Cmd(
-        "tmux send-keys -t 0 'torchrun "
+        f"tmux send-keys -t 0 '{header}"
         + f"--nnodes={args.nnodes} "
         + f"--node-rank={args.node_rank} "
         + f"--nproc-per-node={args.nproc_per_node} "
         + f"--master-addr={args.master_addr} "
         + f"--master-port={args.master_port} "
-        + f"{args.target_script}' Enter \;"
+        + exec_target
+        + f"' Enter \;"
     )
 
 

@@ -95,6 +95,7 @@ class Cmd:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-config", required=True, type=str)
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
     try:
@@ -103,18 +104,32 @@ def main():
     except FileNotFoundError:
         raise
 
-    world_size, master_addr, master_port, target_script, nodes = itemgetter(
-        "world_size", "master_addr", "master_port", "target_script", "nodes"
+    world_size, master_addr, master_port, nodes = itemgetter(
+        "world_size", "master_addr", "master_port", "nodes"
     )(config)
 
+    if not args.terminate:
+        shared_exec_args = ""
+        tmp = config["shared_exec_args"]
+        if "prompt" in tmp:
+            shared_exec_args += f'--prompt="{tmp["prompt"]}" '
+        else:
+            shared_exec_args += f'--prompt-path={tmp["prompt_path"]} '
+        for k in ["n_prompts", "batch_size", "max_tokens"]:
+            if k in tmp:
+                shared_exec_args += f'--{k.replace("_", "-")}={tmp[k]} '
+        if "hide_resp" in tmp:
+            shared_exec_args += f"--hide-resp "
+
     for url, node_info in nodes.items():
-        ssh_port, node_rank, ngpus = itemgetter("ssh_port", "node_rank", "ngpus")(
-            node_info
-        )
+        ssh_port, node_rank, ngpus, script, model_path = itemgetter(
+            "ssh_port", "node_rank", "ngpus", "script", "model_path"
+        )(node_info)
         print(f"node {url}")
         base_cmd = (
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
-            + "'export PATH=\"$PATH:/home/muchichen/miniconda3/condabin/\" && "
+            + "'"
+            + 'export PATH="$PATH:/home/muchichen/miniconda3/condabin/" && '
             + "cd /home/muchichen/ntu_paslab_llm && "
             + "git pull origin merlin && "
             + "conda activate merlin && "
@@ -136,7 +151,11 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + f"--target-script={target_script}'"
+            + f"--script={script} "
+            + f"--model-path={model_path} "
+            + shared_exec_args
+            + ("--profile " if args.profile and url == master_addr else "")
+            + "'"
         )
         if rc != 0:
             print(err.strip())
