@@ -3,9 +3,9 @@
     "master_addr": "10.10.10.1",
     "master_port": "9091",
     "shared_exec_args": {
-        "prompt": "howdy, how do you treat a handover?",
-        "n_prompts": 1,
-        "batch_size": 1,
+        "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
+        "n_prompts": 16,
+        "batch_size": 4,
         "max_tokens": 128
     },
     "nodes": {
