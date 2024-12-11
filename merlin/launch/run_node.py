@@ -122,7 +122,7 @@ def main():
         print(err, file=sys.stderr)
         sys.exit(1)
 
-    exec_target = f"{args.target_script} --model-path={args.model_path} "
+    exec_target = f"{args.script} --model-path={args.model_path} "
     if args.prompt is not None:
         exec_target += f'--prompt="{args.prompt}" '
     else:

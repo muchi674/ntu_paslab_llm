@@ -103,20 +103,23 @@ def main():
     except FileNotFoundError:
         raise
 
-    world_size, master_addr, master_port, target_script, nodes = itemgetter(
-        "world_size", "master_addr", "master_port", "target_script", "nodes"
+    world_size, master_addr, master_port, nodes = itemgetter(
+        "world_size", "master_addr", "master_port", "nodes"
     )(config)
 
     if not args.terminate:
-        targs = config["target"]["args"] # target + arguments = targs :)
-        exec_target = f"--script={config["target"]["script"]} " + f"--model-path={targs["model_path"]} "
+        targs = config["target"]["args"]  # target + arguments = targs :)
+        exec_target = (
+            f'--script={config["target"]["script"]} '
+            + f'--model-path={targs["model_path"]} '
+        )
         if "prompt" in targs:
             exec_target += f'--prompt="{targs["prompt"]}" '
         else:
-            exec_target += f"--prompt-path={targs["prompt_path"]} "
+            exec_target += f'--prompt-path={targs["prompt_path"]} '
         for k in ["n_prompts", "batch_size", "max_tokens"]:
             if k in targs:
-                exec_target += f"--{k.replace("_", "-")}={targs[k]} "
+                exec_target += f'--{k.replace("_", "-")}={targs[k]} '
         if "hide_resp" in targs:
             exec_target += f"--hide-resp "
 
