@@ -107,6 +107,19 @@ def main():
         "world_size", "master_addr", "master_port", "target_script", "nodes"
     )(config)
 
+    if not args.terminate:
+        targs = config["target"]["args"] # target + arguments = targs :)
+        exec_target = f"--script={config["target"]["script"]} " + f"--model-path={targs["model_path"]} "
+        if "prompt" in targs:
+            exec_target += f'--prompt="{targs["prompt"]}" '
+        else:
+            exec_target += f"--prompt-path={targs["prompt_path"]} "
+        for k in ["n_prompts", "batch_size", "max_tokens"]:
+            if k in targs:
+                exec_target += f"--{k.replace("_", "-")}={targs[k]} "
+        if "hide_resp" in targs:
+            exec_target += f"--hide-resp "
+
     for url, node_info in nodes.items():
         ssh_port, node_rank, ngpus = itemgetter("ssh_port", "node_rank", "ngpus")(
             node_info
@@ -114,7 +127,8 @@ def main():
         print(f"node {url}")
         base_cmd = (
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
-            + "'export PATH=\"$PATH:/home/muchichen/miniconda3/condabin/\" && "
+            + "'"
+            + 'export PATH="$PATH:/home/muchichen/miniconda3/condabin/" && '
             + "cd /home/muchichen/ntu_paslab_llm && "
             + "git pull origin merlin && "
             + "conda activate merlin && "
@@ -136,7 +150,8 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + f"--target-script={target_script}'"
+            + exec_target
+            + "'"
         )
         if rc != 0:
             print(err.strip())

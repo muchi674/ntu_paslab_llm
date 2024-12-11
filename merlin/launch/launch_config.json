@@ -2,7 +2,16 @@
     "world_size": 2,
     "master_addr": "10.10.10.1",
     "master_port": "9091",
-    "target_script": "/home/muchichen/ntu_paslab_llm/merlin/misc_tests/test_inter_node.py",
+    "target": {
+        "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
+        "args": {
+            "model_path": "/home/muchichen/Mixtral-8x7B-Instruct-v0.1",
+            "prompt": "howdy, how do you treat a handover?",
+            "n_prompts": 1,
+            "batch_size": 1,
+            "max_tokens": 128
+        }
+    },
     "nodes": {
         "10.10.10.1": {
             "ssh_port": 9051,

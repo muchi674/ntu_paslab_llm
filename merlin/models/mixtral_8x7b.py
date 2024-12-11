@@ -654,10 +654,10 @@ def main(
     model_path: str,
     prompt: str,
     prompt_path: str,
-    n_prompts: int,
-    batch_size: int,
-    max_tokens: int,
-    hide_resp: bool,
+    n_prompts: int = 1,
+    batch_size: int = 1,
+    max_tokens: int = 128,
+    hide_resp: bool = False,
 ):
     assert prompt or (prompt_path and n_prompts and n_prompts > 0)
     assert n_prompts % batch_size == 0
@@ -758,9 +758,9 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
-    parser.add_argument("--n-prompts", type=int)
-    parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--n-prompts", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
