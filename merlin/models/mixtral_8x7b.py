@@ -5,6 +5,7 @@ import argparse
 import inspect
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -394,7 +395,9 @@ class Experts:
         w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
         w2: torch.Tensor = self.ws[f"{li}.w2"][el:er].T
         w3: torch.Tensor = self.ws[f"{li}.w3"][el:er]
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2  # type: ignore
+        y = (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
+        return y  # type: ignore
 
 
 class MoeLayer(nn.Module):
@@ -415,7 +418,6 @@ class MoeLayer(nn.Module):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) == 0:
                 continue
-
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         return results
@@ -521,9 +523,8 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, gpu: torch.device) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device, group) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
-
         non_experts = torch.load(
             model_path / "non-experts.pt",
             map_location=gpu,
@@ -534,7 +535,7 @@ class Transformer(nn.Module):
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts))
+            model = Transformer(args=model_args, experts=Experts(experts, group))
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -546,6 +547,7 @@ def generate(
     tokenizer: MistralTokenizer,
     model: Transformer,
     gpu: torch.device,
+    group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -553,9 +555,7 @@ def generate(
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
-    prefill_tic = torch.cuda.Event(enable_timing=True)
-    prefill_toc = torch.cuda.Event(enable_timing=True)
-    prefill_tic.record()
+    tic = time.time()
 
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
@@ -586,14 +586,12 @@ def generate(
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
-    prefill_toc.record()
-    torch.cuda.synchronize(device=gpu)
-    prefill_time = prefill_tic.elapsed_time(prefill_toc) / 1000  # to seconds
+
+    dist.barrier(group=group)
+    prefill_time = time.time() - tic
+    tic = time.time()
 
     # decode
-    decode_tic = torch.cuda.Event(enable_timing=True)
-    decode_toc = torch.cuda.Event(enable_timing=True)
-    decode_tic.record()
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
@@ -616,9 +614,9 @@ def generate(
     else:
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
-    decode_toc.record()
-    torch.cuda.synchronize(device=gpu)
-    decode_time = decode_tic.elapsed_time(decode_toc) / 1000  # to seconds
+
+    dist.barrier(group=group)
+    decode_time = time.time() - tic
 
     return (
         seqlens,
@@ -677,7 +675,7 @@ def main(
     )
     group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu)
+    model = Transformer.load(Path(model_path), gpu, group)
 
     prefill_tps = []
     decode_tps = []
@@ -691,6 +689,7 @@ def main(
             tokenizer,
             model,
             gpu,
+            group,
             max_tokens=1,
             max_batch_size=len(prompt_batch),
             # temperature=0,
@@ -709,6 +708,7 @@ def main(
             tokenizer,
             model,
             gpu,
+            group,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
