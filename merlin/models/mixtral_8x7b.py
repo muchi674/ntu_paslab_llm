@@ -690,8 +690,8 @@ def main(
         model,
         gpu,
         group,
-        max_tokens=1,
-        max_batch_size=len(prompt_batch),
+        max_tokens=16,
+        max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
