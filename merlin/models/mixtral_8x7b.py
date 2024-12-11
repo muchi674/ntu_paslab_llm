@@ -302,7 +302,7 @@ class BufferCache:
             assert all([pos == 0 for pos in seqpos]), seqpos
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(
                 self.max_seq_len
-            )
+            ).to(self.device)
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
@@ -310,7 +310,7 @@ class BufferCache:
                 kv_seqlen=(self.kv_seqlens + cached_elements)
                 .clamp(max=self.max_seq_len)
                 .tolist(),
-            )
+            ).to(self.device)
 
         return CacheInputMetadata(
             positions=positions,
@@ -393,8 +393,8 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         el, er = ei * self.step, (ei + 1) * self.step
         w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
-        w2: torch.Tensor = self.ws[f"{li}.w2"][el:er].T
-        w3: torch.Tensor = self.ws[f"{li}.w3"][el:er]
+        w2: torch.Tensor = self.ws[f"{li}.w2"][el:er]
+        w3: torch.Tensor = self.ws[f"{li}.w3"][el:er].T
         y = (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
         dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
         return y  # type: ignore
@@ -528,10 +528,14 @@ class Transformer(nn.Module):
         non_experts = torch.load(
             model_path / "non-experts.pt",
             map_location=gpu,
+            weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-tp-{WORLD_RANK}.pt", map_location=gpu, mmap=True
+            model_path / f"experts-tp-{WORLD_RANK}.pt",
+            map_location=gpu,
+            weights_only=True,
+            mmap=True,
         )
 
         with torch.device("meta"):
