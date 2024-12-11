@@ -2,26 +2,26 @@
     "world_size": 2,
     "master_addr": "10.10.10.1",
     "master_port": "9091",
-    "target": {
-        "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
-        "args": {
-            "model_path": "/home/muchichen/Mixtral-8x7B-Instruct-v0.1",
-            "prompt": "howdy, how do you treat a handover?",
-            "n_prompts": 1,
-            "batch_size": 1,
-            "max_tokens": 128
-        }
+    "shared_exec_args": {
+        "prompt": "howdy, how do you treat a handover?",
+        "n_prompts": 1,
+        "batch_size": 1,
+        "max_tokens": 128
     },
     "nodes": {
         "10.10.10.1": {
             "ssh_port": 9051,
             "node_rank": 0,
-            "ngpus": 2
+            "ngpus": 2,
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
+            "model_path": "/home/muchichen/Mixtral-8x7B-Instruct-v0.1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
             "node_rank": 1,
-            "ngpus": 2
+            "ngpus": 4,
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
+            "model_path": "/mnt/disk2/muchichen/Mixtral-8x7B-Instruct-v0.1"
         }
     }
 }

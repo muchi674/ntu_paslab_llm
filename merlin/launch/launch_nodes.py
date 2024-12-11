@@ -108,25 +108,22 @@ def main():
     )(config)
 
     if not args.terminate:
-        targs = config["target"]["args"]  # target + arguments = targs :)
-        exec_target = (
-            f'--script={config["target"]["script"]} '
-            + f'--model-path={targs["model_path"]} '
-        )
-        if "prompt" in targs:
-            exec_target += f'--prompt="{targs["prompt"]}" '
+        shared_exec_args = ""
+        tmp = config["shared_exec_args"]
+        if "prompt" in tmp:
+            shared_exec_args += f'--prompt="{tmp["prompt"]}" '
         else:
-            exec_target += f'--prompt-path={targs["prompt_path"]} '
+            shared_exec_args += f'--prompt-path={tmp["prompt_path"]} '
         for k in ["n_prompts", "batch_size", "max_tokens"]:
-            if k in targs:
-                exec_target += f'--{k.replace("_", "-")}={targs[k]} '
-        if "hide_resp" in targs:
-            exec_target += f"--hide-resp "
+            if k in tmp:
+                shared_exec_args += f'--{k.replace("_", "-")}={tmp[k]} '
+        if "hide_resp" in tmp:
+            shared_exec_args += f"--hide-resp "
 
     for url, node_info in nodes.items():
-        ssh_port, node_rank, ngpus = itemgetter("ssh_port", "node_rank", "ngpus")(
-            node_info
-        )
+        ssh_port, node_rank, ngpus, script, model_path = itemgetter(
+            "ssh_port", "node_rank", "ngpus", "script", "model_path"
+        )(node_info)
         print(f"node {url}")
         base_cmd = (
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
@@ -153,7 +150,9 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + exec_target
+            + f"--script={script} "
+            + f"--model-path={model_path} "
+            + shared_exec_args
             + "'"
         )
         if rc != 0:
