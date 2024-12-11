@@ -387,9 +387,8 @@ class Attention(nn.Module):
 
 class Experts:
 
-    def __init__(self, ws: dict, group):
-        self.ws = ws
-        self.group = group
+    def __init__(self, ws: dict):
+        self.ws: dict[str, torch.Tensor] = ws
         self.step = ws["0.w1"].shape[0] // 8
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
@@ -397,19 +396,20 @@ class Experts:
         w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
         w2: torch.Tensor = self.ws[f"{li}.w2"][el:er]
         w3: torch.Tensor = self.ws[f"{li}.w3"][el:er].T
-        y = (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
-        return y  # type: ignore
+        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
 
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+    def __init__(
+        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
+    ):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -422,6 +422,7 @@ class MoeLayer(nn.Module):
                 continue
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
 
@@ -440,7 +441,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -450,6 +451,7 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
+            group=group,
         )
 
     def forward(
@@ -463,7 +465,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts):
+    def __init__(self, args: ModelArgs, experts: Experts, group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -472,7 +474,9 @@ class Transformer(nn.Module):
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(args=args, li=li, experts=experts)
+                str(li): TransformerBlock(
+                    args=args, li=li, experts=experts, group=group
+                )
                 for li in range(args.n_layers)
             }
         )
@@ -541,7 +545,7 @@ class Transformer(nn.Module):
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts, group))
+            model = Transformer(args=model_args, experts=Experts(experts), group=group)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -552,7 +556,6 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    gpu: torch.device,
     group,
     *,
     max_tokens: int,
