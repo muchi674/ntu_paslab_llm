@@ -95,6 +95,7 @@ class Cmd:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-config", required=True, type=str)
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
     try:
@@ -153,6 +154,7 @@ def main():
             + f"--script={script} "
             + f"--model-path={model_path} "
             + shared_exec_args
+            + ("--profile " if args.profile and url == master_addr else "")
             + "'"
         )
         if rc != 0:

@@ -696,6 +696,7 @@ def main(
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
+    torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
     decode_tps = []
     start = 0
@@ -756,6 +757,7 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
+    torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
     dist.destroy_process_group(group=group)
 

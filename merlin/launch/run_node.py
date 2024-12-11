@@ -109,6 +109,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hide-resp", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
 
@@ -122,6 +123,9 @@ def main():
         print(err, file=sys.stderr)
         sys.exit(1)
 
+    header = "torchrun "
+    if args.profile:
+        header = "nsys profile " + header
     exec_target = f"{args.script} --model-path={args.model_path} "
     if args.prompt is not None:
         exec_target += f'--prompt="{args.prompt}" '
@@ -139,7 +143,7 @@ def main():
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
     Cmd("tmux send-keys -t 0 'conda activate merlin' Enter \;")
     Cmd(
-        "tmux send-keys -t 0 'torchrun "
+        f"tmux send-keys -t 0 '{header}"
         + f"--nnodes={args.nnodes} "
         + f"--node-rank={args.node_rank} "
         + f"--nproc-per-node={args.nproc_per_node} "
