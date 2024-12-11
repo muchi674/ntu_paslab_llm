@@ -719,6 +719,9 @@ def main(
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
+        if WORLD_RANK > 0:
+            continue
+
         prefill_tp = n_p_tkns / prefill_time
         decode_tp = n_gen_tkns / decode_time
         prefill_tps.append(prefill_tp)
@@ -748,10 +751,11 @@ def main(
 
         start = end
 
-    print("=" * 20)
-    print("RUN STATISTICS")
-    print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-    print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if WORLD_RANK == 0:
+        print("=" * 20)
+        print("RUN STATISTICS")
+        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     dist.barrier(group=group)
     dist.destroy_process_group(group=group)
