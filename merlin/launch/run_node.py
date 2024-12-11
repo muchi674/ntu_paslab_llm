@@ -125,7 +125,11 @@ def main():
 
     header = "torchrun "
     if args.profile:
-        header = "nsys profile " + header
+        header = (
+            "nsys profile "
+            + "--capture-range=cudaProfilerApi --capture-range-end=stop "
+            + header
+        )
     exec_target = f"{args.script} --model-path={args.model_path} "
     if args.prompt is not None:
         exec_target += f'--prompt="{args.prompt}" '
