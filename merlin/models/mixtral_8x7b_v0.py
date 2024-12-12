@@ -422,7 +422,7 @@ class MoeLayer(nn.Module):
                 continue
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        dist.all_reduce(results.contiguous(), op=dist.ReduceOp.SUM, group=self.group)
         return results
 
 
