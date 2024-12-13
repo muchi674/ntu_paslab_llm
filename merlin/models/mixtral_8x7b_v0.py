@@ -430,7 +430,7 @@ class MoeLayer(nn.Module):
         for ei in range(self.num_experts):
             mask = selection_mask[:, ei]
             ey = self.experts.forward(self.li, ei, inputs[mask])
-            results[mask] += weights[:,ei][mask] * ey
+            results[mask] += weights[:,ei][mask][None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
