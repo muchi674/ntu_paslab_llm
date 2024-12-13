@@ -414,14 +414,16 @@ class MoeLayer(nn.Module):
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
+
+        eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            torch.cuda.synchronize()
-            torch.cuda.nvtx.range_push("misc")
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) == 0:
-                continue
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.synchronize()
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx)
+                nes.append(nth_expert)
+
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
