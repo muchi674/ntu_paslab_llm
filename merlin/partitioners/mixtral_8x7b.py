@@ -54,12 +54,10 @@ class Partitioner:
                 tpl, tpr = tp_range
 
                 for wi, w in enumerate([w1, w2, w3]):
-                    slices = []
 
-                    for el in range(0, w1.shape[0], interm_dim):
-                        slices.append(w[el : el + interm_dim][tpl:tpr])
-
-                    partition[f"{li}.w{wi + 1}"] = torch.cat(slices, dim=0)
+                    for ei, el in enumerate(range(0, w1.shape[0], interm_dim)):
+                        expert_slice = w[el : el + interm_dim][tpl:tpr].clone()
+                        partition[f"{li}.{ei}.w{wi + 1}"] = expert_slice
 
         for pi, partition in enumerate(partitions):
             torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")

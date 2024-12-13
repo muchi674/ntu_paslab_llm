@@ -389,13 +389,16 @@ class Experts:
 
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
-        self.step = ws["0.w1"].shape[0] // 8
+        # self.step = ws["0.w1"].shape[0] // 8
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        el, er = ei * self.step, (ei + 1) * self.step
-        w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
-        w2: torch.Tensor = self.ws[f"{li}.w2"][el:er]
-        w3: torch.Tensor = self.ws[f"{li}.w3"][el:er].T
+        # el, er = ei * self.step, (ei + 1) * self.step
+        # w1: torch.Tensor = self.ws[f"{li}.w1"][el:er].T
+        # w2: torch.Tensor = self.ws[f"{li}.w2"][el:er]
+        # w3: torch.Tensor = self.ws[f"{li}.w3"][el:er].T
+        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
 
