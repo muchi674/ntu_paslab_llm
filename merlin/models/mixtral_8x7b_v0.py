@@ -416,8 +416,8 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         for ei, tensor_ei in enumerate(torch.arange(self.num_experts, device=inputs.device)):
             batch_idx, nth_expert = torch.where(selected_experts == tensor_ei)
-            if torch.numel(batch_idx) == 0:
-                continue
+            # if torch.numel(batch_idx) == 0:
+            #     continue
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
