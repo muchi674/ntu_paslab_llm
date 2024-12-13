@@ -416,7 +416,7 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         weights = torch.zeros(
             (B, self.num_experts), dtype=weights.dtype, device=inputs.device
-        ).scatter_(1, selected_experts, weights)
+        ).scatter_(1, selected_experts, weights).detach().clone()
         selection_mask = (
             torch.zeros(
                 (B, self.num_experts),
@@ -424,7 +424,7 @@ class MoeLayer(nn.Module):
                 device=inputs.device,
             ).scatter_(1, selected_experts, 1)
             > 0
-        )
+        ).detach().clone()
         results = torch.zeros_like(inputs)
 
         for ei in range(self.num_experts):
