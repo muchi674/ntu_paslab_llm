@@ -410,22 +410,27 @@ class MoeLayer(nn.Module):
         self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        B = inputs.shape[0]
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        weights = torch.zeros(
+            (B, self.num_experts), dtype=weights.dtype, device=inputs.device
+        ).scatter_(1, selected_experts, weights)
+        selection_mask = (
+            torch.zeros(
+                (B, self.num_experts),
+                dtype=selected_experts.dtype,
+                device=inputs.device,
+            ).scatter_(1, selected_experts, 1)
+            > 0
+        )
         results = torch.zeros_like(inputs)
 
-        eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx)
-                nes.append(nth_expert)
-
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+            mask = selection_mask[:, ei]
+            ey = self.experts.forward(self.li, ei, inputs[mask])
+            results[mask] += weights[:,ei][mask] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
