@@ -4,7 +4,7 @@
     "master_port": "9091",
     "shared_exec_args": {
         "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 1,
+        "n_prompts": 16,
         "batch_size": 1,
         "max_tokens": 128
     },
@@ -13,14 +13,14 @@
             "ssh_port": 9051,
             "node_rank": 0,
             "ngpus": 2,
-            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v0.py",
             "model_path": "/home/muchichen/Mixtral-8x7B-Instruct-v0.1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
             "node_rank": 1,
             "ngpus": 4,
-            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b.py",
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v0.py",
             "model_path": "/mnt/disk2/muchichen/Mixtral-8x7B-Instruct-v0.1"
         }
     }
