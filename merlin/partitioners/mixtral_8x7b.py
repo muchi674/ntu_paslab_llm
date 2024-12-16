@@ -35,14 +35,9 @@ class Partitioner:
 
     def partition_expert_weights(self, ws: dict) -> None:
         """current implementation only supports tensor parallelism"""
-        tp_size = self.design["tp_size"]
+        tp_size = self.design["design"][0]["tp_size"]
         interm_dim = self.model_config["intermediate_size"]
-
         step = -(interm_dim // -tp_size)  # ceil division
-        tp_ranges = []
-        for start in range(0, interm_dim, step):
-            tp_ranges.append((start, min(start + step, interm_dim)))
-
         partitions = [{} for _ in range(tp_size)]
 
         for li in range(self.model_config["num_hidden_layers"]):
@@ -50,17 +45,19 @@ class Partitioner:
             w2: torch.Tensor = ws.pop(f"layers.{li}.block_sparse_moe.w2")
             w3: torch.Tensor = ws.pop(f"layers.{li}.block_sparse_moe.w3")
 
-            for tp_range, partition in zip(tp_ranges, partitions):
-                tpl, tpr = tp_range
+            for wi, w in enumerate([w1, w2, w3]):
 
-                for wi, w in enumerate([w1, w2, w3]):
+                for ei, expert_slice in enumerate(torch.split(w, interm_dim)):
 
-                    for ei, el in enumerate(range(0, w1.shape[0], interm_dim)):
-                        expert_slice = w[el : el + interm_dim][tpl:tpr].clone()
-                        partition[f"{li}.{ei}.w{wi + 1}"] = expert_slice
+                    # TODO: add things here
 
-        for pi, partition in enumerate(partitions):
-            torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")
+                    for partition, tp_slice in zip(
+                        partitions, torch.split(expert_slice, step)
+                    ):
+                        partition[f"{li}.{ei}.w{wi + 1}"] = tp_slice.clone()
+
+        # for pi, partition in enumerate(partitions):
+        #     torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")
 
         logging.info("finished partitioning expert weights")
         return ws
@@ -76,7 +73,7 @@ class Partitioner:
 
     def start(self) -> None:
         ws = self.partition_expert_weights(self.load_weights())
-        self.bundle_non_expert_weights(ws)
+        # self.bundle_non_expert_weights(ws)
 
 
 if __name__ == "__main__":

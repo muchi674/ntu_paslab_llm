@@ -1,0 +1,8 @@
+{
+    "design": [
+        {
+            "n_experts": 8,
+            "tp_size": 6
+        }
+    ]
+}
