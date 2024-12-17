@@ -394,6 +394,9 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
         if f"{li}.{ei}.w1" not in self.ws:
             return None
+        print("---------------------------")
+        print(f"{li}.{ei}.w1" not in self.ws)
+        print("---------------------------")
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
