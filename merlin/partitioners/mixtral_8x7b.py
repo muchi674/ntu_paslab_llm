@@ -65,7 +65,7 @@ class Partitioner:
                         partitions[pi][f"{li}.{ei}.w{wi + 1}"] = tp_slice.clone()
 
         for pi, partition in enumerate(partitions):
-            torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")
+            torch.save(partition, self.model_path / f"experts-{pi}.pt")
 
         logging.info("finished partitioning expert weights")
         return ws

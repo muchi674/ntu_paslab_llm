@@ -103,6 +103,7 @@ def main():
     parser.add_argument("--master-port", type=int)
     parser.add_argument("--script", type=str)
     parser.add_argument("--model-path", type=str)
+    parser.add_argument("--node-id", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -130,7 +131,11 @@ def main():
             + "--capture-range=cudaProfilerApi --capture-range-end=stop "
             + header
         )
-    exec_target = f"{args.script} --model-path={args.model_path} "
+    exec_target = (
+        f"{args.script} "
+        + f"--model-path={args.model_path} "
+        + f"--node-id={args.node_id} "
+    )
     if args.prompt is not None:
         exec_target += f'--prompt="{args.prompt}" '
     else:
