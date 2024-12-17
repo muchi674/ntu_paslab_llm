@@ -122,8 +122,8 @@ def main():
             shared_exec_args += f"--hide-resp "
 
     for url, node_info in nodes.items():
-        ssh_port, node_rank, ngpus, script, model_path = itemgetter(
-            "ssh_port", "node_rank", "ngpus", "script", "model_path"
+        ssh_port, node_rank, ngpus, script, model_path, node_id = itemgetter(
+            "ssh_port", "node_rank", "ngpus", "script", "model_path", "node_id"
         )(node_info)
         print(f"node {url}")
         base_cmd = (
@@ -153,6 +153,7 @@ def main():
             + f"--master-port={master_port} "
             + f"--script={script} "
             + f"--model-path={model_path} "
+            + f"--node-id={node_id} "
             + shared_exec_args
             + ("--profile " if args.profile and url == master_addr else "")
             + "'"

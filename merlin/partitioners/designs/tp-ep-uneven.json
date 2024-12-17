@@ -1,12 +1,12 @@
 {
     "design": [
         {
-            "n_experts": 6,
-            "tp_size": 4
-        },
-        {
             "n_experts": 2,
             "tp_size": 2
+        },
+        {
+            "n_experts": 6,
+            "tp_size": 4
         }
     ]
 }
