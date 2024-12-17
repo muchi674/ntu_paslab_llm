@@ -17,14 +17,28 @@ class Partitioner:
     def __init__(self, model_path: str, design_path: str) -> None:
         self.model_path = Path(model_path)
         self.design_path = Path(design_path)
-        self.model_config, self.design = self.get_configs()
+        self.model_config, self.expert_map, self.world_size = self.get_configs()
 
     def get_configs(self) -> tuple[dict, dict]:
         with open(self.model_path / "config.json", "r") as model_config_file:
             model_config = json.load(model_config_file)
         with open(self.design_path, "r") as design_file:
             design = json.load(design_file)
-        return model_config, design
+
+        expert_map = {}
+        interm_dim = model_config["intermediate_size"]
+        next_expert, next_rank = 0, 0
+        for d in design["design"]:
+            n_experts, tp_size = d["n_experts"], d["tp_size"]
+            step = -(interm_dim // -tp_size)  # ceil division
+            m = (step, list(range(next_rank, next_rank + tp_size)))
+            for ei in range(next_expert, next_expert + n_experts):
+                expert_map[ei] = m
+            next_expert += n_experts
+            next_rank += tp_size
+
+        assert next_expert == model_config["num_local_experts"]
+        return model_config, expert_map, next_rank
 
     def load_weights(self) -> dict:
         weight_files = glob.glob(str(self.model_path / "consolidated.*.pt"))
@@ -34,11 +48,8 @@ class Partitioner:
         return weights
 
     def partition_expert_weights(self, ws: dict) -> None:
-        """current implementation only supports tensor parallelism"""
-        tp_size = self.design["design"][0]["tp_size"]
         interm_dim = self.model_config["intermediate_size"]
-        step = -(interm_dim // -tp_size)  # ceil division
-        partitions = [{} for _ in range(tp_size)]
+        partitions = [{} for _ in range(self.world_size)]
 
         for li in range(self.model_config["num_hidden_layers"]):
             w1: torch.Tensor = ws.pop(f"layers.{li}.block_sparse_moe.w1")
@@ -48,16 +59,13 @@ class Partitioner:
             for wi, w in enumerate([w1, w2, w3]):
 
                 for ei, expert_slice in enumerate(torch.split(w, interm_dim)):
+                    step, pis = self.expert_map[ei]
 
-                    # TODO: add things here
+                    for pi, tp_slice in zip(pis, torch.split(expert_slice, step)):
+                        partitions[pi][f"{li}.{ei}.w{wi + 1}"] = tp_slice.clone()
 
-                    for partition, tp_slice in zip(
-                        partitions, torch.split(expert_slice, step)
-                    ):
-                        partition[f"{li}.{ei}.w{wi + 1}"] = tp_slice.clone()
-
-        # for pi, partition in enumerate(partitions):
-        #     torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")
+        for pi, partition in enumerate(partitions):
+            torch.save(partition, self.model_path / f"experts-tp-{pi}.pt")
 
         logging.info("finished partitioning expert weights")
         return ws
@@ -73,7 +81,7 @@ class Partitioner:
 
     def start(self) -> None:
         ws = self.partition_expert_weights(self.load_weights())
-        # self.bundle_non_expert_weights(ws)
+        self.bundle_non_expert_weights(ws)
 
 
 if __name__ == "__main__":
