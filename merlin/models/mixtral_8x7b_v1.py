@@ -28,6 +28,7 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -232,7 +233,7 @@ class BufferCache:
         head_dim: int,
     ):
         self.max_seq_len = max_seq_len
-        self.n_kv_heads = n_kv_heads
+        self.n_kv_heads = n_kv_heads // LOCAL_WORLD_SIZE
         self.head_dim = head_dim
 
         self.cache_k = torch.empty(
@@ -325,13 +326,16 @@ class BufferCache:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, group):
         super().__init__()
         self.args = args
+        self.group = group
 
-        self.n_heads: int = args.n_heads
+        assert args.n_heads % LOCAL_WORLD_SIZE == 0
+        assert args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+        self.n_heads: int = args.n_heads // LOCAL_WORLD_SIZE
         self.head_dim: int = args.head_dim
-        self.n_kv_heads: int = args.n_kv_heads
+        self.n_kv_heads: int = args.n_kv_heads // LOCAL_WORLD_SIZE
 
         self.repeats = self.n_heads // self.n_kv_heads
 
@@ -383,7 +387,9 @@ class Attention(nn.Module):
 
         assert isinstance(output, torch.Tensor)
 
-        return self.wo(output)  # type: ignore
+        output = self.wo(output)
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
+        return output
 
 
 class Experts:
@@ -548,7 +554,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{node_id + LOCAL_RANK}.pt",
+            model_path / f"experts-{LOCAL_WORLD_SIZE}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
