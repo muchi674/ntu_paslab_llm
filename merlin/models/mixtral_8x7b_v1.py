@@ -457,9 +457,11 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
+    def __init__(
+        self, args: ModelArgs, li: int, experts: Experts, attn_group, moe_group
+    ):
         super().__init__()
-        self.attention = Attention(args)
+        self.attention = Attention(args=args, group=attn_group)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
@@ -467,7 +469,7 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
-            group=group,
+            group=moe_group,
         )
 
     def forward(
@@ -481,7 +483,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, group):
+    def __init__(self, args: ModelArgs, experts: Experts, attn_group, moe_group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -491,7 +493,11 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=group
+                    args=args,
+                    li=li,
+                    experts=experts,
+                    attn_group=attn_group,
+                    moe_group=moe_group,
                 )
                 for li in range(args.n_layers)
             }
@@ -545,23 +551,30 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device, group) -> "Transformer":
+    def load(
+        model_path: Path, node_id: int, gpu: torch.device, attn_group, moe_group
+    ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
-            model_path / "non-experts.pt",
+            model_path / f"non-experts-{LOCAL_WORLD_SIZE}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{LOCAL_WORLD_SIZE}-{LOCAL_RANK}.pt",
+            model_path / f"experts-{node_id + LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), group=group)
+            model = Transformer(
+                args=model_args,
+                experts=Experts(experts),
+                attn_group=attn_group,
+                moe_group=moe_group,
+            )
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -572,7 +585,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    group,
+    global_group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -612,7 +625,7 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
-    dist.barrier(group=group)
+    dist.barrier(group=global_group)
     prefill_time = time.time() - tic
     tic = time.time()
 
@@ -640,7 +653,7 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
-    dist.barrier(group=group)
+    dist.barrier(group=global_group)
     decode_time = time.time() - tic
 
     return (
@@ -675,6 +688,14 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
+def get_node_group(node_id, gpu, global_group):
+    global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
+    local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
+    dist.all_gather_into_tensor(global_map, local_map, group=global_group)
+    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
+    return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
+
+
 def main(
     model_path: str,
     node_id: int,
@@ -699,16 +720,25 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
+    global_group = dist.new_group(
+        list(range(WORLD_SIZE)), use_local_synchronization=True
+    )
+    node_group = get_node_group(node_id, gpu, global_group)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), node_id, gpu, group)
+    model = Transformer.load(
+        model_path=Path(model_path),
+        node_id=node_id,
+        gpu=gpu,
+        attn_group=node_group,
+        moe_group=global_group,
+    )
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        group,
+        global_group,
         max_tokens=16,
         max_batch_size=1,
         # temperature=0,
@@ -732,7 +762,7 @@ def main(
             prompt_batch,
             tokenizer,
             model,
-            group,
+            global_group,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
@@ -776,8 +806,8 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier(group=group)
-    dist.destroy_process_group(group=group)
+    dist.barrier(group=global_group)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
