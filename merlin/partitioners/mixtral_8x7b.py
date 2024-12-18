@@ -17,7 +17,9 @@ class Partitioner:
     def __init__(self, model_path: str, design_path: str) -> None:
         self.model_path = Path(model_path)
         self.design_path = Path(design_path)
-        self.model_config, self.expert_map, self.world_size = self.get_configs()
+        self.model_config, self.expert_map, self.world_size, self.attn_tp_sizes = (
+            self.get_configs()
+        )
 
     def get_configs(self) -> tuple[dict, dict]:
         with open(self.model_path / "config.json", "r") as model_config_file:
@@ -26,6 +28,7 @@ class Partitioner:
             design = json.load(design_file)
 
         expert_map = {}
+        attn_tp_sizes = []
         interm_dim = model_config["intermediate_size"]
         next_expert, next_rank = 0, 0
         for d in design["design"]:
@@ -34,11 +37,15 @@ class Partitioner:
             m = (step, list(range(next_rank, next_rank + tp_size)))
             for ei in range(next_expert, next_expert + n_experts):
                 expert_map[ei] = m
+
+            if design["split_attn_weights"]:
+                attn_tp_sizes.append(tp_size)
+
             next_expert += n_experts
             next_rank += tp_size
 
         assert next_expert == model_config["num_local_experts"]
-        return model_config, expert_map, next_rank
+        return model_config, expert_map, next_rank, attn_tp_sizes
 
     def load_weights(self) -> dict:
         weight_files = glob.glob(str(self.model_path / "consolidated.*.pt"))
@@ -70,18 +77,71 @@ class Partitioner:
         logging.info("finished partitioning expert weights")
         return ws
 
-    def bundle_non_expert_weights(self, ws: dict) -> None:
+    def partition_non_expert_weights(self, ws: dict) -> None:
         for li in range(self.model_config["num_hidden_layers"]):
             ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
                 f"layers.{li}.block_sparse_moe.gate.weight"
             )
-        torch.save(ws, self.model_path / f"non-experts.pt")
-        logging.info("finished bundling non-expert weights")
+
+        if len(self.attn_tp_sizes) > 0:
+            non_attn_ws = {
+                "tok_embeddings.weight": ws.pop("tok_embeddings.weight"),
+                "norm.weight": ws.pop("norm.weight"),
+                "output.weight": ws.pop("output.weight"),
+            }
+            for li in range(self.model_config["num_hidden_layers"]):
+                non_attn_ws[f"layers.{li}.attention_norm.weight"] = ws.pop(
+                    f"layers.{li}.attention_norm.weight"
+                )
+                non_attn_ws[f"layers.{li}.ffn_norm.weight"] = ws.pop(
+                    f"layers.{li}.ffn_norm.weight"
+                )
+                non_attn_ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
+                    f"layers.{li}.feed_forward.gate.weight"
+                )
+
+            n_attn_heads = self.model_config["num_attention_heads"]
+            n_kv_heads = self.model_config["num_key_value_heads"]
+            head_dim = self.model_config["hidden_size"] // n_attn_heads
+
+            for tp_size in self.attn_tp_sizes:
+                partitions = [{} for _ in range(tp_size)]
+                assert n_attn_heads % tp_size == 0
+                assert n_kv_heads % tp_size == 0
+                qo_step = n_attn_heads * head_dim // tp_size
+                kv_step = n_kv_heads * head_dim // tp_size
+                steps = [qo_step, kv_step, kv_step, qo_step]
+
+                for li in range(self.model_config["num_hidden_layers"]):
+                    wq: torch.Tensor = ws[f"layers.{li}.attention.wq.weight"]
+                    wk: torch.Tensor = ws[f"layers.{li}.attention.wk.weight"]
+                    wv: torch.Tensor = ws[f"layers.{li}.attention.wv.weight"]
+                    wo: torch.Tensor = ws[f"layers.{li}.attention.wo.weight"]
+
+                    for wi, step, w in zip(
+                        ["wq", "wk", "wv", "wo"], steps, [wq, wk, wv, wo]
+                    ):
+
+                        for partition, w_slice in zip(partitions, torch.split(w, step)):
+                            partition[f"layers.{li}.attention.{wi}.weight"] = (
+                                w_slice.clone()
+                            )
+
+                for pi, partition in enumerate(partitions):
+                    partition.update(non_attn_ws)
+                    torch.save(
+                        partition, self.model_path / f"non-experts-{tp_size}-{pi}.pt"
+                    )
+
+        else:
+            torch.save(ws, self.model_path / f"non-experts-1-0.pt")
+
+        logging.info("finished partitioning non-expert weights")
         return ws
 
     def start(self) -> None:
         ws = self.partition_expert_weights(self.load_weights())
-        self.bundle_non_expert_weights(ws)
+        self.partition_non_expert_weights(ws)
 
 
 if __name__ == "__main__":
