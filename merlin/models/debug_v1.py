@@ -422,6 +422,7 @@ class TransformerBlock(nn.Module):
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         out = x + r
         dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.moe_group)
+        dist.barrier(self.moe_group)
         return out
 
 
