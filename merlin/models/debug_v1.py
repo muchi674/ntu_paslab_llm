@@ -351,43 +351,43 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        seqlen_sum, _ = x.shape
+        # seqlen_sum, _ = x.shape
 
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
-        xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
-        xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        # xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        # xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
+        # xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        # xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if cache is None:
-            key, val = xk, xv
-        elif cache.prefill:
-            key, val = cache.interleave_kv(xk, xv)
-            cache.update(xk, xv)
-        else:
-            cache.update(xk, xv)
-            key, val = cache.key, cache.value
-            key = key.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
-            val = val.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
+        # if cache is None:
+        #     key, val = xk, xv
+        # elif cache.prefill:
+        #     key, val = cache.interleave_kv(xk, xv)
+        #     cache.update(xk, xv)
+        # else:
+        #     cache.update(xk, xv)
+        #     key, val = cache.key, cache.value
+        #     key = key.view(
+        #         seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
+        #     )
+        #     val = val.view(
+        #         seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
+        #     )
 
-        # Repeat keys and values to match number of query heads
-        key, val = repeat_kv(key, val, self.repeats, dim=1)
+        # # Repeat keys and values to match number of query heads
+        # key, val = repeat_kv(key, val, self.repeats, dim=1)
 
-        # xformers requires (B=1, S, H, D)
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(
-            xq, key, val, None if cache is None else cache.mask
-        )
-        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
+        # # xformers requires (B=1, S, H, D)
+        # xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
+        # output = memory_efficient_attention(
+        #     xq, key, val, None if cache is None else cache.mask
+        # )
+        # output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        assert isinstance(output, torch.Tensor)
+        # assert isinstance(output, torch.Tensor)
 
-        output = self.wo(output)
-        print(output.shape)
+        # output = self.wo(output)
+        output = x
         dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
         return output
 
