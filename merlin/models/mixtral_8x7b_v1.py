@@ -341,10 +341,10 @@ class Attention(nn.Module):
 
         self.scale = self.args.head_dim**-0.5
 
-        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(args.dim, self.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
     def forward(
         self,
