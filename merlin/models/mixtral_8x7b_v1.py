@@ -237,10 +237,10 @@ class BufferCache:
         self.head_dim = head_dim
 
         self.cache_k = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
         )
         self.cache_v = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
         )
         # holds the valid length for each batch element in the cache
         self.kv_seqlens: Optional[torch.Tensor] = None
