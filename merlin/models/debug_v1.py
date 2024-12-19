@@ -504,6 +504,10 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        for k in non_experts:
+            if "feed_forward" in k:
+                del non_experts[k]
+
         with torch.device("meta"):
             model = Transformer(
                 args=model_args,
