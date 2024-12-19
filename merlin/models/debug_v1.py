@@ -14,7 +14,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 
 from xformers.ops.fmha import memory_efficient_attention  # type: ignore
@@ -388,58 +387,9 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
+        print(output.shape)
         dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
         return output
-
-
-class Experts:
-
-    def __init__(self, ws: dict):
-        self.ws: dict[str, torch.Tensor] = ws
-
-    def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
-
-
-class MoeLayer(nn.Module):
-    def __init__(
-        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
-    ):
-        super().__init__()
-        self.num_experts: int = args.moe["num_experts"]
-        self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
-        self.li = li
-        self.gate = gate
-        self.experts = experts
-        self.group = group
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
-
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
-
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
-                continue
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results
 
 
 class RMSNorm(torch.nn.Module):
@@ -458,32 +408,25 @@ class RMSNorm(torch.nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(
-        self, args: ModelArgs, li: int, experts: Experts, attn_group, moe_group
+        self, args: ModelArgs, li: int, attn_group, moe_group
     ):
         super().__init__()
         self.attention = Attention(args=args, group=attn_group)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.feed_forward = MoeLayer(
-            args=args,
-            li=li,
-            gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
-            experts=experts,
-            group=moe_group,
-        )
+        self.moe_group = moe_group
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
-        h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
-        out = h + r
+        out = x + r
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.moe_group)
         return out
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, attn_group, moe_group):
+    def __init__(self, args: ModelArgs, attn_group, moe_group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -495,7 +438,6 @@ class Transformer(nn.Module):
                 str(li): TransformerBlock(
                     args=args,
                     li=li,
-                    experts=experts,
                     attn_group=attn_group,
                     moe_group=moe_group,
                 )
@@ -561,17 +503,10 @@ class Transformer(nn.Module):
             weights_only=True,
             mmap=True,
         )
-        experts = torch.load(
-            model_path / f"experts-{node_id + LOCAL_RANK}.pt",
-            map_location=gpu,
-            weights_only=True,
-            mmap=True,
-        )
 
         with torch.device("meta"):
             model = Transformer(
                 args=model_args,
-                experts=Experts(experts),
                 attn_group=attn_group,
                 moe_group=moe_group,
             )
