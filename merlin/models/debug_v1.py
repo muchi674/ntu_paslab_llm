@@ -504,7 +504,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        for k in non_experts:
+        for k in list(non_experts.keys()):
             if "feed_forward" in k:
                 del non_experts[k]
 
