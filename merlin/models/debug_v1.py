@@ -388,7 +388,7 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
+        # dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
         return output
 
 
