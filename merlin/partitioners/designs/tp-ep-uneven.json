@@ -1,5 +1,5 @@
 {
-    "split_attn_weights": true,
+    "split_attn_weights": false,
     "design": [
         {
             "n_experts": 2,
