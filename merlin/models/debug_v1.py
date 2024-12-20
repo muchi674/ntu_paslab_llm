@@ -387,8 +387,7 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
-        dist.barrier(self.group)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
+        # dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
         return output
 
 
@@ -422,7 +421,6 @@ class TransformerBlock(nn.Module):
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         out = x + r
         dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.moe_group)
-        dist.barrier(self.moe_group)
         return out
 
 
