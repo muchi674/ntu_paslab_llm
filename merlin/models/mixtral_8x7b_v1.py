@@ -418,20 +418,21 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+            mask = selected_experts == ei
 
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            if torch.sum(mask) == 0:
+                continue
+
+            flat_mask = torch.any(mask, dim=1)
+            scores = torch.sum(weights * mask, dim=1, keepdim=True)[flat_mask]
+            ey = self.experts.forward(self.li, ei, inputs[flat_mask])
+
             if ey is None:
                 continue
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+
+            results[flat_mask] += scores * ey
+
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
