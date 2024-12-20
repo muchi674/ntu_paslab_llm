@@ -420,10 +420,6 @@ class MoeLayer(nn.Module):
 
         for ei in range(self.num_experts):
             mask = selected_experts == ei
-
-            if torch.sum(mask) == 0:
-                continue
-
             flat_mask = torch.any(mask, dim=1)
             scores = torch.sum(weights * mask, dim=1, keepdim=True)[flat_mask]
             ey = self.experts.forward(self.li, ei, inputs[flat_mask])
