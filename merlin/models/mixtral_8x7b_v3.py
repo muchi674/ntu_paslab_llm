@@ -671,6 +671,38 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
+def ceildiv(a, b):
+    # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
+    return -(a // -b)
+
+
+def get_prompts(
+    prompt: str,
+    prompt_path: str,
+    n_prompts: int = 1,
+    batch_size: int = 1,
+):
+    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    assert n_prompts % batch_size == 0
+    prompts: list[str] = None
+    if prompt:
+        prompts = [prompt]
+    else:
+        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
+        n_repeats = ceildiv(n_prompts, len(dataset))
+        prompts = (dataset * n_repeats)[:n_prompts]
+
+    return prompts
+
+
+def partition_prompt_batch(prompt_batch, batch_size):
+    partition = []
+    for start in range(0, batch_size, WORLD_SIZE):
+        partition.append(prompt_batch[(start + WORLD_RANK) % batch_size])
+
+    return partition
+
+
 def main(
     model_path: str,
     node_id: int,
@@ -681,15 +713,7 @@ def main(
     max_tokens: int = 128,
     hide_resp: bool = False,
 ):
-    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    assert n_prompts % batch_size == 0
-    prompts: list[str] = None
-    if prompt:
-        prompts = [prompt]
-    else:
-        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
-        n_repeats = -(n_prompts // -len(dataset))  # ceil division
-        prompts = (dataset * n_repeats)[:n_prompts]
+    prompts = get_prompts(prompt, prompt_path, n_prompts, batch_size)
 
     gpu = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
@@ -714,9 +738,11 @@ def main(
     torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
     decode_tps = []
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
-        prompt_batch = prompts[start:end]
+    global_start = 0
+    for global_end in range(batch_size, n_prompts + 1, batch_size):
+        prompt_batch = prompts[global_start:global_end]
+        prompt_batch_partition = partition_prompt_batch(prompt_batch, batch_size)
+
         (
             seqlens,
             responses,
@@ -725,16 +751,17 @@ def main(
             n_gen_tkns,
             decode_time,
         ) = generate(
-            prompt_batch,
+            prompt_batch_partition,
             tokenizer,
             model,
             group,
             max_tokens=max_tokens,
-            max_batch_size=len(prompt_batch),
+            max_batch_size=len(prompt_batch_partition),
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
+        # TODO: adjust to address replicas
         if WORLD_RANK == 0:
             prefill_tp = n_p_tkns / prefill_time
             decode_tp = n_gen_tkns / decode_time
@@ -763,7 +790,7 @@ def main(
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
 
-        start = end
+        global_start = global_end
 
     if WORLD_RANK == 0:
         print("=" * 20)
