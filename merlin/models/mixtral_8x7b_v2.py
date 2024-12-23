@@ -1,5 +1,7 @@
 #!/home/joe/miniconda3/envs/mixtral/bin/python
 
+# [POC]: tensor parallel attention
+# [known issues]: process hangs with large batch size, synchronization latency is high
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect

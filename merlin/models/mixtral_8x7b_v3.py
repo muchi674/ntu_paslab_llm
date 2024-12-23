@@ -1,7 +1,6 @@
 #!/home/joe/miniconda3/envs/mixtral/bin/python
 
-# [POC]: tensor + expert parallel MoE
-# [known issues]: OOM with large batch sizes (64, 128)
+# [POC]: expert + tensor + data parallelism
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
