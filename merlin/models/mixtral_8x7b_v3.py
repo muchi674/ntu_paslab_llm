@@ -414,6 +414,7 @@ class MoeLayer(nn.Module):
         self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # TODO: this is not the case during prefill
         """note that all partitions of the global batch (i.e. inputs) should have the same shape"""
         loc_B, model_dim = inputs.shape
         in_dtype, in_device = inputs.dtype, inputs.device
@@ -580,7 +581,6 @@ def generate(
     group,
     *,
     max_tokens: int,
-    max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
@@ -597,12 +597,21 @@ def generate(
     loc_B, V = len(encoded_prompts), model.args.vocab_size
     glob_B = WORLD_SIZE * loc_B
     seqlens = [len(x) for x in encoded_prompts]
+    n_p_tkns = cleared_n_p_tkns = sum(seqlens)
+
+    if WORLD_RANK >= WORLD_SIZE - (glob_B - real_B):
+        cleared_n_p_tkns -= seqlens[-1]
+
+    glob_inputs = torch.zeros(
+        (WORLD_SIZE * loc_B, model_dim), dtype=in_dtype, device=in_device
+    )
+    dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
 
     # Cache
     cache_window = max(seqlens) + max_tokens
     cache = BufferCache(
         model.args.n_layers,
-        max_batch_size,
+        loc_B,
         cache_window,
         model.args.n_kv_heads,
         model.args.head_dim,
@@ -641,7 +650,6 @@ def generate(
         assert last_token_prelogits.shape == (loc_B, V)
 
     generated_tokens: List[List[int]] = []
-    n_p_tkns = sum(seqlens)
     n_gen_tkns = 0
 
     # clear redundancy, matches the design of partition_prompt_batch()
@@ -771,7 +779,6 @@ def main(
         model,
         group,
         max_tokens=16,
-        max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
@@ -797,7 +804,6 @@ def main(
             model,
             group,
             max_tokens=max_tokens,
-            max_batch_size=len(prompt_batch_partition),
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
