@@ -443,7 +443,7 @@ class MoeLayer(nn.Module):
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results[loc_B * WORLD_RANK : (loc_B + 1) * WORLD_RANK].detach().clone()
+        return results[loc_B * WORLD_RANK : loc_B * (WORLD_RANK + 1)].detach().clone()
 
 
 class RMSNorm(torch.nn.Module):
