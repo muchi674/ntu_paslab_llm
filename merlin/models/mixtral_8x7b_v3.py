@@ -640,7 +640,7 @@ def generate(
         last_token_prelogits = model.forward(next_token, [1] * loc_B, cache)
         assert last_token_prelogits.shape == (loc_B, V)
 
-    generated_tokens: List[List[int]]
+    generated_tokens: List[List[int]] = []
     n_p_tkns = sum(seqlens)
     n_gen_tkns = 0
 
@@ -661,21 +661,19 @@ def generate(
         if WORLD_RANK == 0:
             glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
             dist.gather(loc_res, glob_res, dst=0, group=group)
+
+            # clear redundancy
+            cleared_res = []
+            for pi in range(WORLD_SIZE):
+                if pi < WORLD_SIZE - (glob_B - real_B):
+                    cleared_res.append(glob_res[pi])
+                else:
+                    cleared_res.append(glob_res[pi][:-1])
+
+            generated_tokens = torch.cat(cleared_res).tolist()
+            n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
         else:
             dist.gather(loc_res, dst=0, group=group)
-
-        # clear redundancy
-        cleared_res = []
-        for pi in range(WORLD_SIZE):
-            if pi < WORLD_SIZE - (glob_B - real_B):
-                cleared_res.append(glob_res[pi])
-            else:
-                cleared_res.append(glob_res[pi][:-1])
-
-        generated_tokens = torch.cat(cleared_res).tolist()
-        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-    else:
-        generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
     dist.barrier(group=group)
