@@ -641,22 +641,33 @@ def generate(
         assert last_token_prelogits.shape == (loc_B, V)
 
     generated_tokens: List[List[int]]
+    n_p_tkns = sum(seqlens)
     n_gen_tkns = 0
+
+    # clear redundancy, matches the design of partition_prompt_batch()
+    if WORLD_RANK >= WORLD_SIZE - (glob_B - real_B):
+        n_p_tkns -= seqlens[-1]
+    n_p_tkns = torch.tensor(n_p_tkns, device=device)
+    dist.reduce(
+        n_p_tkns,
+        dst=0,
+        op=dist.ReduceOp.SUM,
+        group=group,
+    )
+    n_p_tkns = n_p_tkns.item()
+
     if generated_tensors:
         loc_res = torch.cat(generated_tensors, 1)
         glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
         dist.gather(loc_res, glob_res, dst=0, group=group)
 
-        # clear redundancy, matches the design of partition_prompt_batch()
+        # clear redundancy
         cleared_res = []
-        n_p_tkns = sum(seqlens)
         for pi in range(WORLD_SIZE):
             if pi < WORLD_SIZE - (glob_B - real_B):
                 cleared_res.append(glob_res[pi])
             else:
                 cleared_res.append(glob_res[pi][:-1])
-                if pi == WORLD_RANK:
-                    n_p_tkns -= seqlens[-1]
 
         generated_tokens = torch.cat(cleared_res).tolist()
         n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
@@ -668,9 +679,8 @@ def generate(
     decode_time = time.time() - tic
 
     return (
-        seqlens,
         responses,
-        sum(seqlens),
+        n_p_tkns,
         prefill_time,
         n_gen_tkns,
         decode_time,
@@ -755,6 +765,7 @@ def main(
     # warmup
     generate(
         ["hello, how are you?"],
+        1,
         tokenizer,
         model,
         group,
@@ -773,7 +784,6 @@ def main(
         prompt_batch_partition = partition_prompt_batch(prompt_batch, batch_size)
 
         (
-            seqlens,
             responses,
             n_p_tkns,
             prefill_time,
@@ -781,6 +791,7 @@ def main(
             decode_time,
         ) = generate(
             prompt_batch_partition,
+            batch_size,
             tokenizer,
             model,
             group,
@@ -790,7 +801,6 @@ def main(
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
-        # TODO: adjust to address replicas
         if WORLD_RANK == 0:
             prefill_tp = n_p_tkns / prefill_time
             decode_tp = n_gen_tkns / decode_time
@@ -813,8 +823,6 @@ def main(
             if not hide_resp:
                 print("=" * 20)
                 print("INS-N-OUTS")
-                print(f"AVG seqlen: {mean(seqlens)}")
-                print(f"seqlens: {seqlens}\n")
                 for p, resp in zip(prompt_batch, responses):
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
