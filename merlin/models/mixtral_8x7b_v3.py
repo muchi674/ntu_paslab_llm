@@ -414,10 +414,18 @@ class MoeLayer(nn.Module):
         self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(inputs)
+        """note that all partitions of the global batch (i.e. inputs) should have the same shape"""
+        loc_B, model_dim = inputs.shape
+        in_dtype, in_device = inputs.dtype, inputs.device
+        glob_inputs = torch.zeros(
+            (WORLD_SIZE * loc_B, model_dim), dtype=in_dtype, device=in_device
+        )
+        dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
+
+        gate_logits = self.gate(glob_inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(in_dtype)
+        results = torch.zeros_like(glob_inputs)
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
@@ -425,17 +433,17 @@ class MoeLayer(nn.Module):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+                bis.append(batch_idx.to(device=in_device))
+                nes.append(nth_expert.to(device=in_device))
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            ey = self.experts.forward(self.li, ei, glob_inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results
+        return results[loc_B * WORLD_RANK : (loc_B + 1) * WORLD_RANK].detach().clone()
 
 
 class RMSNorm(torch.nn.Module):
@@ -566,6 +574,7 @@ class Transformer(nn.Module):
 @torch.inference_mode()
 def generate(
     prompts: List[str],
+    real_B: int,
     tokenizer: MistralTokenizer,
     model: Transformer,
     group,
@@ -576,6 +585,7 @@ def generate(
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
+    device = model.device
     tic = time.time()
 
     encoded_prompts: List[List[int]] = [
@@ -584,7 +594,8 @@ def generate(
         ).tokens
         for p in prompts
     ]
-    B, V = len(encoded_prompts), model.args.vocab_size
+    loc_B, V = len(encoded_prompts), model.args.vocab_size
+    glob_B = WORLD_SIZE * loc_B
     seqlens = [len(x) for x in encoded_prompts]
 
     # Cache
@@ -596,16 +607,16 @@ def generate(
         model.args.n_kv_heads,
         model.args.head_dim,
     )
-    cache.to(device=model.device, dtype=model.dtype)
+    cache.to(device=device, dtype=model.dtype)
     cache.reset()
 
     # prefill / prompt evaluation stage
     prelogits = model.forward(
-        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
-        seqlens=seqlens,
-        cache=cache,
+        torch.tensor(sum(encoded_prompts, []), device=device, dtype=torch.long),
+        seqlens,
+        cache,
     )
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+    last_positions = torch.tensor(seqlens, device=device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
     dist.barrier(group=group)
@@ -614,23 +625,40 @@ def generate(
 
     # decode
     generated_tensors = []
-    is_finished = torch.tensor([False for _ in range(B)])
+    loc_is_finished = torch.tensor([False for _ in range(loc_B)], device=device)
+    glob_is_finished = torch.tensor([False for _ in range(glob_B)], device=device)
 
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        is_finished = is_finished | (next_token == eos_id).cpu()
+        loc_is_finished = loc_is_finished | (next_token == eos_id)
+        dist.all_gather_into_tensor(glob_is_finished, loc_is_finished, group=group)
 
-        if is_finished.all():
+        if glob_is_finished.all():
             break
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        assert last_token_prelogits.shape == (B, V)
+        last_token_prelogits = model.forward(next_token, [1] * loc_B, cache)
+        assert last_token_prelogits.shape == (loc_B, V)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
     if generated_tensors:
-        generated_tokens = torch.cat(generated_tensors, 1).tolist()
+        loc_res = torch.cat(generated_tensors, 1)
+        glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
+        dist.gather(loc_res, glob_res, dst=0, group=group)
+
+        # clear redundancy, matches the design of partition_prompt_batch()
+        cleared_res = []
+        n_p_tkns = sum(seqlens)
+        for pi in range(WORLD_SIZE):
+            if pi < WORLD_SIZE - (glob_B - real_B):
+                cleared_res.append(glob_res[pi])
+            else:
+                cleared_res.append(glob_res[pi][:-1])
+                if pi == WORLD_RANK:
+                    n_p_tkns -= seqlens[-1]
+
+        generated_tokens = torch.cat(cleared_res).tolist()
         n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
     else:
         generated_tokens = []
@@ -696,6 +724,7 @@ def get_prompts(
 
 
 def partition_prompt_batch(prompt_batch, batch_size):
+    """creates even-sized partitions from batch, redundancy is possible"""
     partition = []
     for start in range(0, batch_size, WORLD_SIZE):
         partition.append(prompt_batch[(start + WORLD_RANK) % batch_size])
@@ -815,6 +844,7 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(0)
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
