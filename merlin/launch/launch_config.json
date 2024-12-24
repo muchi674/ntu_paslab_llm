@@ -13,7 +13,7 @@
             "ssh_port": 9051,
             "node_rank": 0,
             "ngpus": 2,
-            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v1.py",
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v3.py",
             "model_path": "/home/muchichen/Mixtral-8x7B-Instruct-v0.1",
             "node_id": 0
         },
@@ -21,7 +21,7 @@
             "ssh_port": 9046,
             "node_rank": 1,
             "ngpus": 4,
-            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v1.py",
+            "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v3.py",
             "model_path": "/mnt/disk2/muchichen/Mixtral-8x7B-Instruct-v0.1",
             "node_id": 2
         }
