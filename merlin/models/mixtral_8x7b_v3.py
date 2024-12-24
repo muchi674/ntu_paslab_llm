@@ -658,8 +658,11 @@ def generate(
 
     if generated_tensors:
         loc_res = torch.cat(generated_tensors, 1)
-        glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
-        dist.gather(loc_res, glob_res, dst=0, group=group)
+        if WORLD_RANK == 0:
+            glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
+            dist.gather(loc_res, glob_res, dst=0, group=group)
+        else:
+            dist.gather(loc_res, dst=0, group=group)
 
         # clear redundancy
         cleared_res = []
