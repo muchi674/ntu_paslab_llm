@@ -703,7 +703,7 @@ def generate(
 
     return (
         responses,
-        torch.sum(glob_p_info[:, 1]),
+        torch.sum(glob_p_info[:, 1]).item(),
         prefill_time,
         n_gen_tkns,
         decode_time,
