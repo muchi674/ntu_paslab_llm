@@ -413,19 +413,31 @@ class MoeLayer(nn.Module):
         self.experts = experts
         self.group = group
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # TODO: this is not the case during prefill
-        """note that all partitions of the global batch (i.e. inputs) should have the same shape"""
+    def forward(
+        self, inputs: torch.Tensor, glob_Bs: Optional[list[int]]
+    ) -> torch.Tensor:
+        """
+        note that all partitions of the global batch (i.e. inputs) should have the
+        same shape during decode but not prefill stage. Prompts have different lengths
+        whereas tokens are generated one at a time for every request.
+        """
         loc_B, model_dim = inputs.shape
-        in_dtype, in_device = inputs.dtype, inputs.device
-        glob_inputs = torch.zeros(
-            (WORLD_SIZE * loc_B, model_dim), dtype=in_dtype, device=in_device
-        )
-        dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
+        dtype, device = inputs.dtype, inputs.device
+        if glob_Bs:
+            glob_inputs = [
+                torch.zeros((b, model_dim), dtype=dtype, device=device) for b in glob_Bs
+            ]
+            dist.all_gather(glob_inputs, inputs, group=self.group)
+            glob_inputs = torch.cat(glob_inputs, dim=0)
+        else:
+            glob_inputs = torch.zeros(
+                (WORLD_SIZE * loc_B, model_dim), dtype=dtype, device=device
+            )
+            dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
 
         gate_logits = self.gate(glob_inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(in_dtype)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(dtype)
         results = torch.zeros_like(glob_inputs)
 
         selected_experts = selected_experts.to("cpu")
@@ -434,8 +446,8 @@ class MoeLayer(nn.Module):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
-                bis.append(batch_idx.to(device=in_device))
-                nes.append(nth_expert.to(device=in_device))
+                bis.append(batch_idx.to(device=device))
+                nes.append(nth_expert.to(device=device))
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, glob_inputs[batch_idx])
@@ -444,7 +456,13 @@ class MoeLayer(nn.Module):
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results[loc_B * WORLD_RANK : loc_B * (WORLD_RANK + 1)].detach().clone()
+
+        if glob_Bs:
+            l = sum(glob_Bs[:WORLD_RANK])
+            results = results[l : l + glob_Bs[WORLD_RANK]]
+        else:
+            results = results[loc_B * WORLD_RANK : loc_B * (WORLD_RANK + 1)]
+        return results.detach().clone()
 
 
 class RMSNorm(torch.nn.Module):
@@ -476,11 +494,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[CacheView],
+        glob_Bs: Optional[list[int]],
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward.forward(self.ffn_norm(h), glob_Bs)
         out = h + r
         return out
 
@@ -531,8 +553,9 @@ class Transformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        seqlens: List[int],
+        seqlens: list[int],
         cache: BufferCache,
+        glob_Bs: list[int] = None,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -543,7 +566,7 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, glob_Bs)
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -599,13 +622,15 @@ def generate(
     seqlens = [len(x) for x in encoded_prompts]
     n_p_tkns = cleared_n_p_tkns = sum(seqlens)
 
+    # clear redundancy, matches the design of partition_prompt_batch()
     if WORLD_RANK >= WORLD_SIZE - (glob_B - real_B):
         cleared_n_p_tkns -= seqlens[-1]
 
-    glob_inputs = torch.zeros(
-        (WORLD_SIZE * loc_B, model_dim), dtype=in_dtype, device=in_device
+    loc_p_info = torch.tensor(
+        [n_p_tkns, cleared_n_p_tkns], dtype=torch.int64, device=device
     )
-    dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
+    glob_p_info = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(glob_p_info, loc_p_info, group=group)
 
     # Cache
     cache_window = max(seqlens) + max_tokens
@@ -624,6 +649,7 @@ def generate(
         torch.tensor(sum(encoded_prompts, []), device=device, dtype=torch.long),
         seqlens,
         cache,
+        glob_Bs=glob_p_info[:, 0].tolist(),
     )
     last_positions = torch.tensor(seqlens, device=device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
@@ -652,20 +678,8 @@ def generate(
     generated_tokens: List[List[int]] = []
     n_gen_tkns = 0
 
-    # clear redundancy, matches the design of partition_prompt_batch()
-    if WORLD_RANK >= WORLD_SIZE - (glob_B - real_B):
-        n_p_tkns -= seqlens[-1]
-    n_p_tkns = torch.tensor(n_p_tkns, device=device)
-    dist.reduce(
-        n_p_tkns,
-        dst=0,
-        op=dist.ReduceOp.SUM,
-        group=group,
-    )
-    n_p_tkns = n_p_tkns.item()
-
     if generated_tensors:
-        loc_res = torch.cat(generated_tensors, 1)
+        loc_res = torch.cat(generated_tensors, dim=1)
         if WORLD_RANK == 0:
             glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
             dist.gather(loc_res, glob_res, dst=0, group=group)
@@ -678,7 +692,7 @@ def generate(
                 else:
                     cleared_res.append(glob_res[pi][:-1])
 
-            generated_tokens = torch.cat(cleared_res).tolist()
+            generated_tokens = torch.cat(cleared_res, dim=0).tolist()
             n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
         else:
             dist.gather(loc_res, dst=0, group=group)
@@ -689,7 +703,7 @@ def generate(
 
     return (
         responses,
-        n_p_tkns,
+        torch.sum(glob_p_info[:, 1]),
         prefill_time,
         n_gen_tkns,
         decode_time,
