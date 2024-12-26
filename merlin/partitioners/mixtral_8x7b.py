@@ -14,9 +14,10 @@ import torch
 
 class Partitioner:
 
-    def __init__(self, model_path: str, design_path: str) -> None:
+    def __init__(self, model_path: str, design_path: str, output_path: str) -> None:
         self.model_path = Path(model_path)
         self.design_path = Path(design_path)
+        self.output_path = Path(output_path) if output_path else self.model_path
         self.model_config, self.expert_map, self.world_size, self.attn_tp_sizes = (
             self.get_configs()
         )
@@ -72,7 +73,7 @@ class Partitioner:
                         partitions[pi][f"{li}.{ei}.w{wi + 1}"] = tp_slice.clone()
 
         for pi, partition in enumerate(partitions):
-            torch.save(partition, self.model_path / f"experts-{pi}.pt")
+            torch.save(partition, self.output_path / f"experts-{pi}.pt")
 
         logging.info("finished partitioning expert weights")
         return ws
@@ -132,11 +133,11 @@ class Partitioner:
                 for pi, partition in enumerate(partitions):
                     partition.update(non_attn_ws)
                     torch.save(
-                        partition, self.model_path / f"non-experts-{tp_size}-{pi}.pt"
+                        partition, self.output_path / f"non-experts-{tp_size}-{pi}.pt"
                     )
 
         else:
-            torch.save(ws, self.model_path / f"non-experts-1-0.pt")
+            torch.save(ws, self.output_path / f"non-experts-1-0.pt")
 
         logging.info("finished partitioning non-expert weights")
         return ws
@@ -150,8 +151,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--design-path", type=str)
+    parser.add_argument("--output-path", type=str)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    weights_partitioner = Partitioner(args.model_path, args.design_path)
+    weights_partitioner = Partitioner(
+        args.model_path, args.design_path, args.output_path
+    )
     weights_partitioner.start()

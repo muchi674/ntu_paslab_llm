@@ -1,7 +1,6 @@
 #!/home/joe/miniconda3/envs/mixtral/bin/python
 
-# [POC]: tensor + expert parallel MoE
-# [known issues]: OOM with large batch sizes (64, 128)
+# [POC]: expert + tensor + data parallelism
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -414,11 +413,32 @@ class MoeLayer(nn.Module):
         self.experts = experts
         self.group = group
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(inputs)
+    def forward(
+        self, inputs: torch.Tensor, glob_Bs: Optional[list[int]]
+    ) -> torch.Tensor:
+        """
+        note that all partitions of the global batch (i.e. inputs) should have the
+        same shape during decode but not prefill stage. Prompts have different lengths
+        whereas tokens are generated one at a time for every request.
+        """
+        loc_B, model_dim = inputs.shape
+        dtype, device = inputs.dtype, inputs.device
+        if glob_Bs:
+            glob_inputs = [
+                torch.zeros((b, model_dim), dtype=dtype, device=device) for b in glob_Bs
+            ]
+            dist.all_gather(glob_inputs, inputs, group=self.group)
+            glob_inputs = torch.cat(glob_inputs, dim=0)
+        else:
+            glob_inputs = torch.zeros(
+                (WORLD_SIZE * loc_B, model_dim), dtype=dtype, device=device
+            )
+            dist.all_gather_into_tensor(glob_inputs, inputs, group=self.group)
+
+        gate_logits = self.gate(glob_inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(dtype)
+        results = torch.zeros_like(glob_inputs)
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
@@ -426,17 +446,23 @@ class MoeLayer(nn.Module):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+                bis.append(batch_idx.to(device=device))
+                nes.append(nth_expert.to(device=device))
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            ey = self.experts.forward(self.li, ei, glob_inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results
+
+        if glob_Bs:
+            l = sum(glob_Bs[:WORLD_RANK])
+            results = results[l : l + glob_Bs[WORLD_RANK]]
+        else:
+            results = results[loc_B * WORLD_RANK : loc_B * (WORLD_RANK + 1)]
+        return results.detach().clone()
 
 
 class RMSNorm(torch.nn.Module):
@@ -468,11 +494,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[CacheView],
+        glob_Bs: Optional[list[int]],
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward.forward(self.ffn_norm(h), glob_Bs)
         out = h + r
         return out
 
@@ -523,8 +553,9 @@ class Transformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        seqlens: List[int],
+        seqlens: list[int],
         cache: BufferCache,
+        glob_Bs: list[int] = None,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -535,7 +566,7 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, glob_Bs)
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -567,16 +598,17 @@ class Transformer(nn.Module):
 @torch.inference_mode()
 def generate(
     prompts: List[str],
+    real_B: int,
     tokenizer: MistralTokenizer,
     model: Transformer,
     group,
     *,
     max_tokens: int,
-    max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
+    device = model.device
     tic = time.time()
 
     encoded_prompts: List[List[int]] = [
@@ -585,28 +617,41 @@ def generate(
         ).tokens
         for p in prompts
     ]
-    B, V = len(encoded_prompts), model.args.vocab_size
+    loc_B, V = len(encoded_prompts), model.args.vocab_size
+    glob_B = WORLD_SIZE * loc_B
     seqlens = [len(x) for x in encoded_prompts]
+    n_p_tkns = cleared_n_p_tkns = sum(seqlens)
+
+    # clear redundancy, matches the design of partition_prompt_batch()
+    if WORLD_RANK >= WORLD_SIZE - (glob_B - real_B):
+        cleared_n_p_tkns -= seqlens[-1]
+
+    loc_p_info = torch.tensor(
+        [n_p_tkns, cleared_n_p_tkns], dtype=torch.int64, device=device
+    )
+    glob_p_info = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(glob_p_info, loc_p_info, group=group)
 
     # Cache
     cache_window = max(seqlens) + max_tokens
     cache = BufferCache(
         model.args.n_layers,
-        max_batch_size,
+        loc_B,
         cache_window,
         model.args.n_kv_heads,
         model.args.head_dim,
     )
-    cache.to(device=model.device, dtype=model.dtype)
+    cache.to(device=device, dtype=model.dtype)
     cache.reset()
 
     # prefill / prompt evaluation stage
     prelogits = model.forward(
-        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
-        seqlens=seqlens,
-        cache=cache,
+        torch.tensor(sum(encoded_prompts, []), device=device, dtype=torch.long),
+        seqlens,
+        cache,
+        glob_Bs=glob_p_info[:, 0].tolist(),
     )
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+    last_positions = torch.tensor(seqlens, device=device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
     dist.barrier(group=group)
@@ -615,35 +660,49 @@ def generate(
 
     # decode
     generated_tensors = []
-    is_finished = torch.tensor([False for _ in range(B)])
+    loc_is_finished = torch.tensor([False for _ in range(loc_B)], device=device)
+    glob_is_finished = torch.tensor([False for _ in range(glob_B)], device=device)
 
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        is_finished = is_finished | (next_token == eos_id).cpu()
+        loc_is_finished = loc_is_finished | (next_token == eos_id)
+        dist.all_gather_into_tensor(glob_is_finished, loc_is_finished, group=group)
 
-        if is_finished.all():
+        if glob_is_finished.all():
             break
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        assert last_token_prelogits.shape == (B, V)
+        last_token_prelogits = model.forward(next_token, [1] * loc_B, cache)
+        assert last_token_prelogits.shape == (loc_B, V)
 
-    generated_tokens: List[List[int]]
+    generated_tokens: List[List[int]] = []
     n_gen_tkns = 0
+
     if generated_tensors:
-        generated_tokens = torch.cat(generated_tensors, 1).tolist()
-        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-    else:
-        generated_tokens = []
+        loc_res = torch.cat(generated_tensors, dim=1)
+        if WORLD_RANK == 0:
+            glob_res = [torch.zeros_like(loc_res) for _ in range(WORLD_SIZE)]
+            dist.gather(loc_res, glob_res, dst=0, group=group)
+
+            # clear redundancy
+            cleared_res = []
+            for pi in range(real_B):
+                glob_i = pi % WORLD_SIZE
+                loc_i = pi // WORLD_SIZE
+                cleared_res.append(glob_res[glob_i][loc_i])
+
+            generated_tokens = torch.stack(cleared_res, dim=0).tolist()
+            n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
+        else:
+            dist.gather(loc_res, dst=0, group=group)
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
     dist.barrier(group=group)
     decode_time = time.time() - tic
 
     return (
-        seqlens,
         responses,
-        sum(seqlens),
+        torch.sum(glob_p_info[:, 1]).item(),
         prefill_time,
         n_gen_tkns,
         decode_time,
@@ -672,6 +731,39 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
+def ceildiv(a, b):
+    # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
+    return -(a // -b)
+
+
+def get_prompts(
+    prompt: str,
+    prompt_path: str,
+    n_prompts: int = 1,
+    batch_size: int = 1,
+):
+    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    assert n_prompts % batch_size == 0
+    prompts: list[str] = None
+    if prompt:
+        prompts = [prompt]
+    else:
+        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
+        n_repeats = ceildiv(n_prompts, len(dataset))
+        prompts = (dataset * n_repeats)[:n_prompts]
+
+    return prompts
+
+
+def partition_prompt_batch(prompt_batch, batch_size):
+    """creates even-sized partitions from batch, redundancy is possible"""
+    partition = []
+    for start in range(0, batch_size, WORLD_SIZE):
+        partition.append(prompt_batch[(start + WORLD_RANK) % batch_size])
+
+    return partition
+
+
 def main(
     model_path: str,
     node_id: int,
@@ -682,15 +774,7 @@ def main(
     max_tokens: int = 128,
     hide_resp: bool = False,
 ):
-    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    assert n_prompts % batch_size == 0
-    prompts: list[str] = None
-    if prompt:
-        prompts = [prompt]
-    else:
-        dataset: list[str] = get_json(Path(prompt_path))["prompts"]
-        n_repeats = -(n_prompts // -len(dataset))  # ceil division
-        prompts = (dataset * n_repeats)[:n_prompts]
+    prompts = get_prompts(prompt, prompt_path, n_prompts, batch_size)
 
     gpu = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
@@ -703,11 +787,11 @@ def main(
     # warmup
     generate(
         ["hello, how are you?"],
+        1,
         tokenizer,
         model,
         group,
         max_tokens=16,
-        max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
@@ -715,23 +799,24 @@ def main(
     torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
     decode_tps = []
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
-        prompt_batch = prompts[start:end]
+    global_start = 0
+    for global_end in range(batch_size, n_prompts + 1, batch_size):
+        prompt_batch = prompts[global_start:global_end]
+        prompt_batch_partition = partition_prompt_batch(prompt_batch, batch_size)
+
         (
-            seqlens,
             responses,
             n_p_tkns,
             prefill_time,
             n_gen_tkns,
             decode_time,
         ) = generate(
-            prompt_batch,
+            prompt_batch_partition,
+            batch_size,
             tokenizer,
             model,
             group,
             max_tokens=max_tokens,
-            max_batch_size=len(prompt_batch),
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
@@ -758,13 +843,11 @@ def main(
             if not hide_resp:
                 print("=" * 20)
                 print("INS-N-OUTS")
-                print(f"AVG seqlen: {mean(seqlens)}")
-                print(f"seqlens: {seqlens}\n")
                 for p, resp in zip(prompt_batch, responses):
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
 
-        start = end
+        global_start = global_end
 
     if WORLD_RANK == 0:
         print("=" * 20)
@@ -789,6 +872,7 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(0)
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
