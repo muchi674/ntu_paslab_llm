@@ -686,13 +686,12 @@ def generate(
 
             # clear redundancy
             cleared_res = []
-            for pi in range(WORLD_SIZE):
-                if pi < WORLD_SIZE - (glob_B - real_B):
-                    cleared_res.append(glob_res[pi])
-                else:
-                    cleared_res.append(glob_res[pi][:-1])
+            for pi in range(real_B):
+                glob_i = pi % WORLD_SIZE
+                loc_i = pi // WORLD_SIZE
+                cleared_res.append(glob_res[glob_i][loc_i])
 
-            generated_tokens = torch.cat(cleared_res, dim=0).tolist()
+            generated_tokens = torch.stack(cleared_res, dim=0).tolist()
             n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
         else:
             dist.gather(loc_res, dst=0, group=group)
