@@ -388,9 +388,9 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
-        print("here-2")
+        print("here0")
         dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
-        print("here-1")
+        print("here1")
         return output
 
 
@@ -426,9 +426,6 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        print(selected_experts)
-        print("here")
-
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
@@ -438,29 +435,14 @@ class MoeLayer(nn.Module):
                 bis.append(batch_idx.to(device=inputs.device))
                 nes.append(nth_expert.to(device=inputs.device))
 
-        print("here0")
-
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
-        # batch_idx = torch.tensor([0])
-        # nth_expert = torch.tensor([0])
-        # for ei in range(self.num_experts):
-        #     # batch_idx, nth_expert = torch.where(selected_experts == ei)
-        #     ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-        #     if ey is None:
-        #         continue
-        #     results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
-        print("here1")
-
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-
         print("here2")
-
+        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        print("here3")
         return results
 
 
