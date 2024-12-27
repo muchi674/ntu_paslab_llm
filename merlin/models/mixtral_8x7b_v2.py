@@ -749,9 +749,6 @@ def main(
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    n_prompts = 1
-    prompts = prompts[11]
-
     torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
     decode_tps = []
