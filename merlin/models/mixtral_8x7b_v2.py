@@ -399,6 +399,7 @@ class Attention(nn.Module):
         output: torch.Tensor = self.wo(output)
         return self.aggregate(output, seqlen_sum, model_dim)
 
+
 class Experts:
 
     def __init__(self, ws: dict):
@@ -412,7 +413,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-@torch.compiler.disable
+
 class MoeLayer(nn.Module):
     def __init__(
         self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
@@ -478,6 +479,7 @@ class TransformerBlock(nn.Module):
             experts=experts,
             group=moe_group,
         )
+        torch.compile(self.attention)
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
@@ -509,7 +511,6 @@ class Transformer(nn.Module):
                 for li in range(args.n_layers)
             }
         )
-        torch.compile(self.layers)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -747,7 +748,7 @@ def main(
         tokenizer,
         model,
         global_group,
-        max_tokens=16,
+        max_tokens=128,
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
