@@ -4,7 +4,7 @@
     "master_port": "9091",
     "shared_exec_args": {
         "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 1,
+        "n_prompts": 16,
         "batch_size": 1,
         "max_tokens": 32
     },
@@ -24,7 +24,7 @@
             "script": "/home/muchichen/ntu_paslab_llm/merlin/models/mixtral_8x7b_v2.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/v2",
             "node_id": 2,
-            "profile": true,
+            "profile": false,
             "profiling_output": "n46-v2-bs1"
         }
     }
