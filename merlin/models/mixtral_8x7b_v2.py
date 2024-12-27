@@ -471,10 +471,12 @@ class TransformerBlock(nn.Module):
             experts=experts,
             group=moe_group,
         )
+        self.group = moe_group
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        dist.barrier(group=self.group)
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
@@ -572,7 +574,7 @@ class Transformer(nn.Module):
             model = Transformer(
                 args=model_args,
                 experts=Experts(experts),
-                attn_group=moe_group,
+                attn_group=attn_group,
                 moe_group=moe_group,
             )
         model.load_state_dict(non_experts, assign=True, strict=True)
