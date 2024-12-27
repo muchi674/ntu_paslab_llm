@@ -96,6 +96,9 @@ def list_of_strings(arg):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--terminate", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profiling-output", type=str)
     parser.add_argument("--nnodes", type=int)
     parser.add_argument("--node-rank", type=int)
     parser.add_argument("--nproc-per-node", type=int)
@@ -110,8 +113,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hide-resp", action="store_true")
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
 
     Cmd("""tmux kill-session -t merlin || true""")
@@ -126,11 +127,14 @@ def main():
 
     header = "torchrun "
     if args.profile:
-        header = (
+        prof_cmd = (
             "nsys profile "
-            + "--capture-range=cudaProfilerApi --capture-range-end=stop "
-            + header
+            + "--capture-range=cudaProfilerApi "
+            + "--capture-range-end=stop "
         )
+        if args.profiling_output:
+            prof_cmd += f"-o {args.profiling_output} "
+        header = prof_cmd + header
     exec_target = (
         f"{args.script} "
         + f"--model-path={args.model_path} "
