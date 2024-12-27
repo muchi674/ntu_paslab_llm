@@ -388,7 +388,7 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
+        # dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
         return output
 
 
@@ -476,7 +476,6 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        dist.barrier(group=self.group)
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
