@@ -387,6 +387,7 @@ class Attention(nn.Module):
 
         assert isinstance(output, torch.Tensor)
 
+        # all_reduce is not used to prevent hangs
         output: torch.Tensor = self.wo(output)
         local_world_out = torch.zeros(
             (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
@@ -395,8 +396,6 @@ class Attention(nn.Module):
         )
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
         return torch.sum(local_world_out, dim=0)
-        # dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
-        # return output
 
 
 class Experts:
