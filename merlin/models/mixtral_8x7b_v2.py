@@ -421,11 +421,13 @@ class MoeLayer(nn.Module):
         self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        print("here2")
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
+        print("here3")
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
@@ -435,14 +437,15 @@ class MoeLayer(nn.Module):
                 bis.append(batch_idx.to(device=inputs.device))
                 nes.append(nth_expert.to(device=inputs.device))
 
+        print("here4")
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        print("here2")
+        print("here5")
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        print("here3")
+        print("here6")
         return results
 
 
