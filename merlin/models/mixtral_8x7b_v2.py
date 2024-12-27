@@ -346,17 +346,6 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
-    @torch.compiler.disable
-    def aggregate(self, output: torch.Tensor, seqlen_sum: int, model_dim: int):
-        # all_reduce is not used to prevent hangs
-        local_world_out = torch.zeros(
-            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-        return torch.sum(local_world_out, dim=0)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -397,7 +386,14 @@ class Attention(nn.Module):
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
         output: torch.Tensor = self.wo(output)
-        return self.aggregate(output, seqlen_sum, model_dim)
+        # all_reduce is not used to prevent hangs
+        local_world_out = torch.zeros(
+            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+        return torch.sum(local_world_out, dim=0)
 
 
 class Experts:
@@ -479,7 +475,6 @@ class TransformerBlock(nn.Module):
             experts=experts,
             group=moe_group,
         )
-        torch.compile(self.attention)
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
