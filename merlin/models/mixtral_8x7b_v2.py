@@ -419,6 +419,8 @@ class MoeLayer(nn.Module):
         self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        dist.barrier(self.group)
+
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
@@ -426,31 +428,31 @@ class MoeLayer(nn.Module):
 
         # print("here")
 
-        # selected_experts = selected_experts.to("cpu")
-        # eis, bis, nes = [], [], []
-        # for ei in range(self.num_experts):
-        #     batch_idx, nth_expert = torch.where(selected_experts == ei)
-        #     if torch.numel(batch_idx) > 0:
-        #         eis.append(ei)
-        #         bis.append(batch_idx.to(device=inputs.device))
-        #         nes.append(nth_expert.to(device=inputs.device))
+        selected_experts = selected_experts.to("cpu")
+        eis, bis, nes = [], [], []
+        for ei in range(self.num_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx.to(device=inputs.device))
+                nes.append(nth_expert.to(device=inputs.device))
 
         # print("here0")
 
-        # for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-        #     ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-        #     if ey is None:
-        #         continue
-        #     results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
-        batch_idx = torch.tensor([0])
-        nth_expert = torch.tensor([0])
-        for ei in range(self.num_experts):
-            # batch_idx, nth_expert = torch.where(selected_experts == ei)
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+
+        # batch_idx = torch.tensor([0])
+        # nth_expert = torch.tensor([0])
+        # for ei in range(self.num_experts):
+        #     # batch_idx, nth_expert = torch.where(selected_experts == ei)
+        #     ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+        #     if ey is None:
+        #         continue
+        #     results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         # print("here1")
 
