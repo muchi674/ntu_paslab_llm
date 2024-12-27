@@ -388,7 +388,9 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         output = self.wo(output)
+        print("here-2")
         dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
+        print("here-1")
         return output
 
 
@@ -424,8 +426,8 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        # print(selected_experts)
-        # print("here")
+        print(selected_experts)
+        print("here")
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
@@ -436,7 +438,7 @@ class MoeLayer(nn.Module):
                 bis.append(batch_idx.to(device=inputs.device))
                 nes.append(nth_expert.to(device=inputs.device))
 
-        # print("here0")
+        print("here0")
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
@@ -453,11 +455,11 @@ class MoeLayer(nn.Module):
         #         continue
         #     results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
-        # print("here1")
+        print("here1")
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
 
-        # print("here2")
+        print("here2")
 
         return results
 
@@ -765,12 +767,14 @@ def main(
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
+    n_prompts = 1
+    prompts = prompts[11]
+
     torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
     decode_tps = []
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
-        print("--------", start, "--------")
         prompt_batch = prompts[start:end]
         (
             seqlens,
