@@ -443,8 +443,10 @@ class MoeLayer(nn.Module):
         #         continue
         #     results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
+        batch_idx = torch.tensor([0])
+        nth_expert = torch.tensor([0])
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            # batch_idx, nth_expert = torch.where(selected_experts == ei)
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
