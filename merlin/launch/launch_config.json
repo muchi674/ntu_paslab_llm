@@ -6,7 +6,8 @@
         "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
         "n_prompts": 16,
         "batch_size": 1,
-        "max_tokens": 32
+        "max_tokens": 32,
+        "hide_resp": true
     },
     "nodes": {
         "10.10.10.1": {
