@@ -346,6 +346,17 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
+    @torch.compiler.disable
+    def aggregate(self, output: torch.Tensor, seqlen_sum: int, model_dim: int):
+        # all_reduce is not used to prevent hangs
+        local_world_out = torch.zeros(
+            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+        return torch.sum(local_world_out, dim=0)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -385,18 +396,8 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        assert isinstance(output, torch.Tensor)
-
-        # all_reduce is not used to prevent hangs
         output: torch.Tensor = self.wo(output)
-        local_world_out = torch.zeros(
-            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-        return torch.sum(local_world_out, dim=0)
-
+        return self.aggregate(output, seqlen_sum, model_dim)
 
 class Experts:
 
@@ -411,7 +412,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-
+@torch.compiler.disable
 class MoeLayer(nn.Module):
     def __init__(
         self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
@@ -508,6 +509,7 @@ class Transformer(nn.Module):
                 for li in range(args.n_layers)
             }
         )
+        torch.compile(self.layers)
 
     @property
     def dtype(self) -> torch.dtype:
