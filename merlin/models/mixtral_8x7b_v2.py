@@ -1,5 +1,3 @@
-#!/home/joe/miniconda3/envs/mixtral/bin/python
-
 # [POC]: tensor parallel attention
 # [known issues]: process hangs with large batch size, synchronization latency is high
 # reference: https://github.com/mistralai/mistral-inference
@@ -354,7 +352,7 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        seqlen_sum, _ = x.shape
+        seqlen_sum, model_dim = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
@@ -387,11 +385,15 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        assert isinstance(output, torch.Tensor)
-
-        output = self.wo(output)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.group)
-        return output
+        output: torch.Tensor = self.wo(output)
+        # all_reduce is not used to prevent hangs
+        local_world_out = torch.zeros(
+            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+        return torch.sum(local_world_out, dim=0)
 
 
 class Experts:
@@ -741,7 +743,7 @@ def main(
         tokenizer,
         model,
         global_group,
-        max_tokens=16,
+        max_tokens=128,
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,

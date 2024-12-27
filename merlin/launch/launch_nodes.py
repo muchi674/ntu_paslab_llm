@@ -95,7 +95,6 @@ class Cmd:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-config", required=True, type=str)
-    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--terminate", action="store_true")
     args = parser.parse_args()
     try:
@@ -121,6 +120,8 @@ def main():
         if "hide_resp" in tmp:
             shared_exec_args += f"--hide-resp "
 
+    url: str
+    node_info: dict
     for url, node_info in nodes.items():
         ssh_port, node_rank, ngpus, script, model_path, node_id = itemgetter(
             "ssh_port", "node_rank", "ngpus", "script", "model_path", "node_id"
@@ -130,7 +131,7 @@ def main():
             f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
             + "'"
             + 'export PATH="$PATH:/home/muchichen/miniconda3/condabin/" && '
-            + "cd /home/muchichen/ntu_paslab_llm && "
+            + "cd /home/muchichen/ntu_paslab_llm/merlin && "
             + "git pull origin merlin && "
             + "conda activate merlin && "
             + "python /home/muchichen/ntu_paslab_llm/merlin/launch/run_node.py "
@@ -144,6 +145,11 @@ def main():
                 print("[terminated successfully]")
             continue
 
+        if node_info.get("profile", False):
+            base_cmd += "--profile "
+            if "profiling_output" in node_info:
+                base_cmd += f'--profiling-output={node_info["profiling_output"]} '
+
         rc, out, err = Cmd(
             base_cmd
             + f"--nnodes={world_size} "
@@ -155,7 +161,6 @@ def main():
             + f"--model-path={model_path} "
             + f"--node-id={node_id} "
             + shared_exec_args
-            + ("--profile " if args.profile and url == master_addr else "")
             + "'"
         )
         if rc != 0:
