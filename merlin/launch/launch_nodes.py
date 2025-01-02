@@ -103,8 +103,8 @@ def main():
     except FileNotFoundError:
         raise
 
-    world_size, master_addr, master_port, nodes = itemgetter(
-        "world_size", "master_addr", "master_port", "nodes"
+    world_size, master_addr, master_port, nodes, username = itemgetter(
+        "world_size", "master_addr", "master_port", "nodes", "username"
     )(config)
 
     if not args.terminate:
@@ -128,13 +128,13 @@ def main():
         )(node_info)
         print(f"node {url}")
         base_cmd = (
-            f"ssh -i ~/.ssh/id_merlin muchichen@{url} -p {ssh_port} "
+            f"ssh -i ~/.ssh/id_merlin {username}@{url} -p {ssh_port} "
             + "'"
-            + 'export PATH="$PATH:/home/muchichen/miniconda3/condabin/" && '
-            + "cd /home/muchichen/ntu_paslab_llm/merlin && "
-            + "git pull origin merlin && "
-            + "conda activate merlin && "
-            + "python /home/muchichen/ntu_paslab_llm/merlin/launch/run_node.py "
+            + f'export PATH="$PATH:/home/{username}/miniconda3/condabin/" && '
+            + f"cd /home/{username}/ntu_paslab_llm/merlin && "
+            + f"git pull origin merlin && "
+            + f"conda activate merlin && "
+            + f"python /home/{username}/ntu_paslab_llm/merlin/launch/run_node.py "
         )
 
         if args.terminate:
