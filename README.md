@@ -8,7 +8,7 @@ https://docs.google.com/presentation/d/1S0uQ6G4PuXBWq8a2PRFdHHnBS1VnjT0ysbEE6eEx
 ### authors:
 
 - Mu-Chi Chen, muchichen@ntu.edu.tw
-- Po-Hsuan Huang, aben20807@gmail.com
+- Dr. Po-Hsuan Huang, aben20807@gmail.com
 
 ### advisor:
 
