@@ -3,8 +3,6 @@
 conda create --name merlin python=3.10
 conda activate merlin
 ```
-## install pytorch
-https://pytorch.org/
 
 ## install required packages from pypi channel
 ```shell

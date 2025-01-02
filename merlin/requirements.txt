@@ -18,3 +18,5 @@ sentencepiece==0.2.0
 tiktoken==0.7.0
 urllib3==2.3.0
 xformers==0.0.29.post1
+--find-links https://download.pytorch.org/whl/torch/index.html
+torch==2.5.1+cu121
