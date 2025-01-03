@@ -18,7 +18,9 @@ class Partitioner:
         self.model_path = Path(model_path)
         self.design_path = Path(design_path)
         self.output_path = Path(output_path) if output_path else self.model_path
-        self.model_config, self.expert_map, self.attn_map = self.get_configs()
+        self.model_config, self.expert_map, self.attn_tp_map, self.non_expert_pp_map = (
+            self.get_configs()
+        )
 
     def get_configs(self) -> tuple[dict, dict]:
         with open(self.model_path / "config.json", "r") as model_config_file:
@@ -27,7 +29,8 @@ class Partitioner:
             design = json.load(design_file)
 
         expert_map = {}
-        attn_map = {}
+        attn_tp_map = {}
+        non_expert_pp_map = {}
         next_layer, next_expert = 0, 0
 
         for d in design["design"]:
@@ -40,6 +43,8 @@ class Partitioner:
 
             if len(design["design"]) > 1:
                 assert node_id is not None
+            assert n_layers is None or n_layers > 0
+            assert n_experts is None or n_experts > 0
             # TODO: consider combining expert + pipeline parallelism
             assert (n_layers is None) or (n_experts is None)
 
@@ -72,14 +77,17 @@ class Partitioner:
                     expert_map[f"{li}-{ei}"] = m
 
                 if design.get("split_attn_weights", False):
-                    attn_map.setdefault(str(li), []).append(partitions)
+                    attn_tp_map.setdefault(str(li), []).append(partitions)
+
+                if n_layers:
+                    non_expert_pp_map[str(li)] = partitions
 
             next_layer += n_layers or 0
             next_expert += n_experts or 0
 
         assert next_layer == 0 or next_layer == model_config["num_hidden_layers"]
         assert next_expert == 0 or next_expert == model_config["num_local_experts"]
-        return model_config, expert_map, attn_map
+        return model_config, expert_map, attn_tp_map, non_expert_pp_map
 
     def load_weights(self) -> dict:
         weight_files = glob.glob(str(self.model_path / "consolidated.*.pt"))
@@ -109,66 +117,92 @@ class Partitioner:
         for pk, partition in partitions.items():
             torch.save(partition, self.output_path / f"experts-{pk}.pt")
 
-        logging.info("finished partitioning expert weights")
         return ws
 
     def partition_non_expert_weights(self, ws: dict) -> None:
-        for li in range(self.model_config["num_hidden_layers"]):
+        n_model_layers = self.model_config["num_hidden_layers"]
+        for li in range(n_model_layers):
             ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
                 f"layers.{li}.block_sparse_moe.gate.weight"
             )
 
-        if self.attn_map:
-            non_parallel_ks = ["tok_embeddings.weight", "norm.weight", "output.weight"]
-            for li in range(self.model_config["num_hidden_layers"]):
-                non_parallel_ks.append(f"layers.{li}.attention_norm.weight")
-                non_parallel_ks.append(f"layers.{li}.ffn_norm.weight")
-                non_parallel_ks.append(f"layers.{li}.feed_forward.gate.weight")
-            non_parallel_ws = {k: ws.pop(k) for k in non_parallel_ks}
+        if not self.attn_tp_map and not self.non_expert_pp_map:
+            torch.save(ws, self.output_path / f"non-experts.pt")
+            return
 
-            n_attn_heads = self.model_config["num_attention_heads"]
-            n_kv_heads = self.model_config["num_key_value_heads"]
-            model_dim = self.model_config["hidden_size"]
-            head_dim = model_dim // n_attn_heads
-            partitions = {}
+        n_attn_heads = self.model_config["num_attention_heads"]
+        n_kv_heads = self.model_config["num_key_value_heads"]
+        model_dim = self.model_config["hidden_size"]
+        head_dim = model_dim // n_attn_heads
+        attn_linear_wis = ["wq", "wk", "wv", "wo"]
+        partitions = {}
 
-            for li in range(self.model_config["num_hidden_layers"]):
-                wq: torch.Tensor = ws.pop(f"layers.{li}.attention.wq.weight")
-                wk: torch.Tensor = ws.pop(f"layers.{li}.attention.wk.weight")
-                wv: torch.Tensor = ws.pop(f"layers.{li}.attention.wv.weight")
-                wo: torch.Tensor = ws.pop(f"layers.{li}.attention.wo.weight").T
+        for li in range(n_model_layers):
+            wq, wk, wv, wo, attn_norm, ffn_norm, gate = [
+                ws.pop(wi)
+                for wi in [
+                    f"layers.{li}.attention.wq.weight",
+                    f"layers.{li}.attention.wk.weight",
+                    f"layers.{li}.attention.wv.weight",
+                    f"layers.{li}.attention.wo.weight",
+                    f"layers.{li}.attention_norm.weight",
+                    f"layers.{li}.ffn_norm.weight",
+                    f"layers.{li}.feed_forward.gate.weight",
+                ]
+            ]
 
-                for pks in self.attn_map[str(li)]:
+            if self.attn_tp_map:
+                for pks in self.attn_tp_map[str(li)]:
                     tp_size = len(pks)
                     assert n_attn_heads % tp_size == 0
                     assert n_kv_heads % tp_size == 0
-                    q_step = n_attn_heads * head_dim // tp_size
+                    qo_step = n_attn_heads * head_dim // tp_size
                     kv_step = n_kv_heads * head_dim // tp_size
-                    o_step = model_dim // tp_size
-                    steps = [q_step, kv_step, kv_step, o_step]
+                    steps = [qo_step, kv_step, kv_step, qo_step]
 
-                    for wi, step, w in zip(
-                        ["wq", "wk", "wv", "wo"], steps, [wq, wk, wv, wo]
-                    ):
+                    for wi, step, w in zip(attn_linear_wis, steps, [wq, wk, wv, wo.T]):
 
                         for pk, w_slice in zip(pks, torch.split(w, step)):
                             partitions.setdefault(pk, {})[
                                 f"layers.{li}.attention.{wi}.weight"
                             ] = (w_slice.clone() if wi != "wo" else w_slice.T.clone())
+            else:
+                for pk in self.non_expert_pp_map[str(li)]:
+                    for wi, w in zip(attn_linear_wis, [wq, wk, wv, wo]):
+                        partitions.setdefault(pk, {})[
+                            f"layers.{li}.attention.{wi}.weight"
+                        ] = w
 
-            for pk, partition in partitions.items():
-                partition.update(non_parallel_ws)
-                torch.save(partition, self.output_path / f"non-experts-{pk}.pt")
+            # 2D array
+            non_attn_dest = self.non_expert_pp_map.get(str(li)) or []
+            if not non_attn_dest:
+                for pks in self.attn_tp_map[str(li)]:
+                    non_attn_dest.extend(pks)
 
-        else:
-            torch.save(ws, self.output_path / f"non-experts.pt")
+            for pk in non_attn_dest:
+                partitions[pk][f"layers.{li}.attention_norm.weight"] = attn_norm
+                partitions[pk][f"layers.{li}.ffn_norm.weight"] = ffn_norm
+                partitions[pk][f"layers.{li}.feed_forward.gate.weight"] = gate
 
-        logging.info("finished partitioning non-expert weights")
-        return ws
+            if li == 0:
+                w_embed = ws.pop("tok_embeddings.weight")
+                for pk in non_attn_dest:
+                    partitions[pk]["tok_embeddings.weight"] = w_embed
+            elif li == n_model_layers - 1:
+                w_norm = ws.pop("norm.weight")
+                w_output = ws.pop("output.weight")
+                for pk in non_attn_dest:
+                    partitions[pk]["norm.weight"] = w_norm
+                    partitions[pk]["output.weight"] = w_output
+
+        for pk, partition in partitions.items():
+            torch.save(partition, self.output_path / f"non-experts-{pk}.pt")
 
     def start(self) -> None:
         ws = self.partition_expert_weights(self.load_weights())
+        logging.info("finished partitioning expert weights")
         self.partition_non_expert_weights(ws)
+        logging.info("finished partitioning non-expert weights")
 
 
 if __name__ == "__main__":

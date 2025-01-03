@@ -1,14 +1,14 @@
 {
-    "split_attn_weights": false,
+    "split_attn_weights": true,
     "design": [
         {
             "node_id": 0,
-            "n_experts": 2,
+            "n_experts": 3,
             "tp_size": 2
         },
         {
             "node_id": 1,
-            "n_experts": 6,
+            "n_experts": 5,
             "tp_size": 4
         }
     ]

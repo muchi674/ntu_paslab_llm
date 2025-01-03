@@ -1,4 +1,4 @@
-# [POC]: tensor parallel attention, tensor + expert parallel MoE
+# [POC]: inter-node pipeline parallelism + intra-node tensor parallelism
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -79,6 +79,8 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
+    layer_start: int = None
+    layer_end: int = None
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -555,17 +557,27 @@ class Transformer(nn.Module):
 
     @staticmethod
     def load(
-        model_path: Path, node_id: int, gpu: torch.device, attn_group, moe_group
+        model_path: Path,
+        node_id: int,
+        gpu: torch.device,
+        attn_group,
+        moe_group,
+        layer_start: int,
+        layer_end: int,
     ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
+        model_args.layer_start = layer_start
+        model_args.layer_end = layer_end
+        model_args.n_layers = layer_end - layer_start
+
         non_experts = torch.load(
-            model_path / f"non-experts-{LOCAL_WORLD_SIZE}-{LOCAL_RANK}.pt",
+            model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{node_id + LOCAL_RANK}.pt",
+            model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
@@ -817,6 +829,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--node-id", type=int)
+    parser.add_argument("--layer-start", type=int)
+    parser.add_argument("--layer-end", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -828,6 +842,8 @@ if __name__ == "__main__":
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
+        args.layer_start,
+        args.layer_end,
         args.prompt,
         args.prompt_path,
         args.n_prompts,
