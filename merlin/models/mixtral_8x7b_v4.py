@@ -79,8 +79,11 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
-    layer_start: int = None
-    layer_end: int = None
+    is_first_node: bool = None
+    is_last_node: bool = None
+    first_layer: int = None
+    last_layer: int = None
+    n_assigned_layers: int = None
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -234,14 +237,14 @@ class BufferCache:
         head_dim: int,
     ):
         self.max_seq_len = max_seq_len
-        self.n_kv_heads = n_kv_heads // LOCAL_WORLD_SIZE
+        self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
 
         self.cache_k = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
         )
         self.cache_v = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
         )
         # holds the valid length for each batch element in the cache
         self.kv_seqlens: Optional[torch.Tensor] = None
@@ -332,11 +335,9 @@ class Attention(nn.Module):
         self.args = args
         self.group = group
 
-        assert args.n_heads % LOCAL_WORLD_SIZE == 0
-        assert args.n_kv_heads % LOCAL_WORLD_SIZE == 0
-        self.n_heads: int = args.n_heads // LOCAL_WORLD_SIZE
+        self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
-        self.n_kv_heads: int = args.n_kv_heads // LOCAL_WORLD_SIZE
+        self.n_kv_heads: int = args.n_kv_heads
 
         self.repeats = self.n_heads // self.n_kv_heads
 
@@ -403,8 +404,6 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
@@ -440,8 +439,6 @@ class MoeLayer(nn.Module):
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
-                continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
@@ -462,11 +459,9 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(
-        self, args: ModelArgs, li: int, experts: Experts, attn_group, moe_group
-    ):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
         super().__init__()
-        self.attention = Attention(args=args, group=attn_group)
+        self.attention = Attention(args=args, group=group)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
@@ -474,7 +469,7 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
-            group=moe_group,
+            group=group,
         )
 
     def forward(
@@ -488,23 +483,21 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, attn_group, moe_group):
+    def __init__(self, args: ModelArgs, experts: Experts, group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
-        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+        if args.is_first_node:
+            self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        elif args.is_last_node:  # assumes inter-node PP
+            self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+            self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args,
-                    li=li,
-                    experts=experts,
-                    attn_group=attn_group,
-                    moe_group=moe_group,
+                    args=args, li=li, experts=experts, group=group
                 )
-                for li in range(args.n_layers)
+                for li in range(args.first_layer, args.last_layer + 1)
             }
         )
 
@@ -536,40 +529,35 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        xs: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
     ) -> torch.Tensor:
-        (num_toks,) = input_ids.shape
-        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
-
         input_metadata = cache.get_input_metadata(seqlens)
-        h = self.tok_embeddings(input_ids)
+        h = xs
+        if self.args.is_first_node:
+            h = self.tok_embeddings(h)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
-        for li in range(self.args.n_layers):
-            cache_view = cache.get_view(li, input_metadata)
+        for li in range(self.args.first_layer, self.args.last_layer + 1):
+            cache_view = cache.get_view(li - self.args.first_layer, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
         cache.update_seqlens(seqlens)
-        outs = self.output(self.norm(h))
-        return outs.float()
+        if self.args.is_last_node:
+            return self.output(self.norm(h)).to(torch.float32)
+        return h
 
     @staticmethod
     def load(
         model_path: Path,
         node_id: int,
         gpu: torch.device,
-        attn_group,
-        moe_group,
-        layer_start: int,
-        layer_end: int,
+        group,
+        is_first_node: bool,
+        is_last_node: bool,
     ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
-        model_args.layer_start = layer_start
-        model_args.layer_end = layer_end
-        model_args.n_layers = layer_end - layer_start
-
         non_experts = torch.load(
             model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
@@ -583,13 +571,24 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        # adjust for tensor parallel attention
+        assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
+        assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+        model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
+        model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
+
+        # find PP range
+        model_args.is_first_node = is_first_node
+        model_args.is_last_node = is_last_node
+        lis = [int(k.split(".")[0]) for k in experts]
+        model_args.first_layer = min(lis)
+        model_args.last_layer = max(lis)
+        model_args.n_assigned_layers = (
+            model_args.last_layer - model_args.first_layer + 1
+        )
+
         with torch.device("meta"):
-            model = Transformer(
-                args=model_args,
-                experts=Experts(experts),
-                attn_group=attn_group,
-                moe_group=moe_group,
-            )
+            model = Transformer(args=model_args, experts=Experts(experts), group=group)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -601,6 +600,7 @@ def generate(
     tokenizer: MistralTokenizer,
     model: Transformer,
     global_group,
+    pp_group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -632,13 +632,20 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
-    prelogits = model.forward(
-        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
-        seqlens=seqlens,
-        cache=cache,
-    )
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-    last_token_prelogits = prelogits.index_select(0, last_positions)
+    if model.args.is_first_node:
+        interm_ys = model.forward(
+            torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
+            seqlens=seqlens,
+            cache=cache,
+        )
+        dist.broadcast(interm_ys, WORLD_RANK, group=pp_group) # TODO: change WORLD_RANK
+    elif model.args.is_last_node:
+        prelogits: torch.Tensor
+        last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+        last_token_prelogits = prelogits.index_select(0, last_positions)
+    else:
+        # TODO: receive from prev group = local ranks + prev group leader
+        pass
 
     dist.barrier(group=global_group)
     prefill_time = time.time() - tic
@@ -703,12 +710,24 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def get_node_group(node_id, gpu, global_group):
+def get_node_groups(node_id, gpu, global_group):
+    # returns local node group and the PP group
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
     dist.all_gather_into_tensor(global_map, local_map, group=global_group)
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
-    return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
+    local_group = dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
+
+    first_node = torch.min(global_map[:, 0]).item()
+    last_node = torch.max(global_map[:, 0]).item()
+    next_node = node_id + 1  # assumes sequential node_id
+    if node_id == last_node:
+        next_node = first_node
+    pp_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
+    pp_group.append(WORLD_RANK)
+    pp_group = dist.new_group(pp_group, use_local_synchronization=True)
+
+    return local_group, pp_group, node_id == first_node, node_id == last_node
 
 
 def main(
@@ -738,14 +757,17 @@ def main(
     global_group = dist.new_group(
         list(range(WORLD_SIZE)), use_local_synchronization=True
     )
-    node_group = get_node_group(node_id, gpu, global_group)
+    local_group, pp_group, is_first_node, is_last_node = get_node_groups(
+        node_id, gpu, global_group
+    )
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
         model_path=Path(model_path),
         node_id=node_id,
         gpu=gpu,
-        attn_group=node_group,
-        moe_group=global_group,
+        group=local_group,
+        is_first_node=is_first_node,
+        is_last_node=is_last_node,
     )
 
     # warmup
@@ -829,8 +851,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--node-id", type=int)
-    parser.add_argument("--layer-start", type=int)
-    parser.add_argument("--layer-end", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -842,8 +862,6 @@ if __name__ == "__main__":
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
-        args.layer_start,
-        args.layer_end,
         args.prompt,
         args.prompt_path,
         args.n_prompts,
