@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import time
+import os
 
 """terminal color"""
 TC = SimpleNamespace(
@@ -113,7 +114,7 @@ def main():
         if "prompt" in tmp:
             shared_exec_args += f'--prompt="{tmp["prompt"]}" '
         else:
-            shared_exec_args += f'--prompt-path={tmp["prompt_path"]} '
+            shared_exec_args += f'--prompt-path={os.path.expanduser(tmp["prompt_path"])} '
         for k in ["n_prompts", "batch_size", "max_tokens"]:
             if k in tmp:
                 shared_exec_args += f'--{k.replace("_", "-")}={tmp[k]} '
@@ -157,7 +158,7 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + f"--script={script} "
+            + f"--script={os.path.expanduser(script)} "
             + f"--model-path={model_path} "
             + f"--node-id={node_id} "
             + shared_exec_args

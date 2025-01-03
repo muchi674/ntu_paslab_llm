@@ -1,22 +1,6 @@
-annotated-types==0.7.0
-attrs==24.3.0
-certifi==2024.12.14
-charset-normalizer==3.4.1
-idna==3.10
-jsonschema==4.23.0
-jsonschema-specifications==2024.10.1
 mistral_common==1.5.1
-numpy==1.26.3
-pillow==10.4.0
-pydantic==2.10.4
-pydantic_core==2.27.2
-referencing==0.35.1
-regex==2024.11.6
-requests==2.32.3
-rpds-py==0.22.3
-sentencepiece==0.2.0
-tiktoken==0.7.0
-urllib3==2.3.0
+
+# use CUDA 12.1 for following packages
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
 xformers==0.0.29.post1
---find-links https://download.pytorch.org/whl/torch/index.html
-torch==2.5.1+cu121
