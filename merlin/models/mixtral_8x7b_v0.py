@@ -543,7 +543,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-tp-{WORLD_RANK}.pt",
+            model_path / f"experts-{WORLD_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
