@@ -559,13 +559,13 @@ class Transformer(nn.Module):
     ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
-            model_path / f"non-experts-{LOCAL_WORLD_SIZE}-{LOCAL_RANK}.pt",
+            model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{node_id + LOCAL_RANK}.pt",
+            model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
