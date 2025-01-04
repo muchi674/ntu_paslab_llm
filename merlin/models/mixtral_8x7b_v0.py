@@ -765,7 +765,7 @@ def main(
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
-    dist.destroy_process_group(group=group)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

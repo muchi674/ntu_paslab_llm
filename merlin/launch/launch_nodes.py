@@ -118,7 +118,7 @@ def main():
         for k in ["n_prompts", "batch_size", "max_tokens"]:
             if k in tmp:
                 shared_exec_args += f'--{k.replace("_", "-")}={tmp[k]} '
-        if "hide_resp" in tmp:
+        if tmp.get("hide_resp", False):
             shared_exec_args += f"--hide-resp "
 
     url: str

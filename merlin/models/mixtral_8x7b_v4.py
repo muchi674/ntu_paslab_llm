@@ -718,9 +718,18 @@ def get_node_groups(node_id, gpu, global_group):
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
     local_group = dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
+    # PP communication design:
+    # On every node, one process/GPU is assigned as leader for
+    # sending local group's results to the next PP group/node.
+    # For simplicity,
+    # 1. process/GPU whose LOCAL_RANK = 0 is assigned leader
+    # 2. we assume node_id is assigned sequentially
     first_node = torch.min(global_map[:, 0]).item()
     last_node = torch.max(global_map[:, 0]).item()
-    next_node = node_id + 1  # assumes sequential node_id
+    prev_node = node_id - 1
+    
+
+    next_node = node_id + 1  
     if node_id == last_node:
         next_node = first_node
     pp_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
