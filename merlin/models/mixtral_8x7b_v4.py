@@ -634,14 +634,18 @@ def generate(
     # prefill / prompt evaluation stage
     if model.args.is_first_node:
         interm_ys = model.forward(
-            torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
+            torch.tensor(
+                sum(encoded_prompts, []), device=model.device, dtype=torch.long
+            ),
             seqlens=seqlens,
             cache=cache,
         )
-        dist.broadcast(interm_ys, WORLD_RANK, group=pp_group) # TODO: change WORLD_RANK
+        dist.broadcast(interm_ys, WORLD_RANK, group=pp_group)  # TODO: change WORLD_RANK
     elif model.args.is_last_node:
         prelogits: torch.Tensor
-        last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+        last_positions = (
+            torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+        )
         last_token_prelogits = prelogits.index_select(0, last_positions)
     else:
         # TODO: receive from prev group = local ranks + prev group leader
@@ -715,26 +719,29 @@ def get_node_groups(node_id, gpu, global_group):
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
     dist.all_gather_into_tensor(global_map, local_map, group=global_group)
-    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
-    local_group = dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
+    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1].tolist()
+    local_group = dist.new_group(ranks_on_node, use_local_synchronization=True)
 
     # PP communication design:
     # On every node, one process/GPU is assigned as leader for
     # sending local group's results to the next PP group/node.
     # For simplicity,
-    # 1. process/GPU whose LOCAL_RANK = 0 is assigned leader
+    # 1. process/GPU with min(WORLD_RANK) within that node is assigned leader
     # 2. we assume node_id is assigned sequentially
+    local_leader = min(ranks_on_node)
     first_node = torch.min(global_map[:, 0]).item()
     last_node = torch.max(global_map[:, 0]).item()
-    prev_node = node_id - 1
-    
 
-    next_node = node_id + 1  
-    if node_id == last_node:
-        next_node = first_node
-    pp_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
-    pp_group.append(WORLD_RANK)
-    pp_group = dist.new_group(pp_group, use_local_synchronization=True)
+    prev_node = node_id - 1 if node_id != first_node else last_node
+    prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
+    pp_recv_group = ranks_on_node + [prev_node_leader]
+    pp_recv_group = dist.new_group(pp_recv_group, use_local_synchronization=True)
+
+    if WORLD_RANK == local_leader:
+        next_node = node_id + 1 if node_id != last_node else first_node
+        pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
+        pp_send_group.append(WORLD_RANK)
+        pp_send_group = dist.new_group(pp_group, use_local_synchronization=True)
 
     return local_group, pp_group, node_id == first_node, node_id == last_node
 
