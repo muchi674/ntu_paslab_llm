@@ -599,8 +599,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    global_group,
-    pp_group,
+    groups: dict,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -618,6 +617,7 @@ def generate(
     ]
     B, V = len(encoded_prompts), model.args.vocab_size
     seqlens = [len(x) for x in encoded_prompts]
+    n_p_tkns = sum(seqlens)
 
     # Cache
     cache_window = max(seqlens) + max_tokens
@@ -640,56 +640,73 @@ def generate(
             seqlens=seqlens,
             cache=cache,
         )
-        dist.broadcast(interm_ys, WORLD_RANK, group=pp_group)  # TODO: change WORLD_RANK
-    elif model.args.is_last_node:
-        prelogits: torch.Tensor
+    else:
+        interm_ys = torch.zeros(
+            (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
+        )
+        dist.broadcast(interm_ys, groups["prev_node_leader"], group=groups["recv"])
+        interm_ys = model.forward(interm_ys, seqlens=seqlens, cache=cache)
+
+    if "send" in groups:
+        dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
+
+    if model.args.is_first_node:
+        prelogits = torch.zeros(
+            (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
+        )
+        dist.broadcast(prelogits, groups["prev_node_leader"], group=groups["recv"])
         last_positions = (
             torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
         )
         last_token_prelogits = prelogits.index_select(0, last_positions)
+
+        dist.barrier()
+        prefill_time = time.time() - tic
+        tic = time.time()
+
+        # decode
+        generated_tensors = []
+        is_finished = torch.tensor([False for _ in range(B)])
+
+        for _ in range(max_tokens):
+            next_token = sample(last_token_prelogits, temperature=temperature)
+            is_finished = is_finished | (next_token == eos_id).cpu()
+
+            if is_finished.all():
+                break
+
+            generated_tensors.append(next_token[:, None])
+
+            # TODO: PP communication
+            last_token_prelogits = model.forward(
+                next_token, seqlens=[1] * B, cache=cache
+            )
+
+
+            assert last_token_prelogits.shape == (B, V)
+
+        generated_tokens: List[List[int]]
+        n_gen_tkns = 0
+        if generated_tensors:
+            generated_tokens = torch.cat(generated_tensors, 1).tolist()
+            n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
+        else:
+            generated_tokens = []
+        responses = [tokenizer.decode(y) for y in generated_tokens]
+
+        dist.barrier()
+        decode_time = time.time() - tic
+
+        return (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+        )
     else:
-        # TODO: receive from prev group = local ranks + prev group leader
         pass
-
-    dist.barrier(group=global_group)
-    prefill_time = time.time() - tic
-    tic = time.time()
-
-    # decode
-    generated_tensors = []
-    is_finished = torch.tensor([False for _ in range(B)])
-
-    for _ in range(max_tokens):
-        next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        is_finished = is_finished | (next_token == eos_id).cpu()
-
-        if is_finished.all():
-            break
-
-        generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        assert last_token_prelogits.shape == (B, V)
-
-    generated_tokens: List[List[int]]
-    n_gen_tkns = 0
-    if generated_tensors:
-        generated_tokens = torch.cat(generated_tensors, 1).tolist()
-        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-    else:
-        generated_tokens = []
-    responses = [tokenizer.decode(y) for y in generated_tokens]
-
-    dist.barrier(group=global_group)
-    decode_time = time.time() - tic
-
-    return (
-        seqlens,
-        responses,
-        sum(seqlens),
-        prefill_time,
-        n_gen_tkns,
-        decode_time,
-    )
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -714,13 +731,13 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def get_node_groups(node_id, gpu, global_group):
-    # returns local node group and the PP group
+def get_node_groups(node_id, gpu):
+    groups = {}
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
-    dist.all_gather_into_tensor(global_map, local_map, group=global_group)
+    dist.all_gather_into_tensor(global_map, local_map)
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1].tolist()
-    local_group = dist.new_group(ranks_on_node, use_local_synchronization=True)
+    groups["local"] = dist.new_group(ranks_on_node, use_local_synchronization=True)
 
     # PP communication design:
     # On every node, one process/GPU is assigned as leader for
@@ -735,15 +752,16 @@ def get_node_groups(node_id, gpu, global_group):
     prev_node = node_id - 1 if node_id != first_node else last_node
     prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
     pp_recv_group = ranks_on_node + [prev_node_leader]
-    pp_recv_group = dist.new_group(pp_recv_group, use_local_synchronization=True)
+    groups["prev_node_leader"] = prev_node_leader
+    groups["recv"] = dist.new_group(pp_recv_group, use_local_synchronization=True)
 
     if WORLD_RANK == local_leader:
         next_node = node_id + 1 if node_id != last_node else first_node
         pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
         pp_send_group.append(WORLD_RANK)
-        pp_send_group = dist.new_group(pp_group, use_local_synchronization=True)
+        groups["send"] = dist.new_group(pp_send_group, use_local_synchronization=True)
 
-    return local_group, pp_group, node_id == first_node, node_id == last_node
+    return groups, node_id == first_node, node_id == last_node
 
 
 def main(
@@ -770,18 +788,13 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    global_group = dist.new_group(
-        list(range(WORLD_SIZE)), use_local_synchronization=True
-    )
-    local_group, pp_group, is_first_node, is_last_node = get_node_groups(
-        node_id, gpu, global_group
-    )
+    groups, is_first_node, is_last_node = get_node_groups(node_id, gpu)
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
         model_path=Path(model_path),
         node_id=node_id,
         gpu=gpu,
-        group=local_group,
+        group=groups["local"],
         is_first_node=is_first_node,
         is_last_node=is_last_node,
     )
@@ -859,7 +872,7 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier(group=global_group)
+    dist.barrier()
     dist.destroy_process_group()
 
 
