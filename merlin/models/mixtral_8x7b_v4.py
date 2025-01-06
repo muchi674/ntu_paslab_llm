@@ -778,7 +778,7 @@ def get_node_groups(node_id, gpu):
             pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
             pp_send_group.append(WORLD_RANK)
             print(f"{WORLD_RANK}, {pp_send_group}, here0")
-            dist.new_group([0, 1], backend="nccl")
+            # dist.new_group([0, 1], backend="nccl")
             print("div")
             dist.new_group([0, 2], backend="nccl")
             # groups["send"] = dist.new_group(pp_send_group, backend="nccl")
@@ -790,7 +790,7 @@ def get_node_groups(node_id, gpu):
             pp_recv_group = ranks_on_node + [prev_node_leader]
             groups["prev_node_leader"] = prev_node_leader
             print(f"{WORLD_RANK}, {pp_recv_group}, here2")
-            dist.new_group([0, 1], backend="nccl")
+            # dist.new_group([0, 1], backend="nccl")
             print("div")
             dist.new_group([0, 2], backend="nccl")
             # groups["recv"] = dist.new_group(pp_recv_group, backend="nccl")
