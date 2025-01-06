@@ -708,20 +708,23 @@ def generate(
             decode_time,
         )
     else:
-        interm_ys = torch.zeros(
+        prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
         if WORLD_RANK == local_leader:
-            dist.recv(interm_ys, prev_node_leader)
-        dist.broadcast(interm_ys, local_leader, group=local_group)
+            dist.recv(prefill_interm_ys, prev_node_leader)
+        dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
 
         # prefill / prompt evaluation stage
         # interm_ys.shape could be (n_p_tkns, model.args.vocab_size) if node_id is the last node
-        maybe_prelogits = model.forward(interm_ys, seqlens=seqlens, cache=cache)
+        maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
 
         if WORLD_RANK == local_leader:
             dist.send(maybe_prelogits, next_node_leader)
 
+        decode_interm_ys = torch.zeros(
+            (B, model.args.dim), dtype=model.dtype, device=model.device
+        )
         # decode
         for ti in range(max_tokens):
             continue_sig = torch.tensor([0], device=model.device)
@@ -731,10 +734,10 @@ def generate(
                 break
 
             if WORLD_RANK == local_leader:
-                dist.recv(interm_ys, prev_node_leader)
-            dist.broadcast(interm_ys, local_leader, group=local_group)
+                dist.recv(decode_interm_ys, prev_node_leader)
+            dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
-            maybe_prelogits = model.forward(interm_ys, seqlens=[1] * B, cache=cache)
+            maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
 
             if WORLD_RANK == local_leader:
                 dist.send(maybe_prelogits, next_node_leader)
