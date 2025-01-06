@@ -622,7 +622,7 @@ def generate(
     # Cache
     cache_window = max(seqlens) + max_tokens
     cache = BufferCache(
-        model.args.n_layers,
+        model.args.n_assigned_layers,
         max_batch_size,
         cache_window,
         model.args.n_kv_heads,
@@ -660,7 +660,6 @@ def generate(
         )
         last_token_prelogits = prelogits.index_select(0, last_positions)
 
-        dist.barrier()
         prefill_time = time.time() - tic
         tic = time.time()
 
@@ -668,22 +667,30 @@ def generate(
         generated_tensors = []
         is_finished = torch.tensor([False for _ in range(B)])
 
-        for _ in range(max_tokens):
+        for ti in range(max_tokens):
+            if ti > 0:
+                dist.broadcast(
+                    last_token_prelogits,
+                    groups["prev_node_leader"],
+                    group=groups["recv"],
+                )
             next_token = sample(last_token_prelogits, temperature=temperature)
             is_finished = is_finished | (next_token == eos_id).cpu()
 
             if is_finished.all():
+                continue_sig = torch.tensor([0], device=model.device)
+                dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
                 break
 
             generated_tensors.append(next_token[:, None])
+            continue_sig = torch.tensor([1], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            # TODO: PP communication
             last_token_prelogits = model.forward(
                 next_token, seqlens=[1] * B, cache=cache
             )
-
-
-            assert last_token_prelogits.shape == (B, V)
+            if "send" in groups:
+                dist.broadcast(last_token_prelogits, WORLD_RANK, group=groups["send"])
 
         generated_tokens: List[List[int]]
         n_gen_tkns = 0
@@ -694,7 +701,6 @@ def generate(
             generated_tokens = []
         responses = [tokenizer.decode(y) for y in generated_tokens]
 
-        dist.barrier()
         decode_time = time.time() - tic
 
         return (
@@ -706,7 +712,23 @@ def generate(
             decode_time,
         )
     else:
-        pass
+        for ti in range(max_tokens):
+            continue_sig = torch.tensor([0], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+
+            if continue_sig[0] == 0:
+                break
+
+            dist.broadcast(
+                interm_ys,
+                groups["prev_node_leader"],
+                group=groups["recv"],
+            )
+            interm_ys = model.forward(interm_ys, seqlens=[1] * B, cache=cache)
+            if "send" in groups:
+                dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
+
+        return (None, None, None, None, None, None)
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -804,7 +826,7 @@ def main(
         ["hello, how are you?"],
         tokenizer,
         model,
-        global_group,
+        groups,
         max_tokens=128,
         max_batch_size=1,
         # temperature=0,
@@ -828,7 +850,7 @@ def main(
             prompt_batch,
             tokenizer,
             model,
-            global_group,
+            groups,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
