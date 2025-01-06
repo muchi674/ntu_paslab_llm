@@ -648,7 +648,6 @@ def generate(
         )
 
         if WORLD_RANK == local_leader:
-            print(f"\n--------{interm_ys.shape}---------\n")
             dist.send(interm_ys, next_node_leader)
             dist.recv(prelogits, prev_node_leader)
         dist.broadcast(prelogits, local_leader, group=local_group)
@@ -668,7 +667,9 @@ def generate(
         for ti in range(max_tokens):
             if ti > 0:
                 if WORLD_RANK == local_leader:
+                    print("here2")
                     dist.recv(last_token_prelogits, prev_node_leader)
+                    print("here3")
                 dist.broadcast(last_token_prelogits, local_leader, group=local_group)
 
             next_token = sample(
@@ -687,8 +688,9 @@ def generate(
 
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
-                print(f"\n--------{interm_ys.shape}---------\n")
+                print("here0")
                 dist.send(interm_ys, next_node_leader)
+                print("here1")
 
         generated_tokens: List[List[int]]
         n_gen_tkns = 0
@@ -714,7 +716,6 @@ def generate(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
         if WORLD_RANK == local_leader:
-            print(f"\n--------{prefill_interm_ys.shape}---------\n")
             dist.recv(prefill_interm_ys, prev_node_leader)
         dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
 
@@ -737,14 +738,17 @@ def generate(
                 break
 
             if WORLD_RANK == local_leader:
-                print(f"\n--------{decode_interm_ys.shape}---------\n")
+                print("here0")
                 dist.recv(decode_interm_ys, prev_node_leader)
+                print("here1")
             dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
             maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
 
             if WORLD_RANK == local_leader:
+                print("here2")
                 dist.send(maybe_prelogits, next_node_leader)
+                print("here3")
 
         return (None, None, None, None, None, None)
 
