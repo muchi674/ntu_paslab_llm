@@ -712,8 +712,8 @@ def generate(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
         if WORLD_RANK == local_leader:
-            dist.recv(prelogits, prev_node_leader)
-        dist.broadcast(prelogits, local_leader, group=local_group)
+            dist.recv(interm_ys, prev_node_leader)
+        dist.broadcast(interm_ys, local_leader, group=local_group)
 
         # prefill / prompt evaluation stage
         interm_ys = model.forward(interm_ys, seqlens=seqlens, cache=cache)
