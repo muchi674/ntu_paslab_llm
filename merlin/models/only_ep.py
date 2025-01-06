@@ -411,13 +411,10 @@ class MoeLayer(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
+        gate_logits = gate_logits[:, :6]
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        selected_experts = selected_experts % 6
-        for i in range(selected_experts.size(0)):
-            while selected_experts[i,0] == selected_experts[i,1]:
-                val = random.randint(0, 5) 
-                selected_experts[i,1] = val
-
+            
+        
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
