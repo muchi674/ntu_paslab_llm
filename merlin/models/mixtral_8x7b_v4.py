@@ -759,7 +759,7 @@ def get_node_groups(node_id, gpu):
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
     dist.all_gather_into_tensor(global_map, local_map)
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1].tolist()
-    groups["local"] = dist.new_group(ranks_on_node, use_local_synchronization=True)
+    groups["local"] = dist.new_group(ranks_on_node, backend="nccl", use_local_synchronization=True)
 
     # PP communication design:
     # On every node, one process/GPU is assigned as leader for
@@ -778,7 +778,7 @@ def get_node_groups(node_id, gpu):
             pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
             pp_send_group.append(WORLD_RANK)
             print(f"{WORLD_RANK}, {pp_send_group}, here0")
-            groups["send"] = dist.new_group(pp_send_group)
+            groups["send"] = dist.new_group(pp_send_group, backend="nccl")
             print(f"{WORLD_RANK}, here1")
         if ni == node_id:
             prev_node_leader = torch.min(
@@ -787,7 +787,7 @@ def get_node_groups(node_id, gpu):
             pp_recv_group = ranks_on_node + [prev_node_leader]
             groups["prev_node_leader"] = prev_node_leader
             print(f"{WORLD_RANK}, {pp_recv_group}, here2")
-            groups["recv"] = dist.new_group(pp_recv_group)
+            groups["recv"] = dist.new_group(pp_recv_group, backend="nccl")
             print(f"{WORLD_RANK}, here3")
 
         dist.barrier()
