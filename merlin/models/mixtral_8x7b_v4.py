@@ -775,15 +775,13 @@ def get_node_groups(node_id, gpu):
     prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
     pp_recv_group = ranks_on_node + [prev_node_leader]
     groups["prev_node_leader"] = prev_node_leader
-    print(pp_recv_group)
-    groups["recv"] = dist.new_group(pp_recv_group, use_local_synchronization=True)
+    groups["recv"] = dist.new_group(pp_recv_group)
 
     if WORLD_RANK == local_leader:
         next_node = node_id + 1 if node_id != last_node else first_node
         pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
         pp_send_group.append(WORLD_RANK)
-        print(pp_send_group)
-        groups["send"] = dist.new_group(pp_send_group, use_local_synchronization=True)
+        groups["send"] = dist.new_group(pp_send_group)
 
     return groups, node_id == first_node, node_id == last_node
 
