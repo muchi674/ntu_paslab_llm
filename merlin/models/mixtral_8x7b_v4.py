@@ -718,6 +718,9 @@ def generate(
         # prefill / prompt evaluation stage
         interm_ys = model.forward(interm_ys, seqlens=seqlens, cache=cache)
 
+        if WORLD_RANK == local_leader:
+            dist.send(interm_ys, next_node_leader)
+
         # decode
         for ti in range(max_tokens):
             continue_sig = torch.tensor([0], device=model.device)
