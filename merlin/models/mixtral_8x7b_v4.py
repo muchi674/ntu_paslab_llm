@@ -670,7 +670,9 @@ def generate(
                     dist.recv(last_token_prelogits, prev_node_leader)
                 dist.broadcast(last_token_prelogits, local_leader, group=local_group)
 
-            next_token = sample(last_token_prelogits, temperature=temperature)
+            next_token = sample(
+                last_token_prelogits, temperature=temperature, top_p=0.8
+            )
             is_finished = is_finished | (next_token == eos_id).cpu()
 
             if is_finished.all():
