@@ -684,11 +684,9 @@ def generate(
             continue_sig = torch.tensor([1], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            last_token_prelogits = model.forward(
-                next_token, seqlens=[1] * B, cache=cache
-            )
+            interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
-                dist.send(last_token_prelogits, next_node_leader)
+                dist.send(interm_ys, next_node_leader)
 
         generated_tokens: List[List[int]]
         n_gen_tkns = 0
@@ -718,10 +716,11 @@ def generate(
         dist.broadcast(interm_ys, local_leader, group=local_group)
 
         # prefill / prompt evaluation stage
-        interm_ys = model.forward(interm_ys, seqlens=seqlens, cache=cache)
+        # interm_ys.shape could be (n_p_tkns, model.args.vocab_size) if node_id is the last node
+        maybe_prelogits = model.forward(interm_ys, seqlens=seqlens, cache=cache)
 
         if WORLD_RANK == local_leader:
-            dist.send(interm_ys, next_node_leader)
+            dist.send(maybe_prelogits, next_node_leader)
 
         # decode
         for ti in range(max_tokens):
@@ -735,10 +734,10 @@ def generate(
                 dist.recv(interm_ys, prev_node_leader)
             dist.broadcast(interm_ys, local_leader, group=local_group)
 
-            interm_ys = model.forward(interm_ys, seqlens=[1] * B, cache=cache)
+            maybe_prelogits = model.forward(interm_ys, seqlens=[1] * B, cache=cache)
 
             if WORLD_RANK == local_leader:
-                dist.send(interm_ys, next_node_leader)
+                dist.send(maybe_prelogits, next_node_leader)
 
         return (None, None, None, None, None, None)
 
