@@ -648,6 +648,7 @@ def generate(
         )
 
         if WORLD_RANK == local_leader:
+            print(f"\n--------{interm_ys.shape}---------\n")
             dist.send(interm_ys, next_node_leader)
             dist.recv(prelogits, prev_node_leader)
         dist.broadcast(prelogits, local_leader, group=local_group)
@@ -686,6 +687,7 @@ def generate(
 
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
+                print(f"\n--------{interm_ys.shape}---------\n")
                 dist.send(interm_ys, next_node_leader)
 
         generated_tokens: List[List[int]]
@@ -712,6 +714,7 @@ def generate(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
         if WORLD_RANK == local_leader:
+            print(f"\n--------{prefill_interm_ys.shape}---------\n")
             dist.recv(prefill_interm_ys, prev_node_leader)
         dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
 
@@ -734,6 +737,7 @@ def generate(
                 break
 
             if WORLD_RANK == local_leader:
+                print(f"\n--------{decode_interm_ys.shape}---------\n")
                 dist.recv(decode_interm_ys, prev_node_leader)
             dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
