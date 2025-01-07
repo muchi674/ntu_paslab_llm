@@ -797,7 +797,7 @@ def get_node_groups(node_id, gpu):
         pp_send_group.append(local_leader)
         print(f"{WORLD_RANK}, here2")
         pp_send_group = dist.new_group(
-            pp_send_group, backend="nccl", use_local_synchronization=True
+            pp_send_group, backend="nccl"
         )
         dist.barrier()
         print(f"{WORLD_RANK}, here3")
@@ -808,7 +808,7 @@ def get_node_groups(node_id, gpu):
         pp_recv_group = ranks_on_node + [prev_node_leader]
         print(f"{WORLD_RANK}, here4")
         pp_recv_group = dist.new_group(
-            pp_recv_group, backend="nccl", use_local_synchronization=True
+            pp_recv_group, backend="nccl"
         )
         dist.barrier()
         print(f"{WORLD_RANK}, here5")
