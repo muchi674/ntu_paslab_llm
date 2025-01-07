@@ -643,10 +643,11 @@ def generate(
 
         if "send" in groups:
             dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
-        dist.barrier(group=groups["local"])
-        prelogits = torch.zeros(
-            (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
-        )
+        # dist.barrier(group=groups["local"])
+        dist.barrier()
+        # prelogits = torch.zeros(
+        #     (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
+        # )
         # dist.broadcast(prelogits, groups["prev_node_leader"], group=groups["recv"])
 
         # last_positions = torch.tensor(seqlens, device=model.device).cumsum(dim=0) - 1
@@ -715,6 +716,8 @@ def generate(
         )
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+        torch.cuda.synchronize()
+        dist.barrier()
         # if "send" in groups:
         #     dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
 
