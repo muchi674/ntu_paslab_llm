@@ -685,6 +685,8 @@ def generate(
             continue_sig = torch.tensor([1], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
+            print(continue_sig)
+
             # .shape = (B, model.args.dim)
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
@@ -732,6 +734,7 @@ def generate(
         for ti in range(2):
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            print(continue_sig)
 
             if continue_sig[0] == 0:
                 break
