@@ -657,7 +657,6 @@ def generate(
         )
         last_token_prelogits = prelogits.index_select(0, last_positions)
 
-        dist.barrier()
         prefill_time = time.time() - tic
         tic = time.time()
 
@@ -676,14 +675,14 @@ def generate(
             )
             is_finished = is_finished | (next_token == eos_id).cpu()
 
-            if is_finished.all():
-                continue_sig = torch.tensor([0], device=model.device)
-                dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-                break
+            # if is_finished.all():
+            #     continue_sig = torch.tensor([0], device=model.device)
+            #     dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            #     break
 
-            generated_tensors.append(next_token[:, None])
-            continue_sig = torch.tensor([1], device=model.device)
-            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            # generated_tensors.append(next_token[:, None])
+            # continue_sig = torch.tensor([1], device=model.device)
+            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
             # .shape = (B, model.args.dim)
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
@@ -723,18 +722,17 @@ def generate(
 
         if WORLD_RANK == local_leader:
             dist.send(maybe_prelogits, next_node_leader)
-        dist.barrier()
 
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
         # decode
         for ti in range(2):
-            continue_sig = torch.tensor([0], device=model.device)
-            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            # continue_sig = torch.tensor([0], device=model.device)
+            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            if continue_sig[0] == 0:
-                break
+            # if continue_sig[0] == 0:
+            #     break
 
             if WORLD_RANK == local_leader:
                 dist.recv(decode_interm_ys, prev_node_leader)
