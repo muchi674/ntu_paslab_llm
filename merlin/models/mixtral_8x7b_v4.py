@@ -633,7 +633,6 @@ def generate(
 
     if model.args.is_first_node:
         # prefill / prompt evaluation stage
-        print("here0")
         interm_ys = model.forward(
             torch.tensor(
                 sum(encoded_prompts, []), device=model.device, dtype=torch.long
@@ -641,18 +640,14 @@ def generate(
             seqlens=seqlens,
             cache=cache,
         )  # .shape = (n_p_tkns, model.args.dim)
-        print("here1")
 
         if "send" in groups:
-            print("here2")
             dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
-            print("here3")
+        dist.barrier(group=groups["local"])
         prelogits = torch.zeros(
             (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
         )
-        print("here4")
         dist.broadcast(prelogits, groups["prev_node_leader"], group=groups["recv"])
-        print("here5")
 
         last_positions = torch.tensor(seqlens, device=model.device).cumsum(dim=0) - 1
         # .shape = (B, model.args.vocab_size)
@@ -680,22 +675,17 @@ def generate(
                 continue_sig = torch.tensor([0], device=model.device)
                 dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
                 break
-            
-            print("here6")
+
             generated_tensors.append(next_token[:, None])
             continue_sig = torch.tensor([1], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-            print("here7")
 
-            print("here8")
             interm_ys = model.forward(
                 next_token, seqlens=[1] * B, cache=cache
             )  # .shape = (B, model.args.dim)
-            print("here9")
             if "send" in groups:
-                print("here10")
                 dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
-                print("here11")
+            dist.barrier(group=groups["local"])
 
         generated_tokens: List[List[int]]
         n_gen_tkns = 0
@@ -721,48 +711,35 @@ def generate(
         prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
-        print("here0 ")
         dist.broadcast(
             prefill_interm_ys, groups["prev_node_leader"], group=groups["recv"]
         )
-        print("here1 ")
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
-        print("here2 ")
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
-        print("here3 ")
         if "send" in groups:
-            print("here4 ")
             dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
-            print("here5 ")
 
         # decode
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
         for ti in range(max_tokens):
-            print("here6 ")
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
             if continue_sig[0] == 0:
                 break
-            print("here7 ")
 
-            print("here8 ")
             dist.broadcast(
                 decode_interm_ys,
                 groups["prev_node_leader"],
                 group=groups["recv"],
             )
-            print("here9 ")
             # .shape could be (B, model.args.dim) or (B, model.args.vocab_size)
             maybe_prelogits = model.forward(
                 decode_interm_ys, seqlens=[1] * B, cache=cache
             )
-            print("here10 ")
             if "send" in groups:
-                print("here11 ")
                 dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
-                print("here12 ")
 
         return (None, None, None, None, None, None)
 
