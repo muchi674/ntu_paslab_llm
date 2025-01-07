@@ -155,7 +155,7 @@ def main():
     Cmd("tmux set-option -g mouse on")
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
     Cmd("tmux send-keys -t 0 'conda activate merlin' Enter \;")
-    Cmd("tmux send-keys -t 0 'export NCCL_DEBUG=INFO' Enter \;")
+    # Cmd("tmux send-keys -t 0 'export NCCL_DEBUG=INFO' Enter \;")
     Cmd(
         f"tmux send-keys -t 0 '{header}"
         + f"--nnodes={args.nnodes} "

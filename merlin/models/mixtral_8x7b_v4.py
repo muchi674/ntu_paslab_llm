@@ -599,10 +599,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    local_group,
-    local_leader: int,
-    prev_node_leader: int,
-    next_node_leader: int,
+    groups: dict,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -643,18 +640,16 @@ def generate(
             seqlens=seqlens,
             cache=cache,
         )  # .shape = (n_p_tkns, model.args.dim)
+
+        if "send" in groups:
+            dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
         prelogits = torch.zeros(
             (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
         )
+        dist.broadcast(prelogits, groups["prev_node_leader"], group=groups["recv"])
 
-        if WORLD_RANK == local_leader:
-            dist.send(interm_ys, next_node_leader)
-            dist.recv(prelogits, prev_node_leader)
-        dist.broadcast(prelogits, local_leader, group=local_group)
-
-        last_positions = (
-            torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-        )
+        last_positions = torch.tensor(seqlens, device=model.device).cumsum(dim=0) - 1
+        # .shape = (B, model.args.vocab_size)
         last_token_prelogits = prelogits.index_select(0, last_positions)
 
         prefill_time = time.time() - tic
@@ -664,86 +659,86 @@ def generate(
         generated_tensors = []
         is_finished = torch.tensor([False for _ in range(B)])
 
-        for ti in range(2):
+        for ti in range(max_tokens):
             if ti > 0:
-                if WORLD_RANK == local_leader:
-                    dist.recv(last_token_prelogits, prev_node_leader)
-                dist.broadcast(last_token_prelogits, local_leader, group=local_group)
-
-            next_token = sample(
-                last_token_prelogits, temperature=temperature, top_p=0.8
-            )
+                dist.broadcast(
+                    last_token_prelogits,
+                    groups["prev_node_leader"],
+                    group=groups["recv"],
+                )
+            next_token = sample(last_token_prelogits, temperature=temperature)
             is_finished = is_finished | (next_token == eos_id).cpu()
 
-            # if is_finished.all():
-            #     continue_sig = torch.tensor([0], device=model.device)
-            #     dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-            #     break
+            if is_finished.all():
+                continue_sig = torch.tensor([0], device=model.device)
+                dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+                break
 
-            # generated_tensors.append(next_token[:, None])
-            # continue_sig = torch.tensor([1], device=model.device)
-            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            generated_tensors.append(next_token[:, None])
+            continue_sig = torch.tensor([1], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            # .shape = (B, model.args.dim)
-            interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
-            if WORLD_RANK == local_leader:
-                dist.send(interm_ys, next_node_leader)
+            interm_ys = model.forward(
+                next_token, seqlens=[1] * B, cache=cache
+            )  # .shape = (B, model.args.dim)
+            if "send" in groups:
+                dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
 
-        # generated_tokens: List[List[int]]
-        # n_gen_tkns = 0
-        # if generated_tensors:
-        #     generated_tokens = torch.cat(generated_tensors, 1).tolist()
-        #     n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-        # else:
-        #     generated_tokens = []
-        # responses = [tokenizer.decode(y) for y in generated_tokens]
+        generated_tokens: List[List[int]]
+        n_gen_tkns = 0
+        if generated_tensors:
+            generated_tokens = torch.cat(generated_tensors, 1).tolist()
+            n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
+        else:
+            generated_tokens = []
+        responses = [tokenizer.decode(y) for y in generated_tokens]
 
-        # decode_time = time.time() - tic
+        decode_time = time.time() - tic
 
-        # return (
-        #     seqlens,
-        #     responses,
-        #     n_p_tkns,
-        #     prefill_time,
-        #     n_gen_tkns,
-        #     decode_time,
-        # )
+        return (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+        )
     else:
+        # prefill / prompt evaluation stage
         prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
-        if WORLD_RANK == local_leader:
-            dist.recv(prefill_interm_ys, prev_node_leader)
-        dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
-
-        # prefill / prompt evaluation stage
-        # interm_ys.shape could be (n_p_tkns, model.args.vocab_size) if node_id is the last node
+        dist.broadcast(
+            prefill_interm_ys, groups["prev_node_leader"], group=groups["recv"]
+        )
+        # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+        if "send" in groups:
+            dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
 
-        if WORLD_RANK == local_leader:
-            dist.send(maybe_prelogits, next_node_leader)
-
+        # decode
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
-        # decode
-        for ti in range(2):
-            # continue_sig = torch.tensor([0], device=model.device)
-            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+        for ti in range(max_tokens):
+            continue_sig = torch.tensor([0], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            if continue_sig[0] == 0:
+                break
 
-            # if continue_sig[0] == 0:
-            #     break
+            dist.broadcast(
+                decode_interm_ys,
+                groups["prev_node_leader"],
+                group=groups["recv"],
+            )
+            # .shape could be (B, model.args.dim) or (B, model.args.vocab_size)
+            maybe_prelogits = model.forward(
+                decode_interm_ys, seqlens=[1] * B, cache=cache
+            )
+            if "send" in groups:
+                dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
 
-            if WORLD_RANK == local_leader:
-                dist.recv(decode_interm_ys, prev_node_leader)
-            dist.broadcast(decode_interm_ys, local_leader, group=local_group)
-
-            maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
-
-            if WORLD_RANK == local_leader:
-                dist.send(maybe_prelogits, next_node_leader)
-
-        # return (None, None, None, None, None, None)
+        return (None, None, None, None, None, None)
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -768,31 +763,54 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def get_cluster_info(node_id, gpu):
+def get_node_groups(node_id, gpu):
+    # PP communication design:
+    # On every node, one process/GPU is assigned as leader for
+    # sending local group's results to the next PP group/node.
+    # For simplicity,
+    # 1. process/GPU with min(WORLD_RANK) within that node is assigned leader
+    # 2. we assume node_id is assigned sequentially
+
+    groups = {}
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
     dist.all_gather_into_tensor(global_map, local_map)
-    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1].tolist()
-    local_group = dist.new_group(
-        ranks_on_node, backend="nccl", use_local_synchronization=True
-    )
 
-    local_leader = min(ranks_on_node)
     first_node = torch.min(global_map[:, 0]).item()
     last_node = torch.max(global_map[:, 0]).item()
-    prev_node = node_id - 1 if node_id != first_node else last_node
-    next_node = node_id + 1 if node_id != last_node else first_node
-    prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
-    next_node_leader = torch.min(global_map[global_map[:, 0] == next_node][:, 1]).item()
 
-    return (
-        local_group,
-        local_leader,
-        prev_node_leader,
-        next_node_leader,
-        node_id == first_node,
-        node_id == last_node,
-    )
+    for ni in range(first_node, last_node + 1):
+        ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
+        local_group = dist.new_group(
+            ranks_on_node, backend="nccl", use_local_synchronization=True
+        )
+
+        local_leader = min(ranks_on_node)
+        prev_node = ni - 1 if ni != first_node else last_node
+        next_node = ni + 1 if ni != last_node else first_node
+
+        pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
+        pp_send_group.append(local_leader)
+        pp_send_group = dist.new_group(
+            pp_send_group, backend="nccl", use_local_synchronization=True
+        )
+
+        prev_node_leader = torch.min(
+            global_map[global_map[:, 0] == prev_node][:, 1]
+        ).item()
+        pp_recv_group = ranks_on_node + [prev_node_leader]
+        pp_recv_group = dist.new_group(
+            pp_recv_group, backend="nccl", use_local_synchronization=True
+        )
+
+        if node_id == ni:
+            groups["local"] = local_group
+            groups["prev_node_leader"] = prev_node_leader
+            groups["recv"] = pp_recv_group
+            if WORLD_RANK == local_leader:
+                groups["send"] = pp_send_group
+
+    return groups, node_id == first_node, node_id == last_node
 
 
 def main(
@@ -819,21 +837,13 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    (
-        local_group,
-        local_leader,
-        prev_node_leader,
-        next_node_leader,
-        is_first_node,
-        is_last_node,
-    ) = get_cluster_info(node_id, gpu)
-
+    groups, is_first_node, is_last_node = get_node_groups(node_id, gpu)
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
         model_path=Path(model_path),
         node_id=node_id,
         gpu=gpu,
-        group=local_group,
+        group=groups["local"],
         is_first_node=is_first_node,
         is_last_node=is_last_node,
     )
@@ -843,82 +853,76 @@ def main(
         ["hello, how are you?"],
         tokenizer,
         model,
-        local_group,
-        local_leader,
-        prev_node_leader,
-        next_node_leader,
+        groups,
         max_tokens=128,
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    # torch.cuda.cudart().cudaProfilerStart()
-    # prefill_tps = []
-    # decode_tps = []
-    # start = 0
-    # for end in range(batch_size, n_prompts + 1, batch_size):
-    #     prompt_batch = prompts[start:end]
-    #     (
-    #         seqlens,
-    #         responses,
-    #         n_p_tkns,
-    #         prefill_time,
-    #         n_gen_tkns,
-    #         decode_time,
-    #     ) = generate(
-    #         prompt_batch,
-    #         tokenizer,
-    #         model,
-    #         local_group,
-    #         local_leader,
-    #         prev_node_leader,
-    #         next_node_leader,
-    #         max_tokens=max_tokens,
-    #         max_batch_size=len(prompt_batch),
-    #         # temperature=0,
-    #         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-    #     )
+    torch.cuda.cudart().cudaProfilerStart()
+    prefill_tps = []
+    decode_tps = []
+    start = 0
+    for end in range(batch_size, n_prompts + 1, batch_size):
+        prompt_batch = prompts[start:end]
+        (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+        ) = generate(
+            prompt_batch,
+            tokenizer,
+            model,
+            groups,
+            max_tokens=max_tokens,
+            max_batch_size=len(prompt_batch),
+            # temperature=0,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        )
 
-    #     if WORLD_RANK == 0:
-    #         prefill_tp = n_p_tkns / prefill_time
-    #         decode_tp = n_gen_tkns / decode_time
-    #         prefill_tps.append(prefill_tp)
-    #         decode_tps.append(decode_tp)
+        if WORLD_RANK == 0:
+            prefill_tp = n_p_tkns / prefill_time
+            decode_tp = n_gen_tkns / decode_time
+            prefill_tps.append(prefill_tp)
+            decode_tps.append(decode_tp)
 
-    #         print("=" * 20)
-    #         print("PERFORMANCE BREAKDOWN\n")
-    #         print("PROMPT EVALUATION:")
-    #         print(f"token count: {n_p_tkns}")
-    #         print(f"total time in sec(s): {prefill_time:.2f}")
-    #         print(f"throughput: {prefill_tp:.2f} t/s")
-    #         print("TOKEN GENERATION:")
-    #         print(f"token count: {n_gen_tkns}")
-    #         print(f"total time in sec(s): {decode_time:.2f}")
-    #         if n_gen_tkns > 0:
-    #             print(f"throughput: {decode_tp:.2f} t/s")
-    #         else:
-    #             responses = ["" for _ in prompt_batch]
-    #         if not hide_resp:
-    #             print("=" * 20)
-    #             print("INS-N-OUTS")
-    #             print(f"AVG seqlen: {mean(seqlens)}")
-    #             print(f"seqlens: {seqlens}\n")
-    #             for p, resp in zip(prompt_batch, responses):
-    #                 print(f"PROMPT:\n{p}")
-    #                 print(f"RESPONSE:\n{resp}\n")
+            print("=" * 20)
+            print("PERFORMANCE BREAKDOWN\n")
+            print("PROMPT EVALUATION:")
+            print(f"token count: {n_p_tkns}")
+            print(f"total time in sec(s): {prefill_time:.2f}")
+            print(f"throughput: {prefill_tp:.2f} t/s")
+            print("TOKEN GENERATION:")
+            print(f"token count: {n_gen_tkns}")
+            print(f"total time in sec(s): {decode_time:.2f}")
+            if n_gen_tkns > 0:
+                print(f"throughput: {decode_tp:.2f} t/s")
+            else:
+                responses = ["" for _ in prompt_batch]
+            if not hide_resp:
+                print("=" * 20)
+                print("INS-N-OUTS")
+                print(f"AVG seqlen: {mean(seqlens)}")
+                print(f"seqlens: {seqlens}\n")
+                for p, resp in zip(prompt_batch, responses):
+                    print(f"PROMPT:\n{p}")
+                    print(f"RESPONSE:\n{resp}\n")
 
-    #     start = end
+        start = end
 
-    # if WORLD_RANK == 0:
-    #     print("=" * 20)
-    #     print("RUN STATISTICS")
-    #     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-    #     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if WORLD_RANK == 0:
+        print("=" * 20)
+        print("RUN STATISTICS")
+        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-    # torch.cuda.cudart().cudaProfilerStop()
-    # dist.barrier()
-    # dist.destroy_process_group()
+    torch.cuda.cudart().cudaProfilerStop()
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
