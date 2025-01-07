@@ -475,9 +475,13 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        print("before attn")
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        print("after attn")
         h = x + r
+        print("before ffn")
         r = self.feed_forward.forward(self.ffn_norm(h))
+        print("after ffn")
         out = h + r
         return out
 
@@ -814,6 +818,7 @@ def get_node_groups(node_id, gpu):
         dist.barrier()
 
         if node_id == ni:
+            print(ranks_on_node)
             groups["local"] = local_group
             groups["prev_node_leader"] = prev_node_leader
             groups["recv"] = pp_recv_group
