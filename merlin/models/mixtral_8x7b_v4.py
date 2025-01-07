@@ -784,7 +784,7 @@ def get_node_groups(node_id, gpu):
         ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
         print(f"{WORLD_RANK}, here0")
         local_group = dist.new_group(
-            ranks_on_node, backend="nccl", use_local_synchronization=True
+            ranks_on_node, backend="nccl"
         )
         dist.barrier()
         print(f"{WORLD_RANK}, here1")
