@@ -649,8 +649,7 @@ def generate(
 
         if WORLD_RANK == local_leader:
             dist.send(interm_ys, next_node_leader)
-            r = dist.recv(prelogits, prev_node_leader)
-            print(f"received from {r}")
+            dist.recv(prelogits, prev_node_leader)
         dist.broadcast(prelogits, local_leader, group=local_group)
 
         last_positions = (
@@ -658,39 +657,40 @@ def generate(
         )
         last_token_prelogits = prelogits.index_select(0, last_positions)
 
-        print(last_token_prelogits.shape)
-
         prefill_time = time.time() - tic
         tic = time.time()
 
-        # # decode
-        # generated_tensors = []
-        # is_finished = torch.tensor([False for _ in range(B)])
+        # decode
+        generated_tensors = []
+        is_finished = torch.tensor([False for _ in range(B)])
 
-        # for ti in range(max_tokens):
-        #     if ti > 0:
-        #         if WORLD_RANK == local_leader:
-        #             print(last_token_prelogits.shape)
-        #             dist.recv(last_token_prelogits, prev_node_leader)
-        #         dist.broadcast(last_token_prelogits, local_leader, group=local_group)
+        for ti in range(2):
+            if ti > 0:
+                if WORLD_RANK == local_leader:
+                    print(last_token_prelogits.shape)
+                    r = dist.recv(last_token_prelogits, prev_node_leader)
+                    print(f"received from {r}")
+                dist.broadcast(last_token_prelogits, local_leader, group=local_group)
+                break
 
-        #     next_token = sample(
-        #         last_token_prelogits, temperature=temperature, top_p=0.8
-        #     )
-        #     is_finished = is_finished | (next_token == eos_id).cpu()
+            next_token = sample(
+                last_token_prelogits, temperature=temperature, top_p=0.8
+            )
+            is_finished = is_finished | (next_token == eos_id).cpu()
 
-        #     if is_finished.all():
-        #         continue_sig = torch.tensor([0], device=model.device)
-        #         dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-        #         break
+            if is_finished.all():
+                continue_sig = torch.tensor([0], device=model.device)
+                dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+                break
 
-        #     generated_tensors.append(next_token[:, None])
-        #     continue_sig = torch.tensor([1], device=model.device)
-        #     dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            generated_tensors.append(next_token[:, None])
+            continue_sig = torch.tensor([1], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-        #     interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        #     if WORLD_RANK == local_leader:
-        #         dist.send(interm_ys, next_node_leader)
+            # .shape = (B, model.args.dim)
+            interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
+            if WORLD_RANK == local_leader:
+                dist.send(interm_ys, next_node_leader)
 
         # generated_tokens: List[List[int]]
         # n_gen_tkns = 0
@@ -716,8 +716,7 @@ def generate(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
         if WORLD_RANK == local_leader:
-            r = dist.recv(prefill_interm_ys, prev_node_leader)
-            print(f"received from {r}")
+            dist.recv(prefill_interm_ys, prev_node_leader)
         dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
 
         # prefill / prompt evaluation stage
@@ -727,26 +726,27 @@ def generate(
         if WORLD_RANK == local_leader:
             dist.send(maybe_prelogits, next_node_leader)
 
-        # decode_interm_ys = torch.zeros(
-        #     (B, model.args.dim), dtype=model.dtype, device=model.device
-        # )
-        # # decode
-        # for ti in range(max_tokens):
-        #     continue_sig = torch.tensor([0], device=model.device)
-        #     dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+        decode_interm_ys = torch.zeros(
+            (B, model.args.dim), dtype=model.dtype, device=model.device
+        )
+        # decode
+        for ti in range(1):
+            continue_sig = torch.tensor([0], device=model.device)
+            dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-        #     if continue_sig[0] == 0:
-        #         break
+            if continue_sig[0] == 0:
+                break
 
-        #     if WORLD_RANK == local_leader:
-        #         dist.recv(decode_interm_ys, prev_node_leader)
-        #     dist.broadcast(decode_interm_ys, local_leader, group=local_group)
+            if WORLD_RANK == local_leader:
+                r = dist.recv(decode_interm_ys, prev_node_leader)
+                print(f"received from {r}")
+            dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
-        #     maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
+            maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
 
-        #     if WORLD_RANK == local_leader:
-        #         print(maybe_prelogits.shape)
-        #         dist.send(maybe_prelogits, next_node_leader)
+            if WORLD_RANK == local_leader:
+                print(maybe_prelogits.shape)
+                dist.send(maybe_prelogits, next_node_leader)
 
         # return (None, None, None, None, None, None)
 
@@ -842,8 +842,6 @@ def main(
         is_first_node=is_first_node,
         is_last_node=is_last_node,
     )
-
-    print(local_leader, prev_node_leader, next_node_leader)
 
     # warmup
     generate(
