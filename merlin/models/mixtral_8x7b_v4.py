@@ -780,10 +780,13 @@ def get_node_groups(node_id, gpu):
     last_node = torch.max(global_map[:, 0]).item()
 
     for ni in range(first_node, last_node + 1):
+        print(f"world rank: {WORLD_RANK}, ni: {ni}")
         ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
+        print(f"{WORLD_RANK}, here0")
         local_group = dist.new_group(
             ranks_on_node, backend="nccl", use_local_synchronization=True
         )
+        print(f"{WORLD_RANK}, here1")
 
         local_leader = min(ranks_on_node)
         prev_node = ni - 1 if ni != first_node else last_node
@@ -791,17 +794,21 @@ def get_node_groups(node_id, gpu):
 
         pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
         pp_send_group.append(local_leader)
+        print(f"{WORLD_RANK}, here2")
         pp_send_group = dist.new_group(
             pp_send_group, backend="nccl", use_local_synchronization=True
         )
+        print(f"{WORLD_RANK}, here3")
 
         prev_node_leader = torch.min(
             global_map[global_map[:, 0] == prev_node][:, 1]
         ).item()
         pp_recv_group = ranks_on_node + [prev_node_leader]
+        print(f"{WORLD_RANK}, here4")
         pp_recv_group = dist.new_group(
             pp_recv_group, backend="nccl", use_local_synchronization=True
         )
+        print(f"{WORLD_RANK}, here5")
 
         if node_id == ni:
             groups["local"] = local_group
