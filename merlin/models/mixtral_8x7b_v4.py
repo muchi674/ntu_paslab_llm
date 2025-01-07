@@ -657,6 +657,7 @@ def generate(
         )
         last_token_prelogits = prelogits.index_select(0, last_positions)
 
+        dist.barrier()
         prefill_time = time.time() - tic
         tic = time.time()
 
@@ -668,7 +669,6 @@ def generate(
             if ti > 0:
                 if WORLD_RANK == local_leader:
                     dist.recv(last_token_prelogits, prev_node_leader)
-                    print(f"{ti} recv")
                 dist.broadcast(last_token_prelogits, local_leader, group=local_group)
 
             next_token = sample(
@@ -685,12 +685,9 @@ def generate(
             continue_sig = torch.tensor([1], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            print(continue_sig)
-
             # .shape = (B, model.args.dim)
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
-                print(f"{ti} send")
                 dist.send(interm_ys, next_node_leader)
 
         # generated_tokens: List[List[int]]
@@ -726,6 +723,7 @@ def generate(
 
         if WORLD_RANK == local_leader:
             dist.send(maybe_prelogits, next_node_leader)
+        dist.barrier()
 
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
@@ -734,22 +732,18 @@ def generate(
         for ti in range(2):
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-            print(continue_sig)
 
             if continue_sig[0] == 0:
                 break
 
             if WORLD_RANK == local_leader:
                 dist.recv(decode_interm_ys, prev_node_leader)
-                print(decode_interm_ys)
-                print(f"{ti} recv")
             dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
             maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
 
             if WORLD_RANK == local_leader:
                 dist.send(maybe_prelogits, next_node_leader)
-                print(f"{ti} send")
 
         # return (None, None, None, None, None, None)
 
