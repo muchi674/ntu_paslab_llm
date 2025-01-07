@@ -633,6 +633,7 @@ def generate(
 
     if model.args.is_first_node:
         # prefill / prompt evaluation stage
+        print("here0")
         interm_ys = model.forward(
             torch.tensor(
                 sum(encoded_prompts, []), device=model.device, dtype=torch.long
@@ -640,10 +641,15 @@ def generate(
             seqlens=seqlens,
             cache=cache,
         )  # .shape = (n_p_tkns, model.args.dim)
+        print("here1")
 
         if "send" in groups:
+            print("here2")
             dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
-        # dist.barrier(group=groups["local"])
+            print("here3")
+        print("here4")
+        dist.barrier(group=groups["local"])
+        print("here5")
         # prelogits = torch.zeros(
         #     (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
         # )
@@ -710,12 +716,16 @@ def generate(
         prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
+        print("here0")
         dist.broadcast(
             prefill_interm_ys, groups["prev_node_leader"], group=groups["recv"]
         )
+        print("here1")
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+        print("here2")
         torch.cuda.synchronize()
+        print("here3")
         # if "send" in groups:
         #     dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
 
