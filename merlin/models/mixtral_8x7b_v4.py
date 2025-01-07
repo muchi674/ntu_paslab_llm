@@ -786,6 +786,7 @@ def get_node_groups(node_id, gpu):
         local_group = dist.new_group(
             ranks_on_node, backend="nccl", use_local_synchronization=True
         )
+        dist.barrier()
         print(f"{WORLD_RANK}, here1")
 
         local_leader = min(ranks_on_node)
@@ -798,6 +799,7 @@ def get_node_groups(node_id, gpu):
         pp_send_group = dist.new_group(
             pp_send_group, backend="nccl", use_local_synchronization=True
         )
+        dist.barrier()
         print(f"{WORLD_RANK}, here3")
 
         prev_node_leader = torch.min(
@@ -808,6 +810,7 @@ def get_node_groups(node_id, gpu):
         pp_recv_group = dist.new_group(
             pp_recv_group, backend="nccl", use_local_synchronization=True
         )
+        dist.barrier()
         print(f"{WORLD_RANK}, here5")
 
         if node_id == ni:
@@ -816,8 +819,6 @@ def get_node_groups(node_id, gpu):
             groups["recv"] = pp_recv_group
             if WORLD_RANK == local_leader:
                 groups["send"] = pp_send_group
-
-        dist.barrier()
 
     return groups, node_id == first_node, node_id == last_node
 
