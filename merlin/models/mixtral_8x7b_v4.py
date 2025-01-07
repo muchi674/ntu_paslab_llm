@@ -741,6 +741,7 @@ def generate(
 
             if WORLD_RANK == local_leader:
                 dist.recv(decode_interm_ys, prev_node_leader)
+                print(decode_interm_ys)
                 print(f"{ti} recv")
             dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
