@@ -666,6 +666,7 @@ def generate(
         is_finished = torch.tensor([False for _ in range(B)])
 
         for ti in range(max_tokens):
+            print(f"at ti: {ti}")
             if ti > 0:
                 dist.broadcast(
                     last_token_prelogits,
@@ -720,35 +721,48 @@ def generate(
         prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
+        print("here0 ")
         dist.broadcast(
             prefill_interm_ys, groups["prev_node_leader"], group=groups["recv"]
         )
+        print("here1 ")
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
+        print("here2 ")
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+        print("here3 ")
         if "send" in groups:
+            print("here4 ")
             dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
+            print("here5 ")
 
         # decode
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
         for ti in range(max_tokens):
+            print("here6 ")
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
             if continue_sig[0] == 0:
                 break
+            print("here7 ")
 
+            print("here8 ")
             dist.broadcast(
                 decode_interm_ys,
                 groups["prev_node_leader"],
                 group=groups["recv"],
             )
+            print("here9 ")
             # .shape could be (B, model.args.dim) or (B, model.args.vocab_size)
             maybe_prelogits = model.forward(
                 decode_interm_ys, seqlens=[1] * B, cache=cache
             )
+            print("here10 ")
             if "send" in groups:
+                print("here11 ")
                 dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
+                print("here12 ")
 
         return (None, None, None, None, None, None)
 
