@@ -652,8 +652,7 @@ def generate(
             dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
             print("here3")
         print("here4")
-        dist.barrier(group=groups["local"])
-        print("here5")
+        # dist.barrier(group=groups["local"])
         # prelogits = torch.zeros(
         #     (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
         # )
@@ -728,8 +727,6 @@ def generate(
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
         print("here2")
-        dist.barrier(group=groups["local"])
-        print("here3")
         # if "send" in groups:
         #     dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
 
