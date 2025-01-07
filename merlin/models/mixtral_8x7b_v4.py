@@ -652,6 +652,7 @@ def generate(
         last_positions = torch.tensor(seqlens, device=model.device).cumsum(dim=0) - 1
         # .shape = (B, model.args.vocab_size)
         last_token_prelogits = prelogits.index_select(0, last_positions)
+        print(last_token_prelogits)
 
         prefill_time = time.time() - tic
         tic = time.time()
@@ -661,7 +662,6 @@ def generate(
         is_finished = torch.tensor([False for _ in range(B)])
 
         for ti in range(max_tokens):
-            print(f"at ti: {ti}")
             if ti > 0:
                 dist.broadcast(
                     last_token_prelogits,
@@ -711,35 +711,46 @@ def generate(
         prefill_interm_ys = torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
+        print(f"{WORLD_RANK}, here0 ")
         dist.broadcast(
             prefill_interm_ys, groups["prev_node_leader"], group=groups["recv"]
         )
+        print(f"{WORLD_RANK}, here1 ")
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+        print(f"{WORLD_RANK}, here2 ")
         if "send" in groups:
+            print(f"{WORLD_RANK}, here3 ")
             dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
+            print(f"{WORLD_RANK}, here4 ")
 
         # decode
         decode_interm_ys = torch.zeros(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
         for ti in range(max_tokens):
+            print(f"{WORLD_RANK}, here5 ")
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
             if continue_sig[0] == 0:
                 break
+            print(f"{WORLD_RANK}, here6 ")
 
             dist.broadcast(
                 decode_interm_ys,
                 groups["prev_node_leader"],
                 group=groups["recv"],
             )
+            print(f"{WORLD_RANK}, here7 ")
             # .shape could be (B, model.args.dim) or (B, model.args.vocab_size)
             maybe_prelogits = model.forward(
                 decode_interm_ys, seqlens=[1] * B, cache=cache
             )
+            print(f"{WORLD_RANK}, here8 ")
             if "send" in groups:
+                print(f"{WORLD_RANK}, here9 ")
                 dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
+                print(f"{WORLD_RANK}, here10 ")
 
         return (None, None, None, None, None, None)
 
@@ -838,7 +849,6 @@ def main(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
     groups, is_first_node, is_last_node = get_node_groups(node_id, gpu)
-    print(WORLD_RANK)
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
         model_path=Path(model_path),
