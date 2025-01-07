@@ -633,6 +633,7 @@ def generate(
 
     if model.args.is_first_node:
         # prefill / prompt evaluation stage
+        print("here0")
         interm_ys = model.forward(
             torch.tensor(
                 sum(encoded_prompts, []), device=model.device, dtype=torch.long
@@ -640,13 +641,18 @@ def generate(
             seqlens=seqlens,
             cache=cache,
         )  # .shape = (n_p_tkns, model.args.dim)
+        print("here1")
 
         if "send" in groups:
+            print("here2")
             dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
+            print("here3")
         prelogits = torch.zeros(
             (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
         )
+        print("here4")
         dist.broadcast(prelogits, groups["prev_node_leader"], group=groups["recv"])
+        print("here5")
 
         last_positions = torch.tensor(seqlens, device=model.device).cumsum(dim=0) - 1
         # .shape = (B, model.args.vocab_size)
@@ -673,16 +679,22 @@ def generate(
                 continue_sig = torch.tensor([0], device=model.device)
                 dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
                 break
-
+            
+            print("here6")
             generated_tensors.append(next_token[:, None])
             continue_sig = torch.tensor([1], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
+            print("here7")
 
+            print("here8")
             interm_ys = model.forward(
                 next_token, seqlens=[1] * B, cache=cache
             )  # .shape = (B, model.args.dim)
+            print("here9")
             if "send" in groups:
+                print("here10")
                 dist.broadcast(interm_ys, WORLD_RANK, group=groups["send"])
+                print("here11")
 
         generated_tokens: List[List[int]]
         n_gen_tkns = 0
@@ -780,14 +792,9 @@ def get_node_groups(node_id, gpu):
     last_node = torch.max(global_map[:, 0]).item()
 
     for ni in range(first_node, last_node + 1):
-        print(f"world rank: {WORLD_RANK}, ni: {ni}")
         ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
-        print(f"{WORLD_RANK}, here0")
-        local_group = dist.new_group(
-            ranks_on_node, backend="nccl"
-        )
+        local_group = dist.new_group(ranks_on_node, backend="nccl")
         dist.barrier()
-        print(f"{WORLD_RANK}, here1")
 
         local_leader = min(ranks_on_node)
         prev_node = ni - 1 if ni != first_node else last_node
@@ -795,23 +802,15 @@ def get_node_groups(node_id, gpu):
 
         pp_send_group = global_map[global_map[:, 0] == next_node][:, 1].tolist()
         pp_send_group.append(local_leader)
-        print(f"{WORLD_RANK}, here2")
-        pp_send_group = dist.new_group(
-            pp_send_group, backend="nccl"
-        )
+        pp_send_group = dist.new_group(pp_send_group, backend="nccl")
         dist.barrier()
-        print(f"{WORLD_RANK}, here3")
 
         prev_node_leader = torch.min(
             global_map[global_map[:, 0] == prev_node][:, 1]
         ).item()
         pp_recv_group = ranks_on_node + [prev_node_leader]
-        print(f"{WORLD_RANK}, here4")
-        pp_recv_group = dist.new_group(
-            pp_recv_group, backend="nccl"
-        )
+        pp_recv_group = dist.new_group(pp_recv_group, backend="nccl")
         dist.barrier()
-        print(f"{WORLD_RANK}, here5")
 
         if node_id == ni:
             groups["local"] = local_group
@@ -848,6 +847,7 @@ def main(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
     groups, is_first_node, is_last_node = get_node_groups(node_id, gpu)
+    print(WORLD_RANK)
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
         model_path=Path(model_path),
