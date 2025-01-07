@@ -817,6 +817,8 @@ def get_node_groups(node_id, gpu):
             if WORLD_RANK == local_leader:
                 groups["send"] = pp_send_group
 
+        dist.barrier()
+
     return groups, node_id == first_node, node_id == last_node
 
 
