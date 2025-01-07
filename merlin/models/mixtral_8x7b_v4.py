@@ -728,7 +728,7 @@ def generate(
         # .shape could be (n_p_tkns, model.args.dim) or (n_p_tkns, model.args.vocab_size)
         maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
         print("here2")
-        torch.cuda.synchronize()
+        dist.barrier(group=groups["local"])
         print("here3")
         # if "send" in groups:
         #     dist.broadcast(maybe_prelogits, WORLD_RANK, group=groups["send"])
@@ -818,7 +818,6 @@ def get_node_groups(node_id, gpu):
         dist.barrier()
 
         if node_id == ni:
-            print(ranks_on_node)
             groups["local"] = local_group
             groups["prev_node_leader"] = prev_node_leader
             groups["recv"] = pp_recv_group
