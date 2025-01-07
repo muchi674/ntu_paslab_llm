@@ -667,11 +667,9 @@ def generate(
         for ti in range(2):
             if ti > 0:
                 if WORLD_RANK == local_leader:
-                    print(last_token_prelogits.shape)
-                    r = dist.recv(last_token_prelogits, prev_node_leader)
-                    print(f"received from {r}")
+                    dist.recv(last_token_prelogits, prev_node_leader)
+                    print(f"{ti} recv")
                 dist.broadcast(last_token_prelogits, local_leader, group=local_group)
-                break
 
             next_token = sample(
                 last_token_prelogits, temperature=temperature, top_p=0.8
@@ -690,6 +688,7 @@ def generate(
             # .shape = (B, model.args.dim)
             interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
             if WORLD_RANK == local_leader:
+                print(f"{ti} send")
                 dist.send(interm_ys, next_node_leader)
 
         # generated_tokens: List[List[int]]
@@ -730,7 +729,7 @@ def generate(
             (B, model.args.dim), dtype=model.dtype, device=model.device
         )
         # decode
-        for ti in range(1):
+        for ti in range(2):
             continue_sig = torch.tensor([0], device=model.device)
             dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
@@ -738,15 +737,15 @@ def generate(
                 break
 
             if WORLD_RANK == local_leader:
-                r = dist.recv(decode_interm_ys, prev_node_leader)
-                print(f"received from {r}")
+                dist.recv(decode_interm_ys, prev_node_leader)
+                print(f"{ti} recv")
             dist.broadcast(decode_interm_ys, local_leader, group=local_group)
 
             maybe_prelogits = model.forward(decode_interm_ys, seqlens=[1] * B, cache=cache)
 
             if WORLD_RANK == local_leader:
-                print(maybe_prelogits.shape)
                 dist.send(maybe_prelogits, next_node_leader)
+                print(f"{ti} send")
 
         # return (None, None, None, None, None, None)
 
