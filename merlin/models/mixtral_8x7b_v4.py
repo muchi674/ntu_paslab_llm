@@ -386,14 +386,16 @@ class Attention(nn.Module):
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
         output: torch.Tensor = self.wo(output)
-        # all_reduce is not used to prevent hangs
-        local_world_out = torch.zeros(
-            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-        return torch.sum(local_world_out, dim=0)
+        # # all_reduce is not used to prevent hangs
+        # local_world_out = torch.zeros(
+        #     (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+        #     dtype=output.dtype,
+        #     device=output.device,
+        # )
+        # dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+        # return torch.sum(local_world_out, dim=0)
+
+        return output
 
 
 class Experts:
