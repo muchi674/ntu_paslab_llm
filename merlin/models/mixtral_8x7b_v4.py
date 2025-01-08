@@ -834,6 +834,7 @@ def main(
         is_first_node,
         is_last_node,
     ) = get_cluster_info(node_id, gpu)
+    print(WORLD_RANK)
 
     # tokenizer = MistralTokenizer.v1()
     # model = Transformer.load(
@@ -924,8 +925,8 @@ def main(
     #     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     # torch.cuda.cudart().cudaProfilerStop()
-    # dist.barrier()
-    # dist.destroy_process_group()
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
