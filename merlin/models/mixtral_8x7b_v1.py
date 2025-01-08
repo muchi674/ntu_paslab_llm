@@ -417,14 +417,8 @@ class MoeLayer(nn.Module):
         self.decode_comp_time = []
         self.decode_comm_time = []
 
-    def forward(self, inputs: torch.Tensor, is_prefill: bool, need_profile: bool) -> torch.Tensor:
-        # computation
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-        gate_logits = self.gate(inputs)
-        
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        gate_logits = self.gate(inputs)[:, 3:]
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
