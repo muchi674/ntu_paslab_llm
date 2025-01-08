@@ -586,11 +586,11 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        # adjust for tensor parallel attention
-        assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
-        assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
-        model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
-        model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
+        # # adjust for tensor parallel attention
+        # assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
+        # assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+        # model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
+        # model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
 
         # find PP range
         lis = [int(k.split(".")[0]) for k in experts]
