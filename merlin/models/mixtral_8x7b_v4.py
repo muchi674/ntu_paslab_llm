@@ -79,8 +79,6 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
-    is_first_node: bool = None
-    is_last_node: bool = None
     first_layer: int = None
     last_layer: int = None
     n_assigned_layers: int = None
@@ -483,19 +481,27 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, group):
+    def __init__(self, args: ModelArgs, experts: Experts, comms: tuple):
         super().__init__()
         self.args = args
+        (
+            self.local_group,
+            self.local_leader,
+            self.prev_node_leader,
+            self.next_node_leader,
+            self.is_first_node,
+            self.is_last_node,
+        ) = comms
         self._precomputed_freqs_cis: torch.Tensor = None
-        if args.is_first_node:
+        if self.is_first_node:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        elif args.is_last_node:  # assumes inter-node PP
+        elif self.is_last_node:  # assumes inter-node PP
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=group
+                    args=args, li=li, experts=experts, group=self.local_group
                 )
                 for li in range(args.first_layer, args.last_layer + 1)
             }
@@ -535,8 +541,12 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         input_metadata = cache.get_input_metadata(seqlens)
         h = xs
-        if self.args.is_first_node:
+        if self.is_first_node:
             h = self.tok_embeddings(h)
+        else:
+            if WORLD_RANK == self.local_leader:
+                dist.recv(h, self.prev_node_leader)
+            dist.broadcast(h, self.local_leader, group=self.local_group)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for li in range(self.args.first_layer, self.args.last_layer + 1):
@@ -544,18 +554,23 @@ class Transformer(nn.Module):
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
         cache.update_seqlens(seqlens)
-        if self.args.is_last_node:
-            return self.output(self.norm(h)).to(torch.float32)
-        return h
+        ys: torch.Tensor
+        if self.is_last_node:
+            ys = self.output(self.norm(h))
+        else:
+            if WORLD_RANK == self.local_leader:
+                dist.send(h, self.next_node_leader)
+            ys = torch.zeros(
+                (xs.shape[0], self.args.vocab_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        dist.broadcast(ys, WORLD_SIZE - 1)
+        return ys.to(torch.float32)
 
     @staticmethod
     def load(
-        model_path: Path,
-        node_id: int,
-        gpu: torch.device,
-        group,
-        is_first_node: bool,
-        is_last_node: bool,
+        model_path: Path, node_id: int, gpu: torch.device, comms: tuple
     ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
@@ -578,8 +593,6 @@ class Transformer(nn.Module):
         model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
 
         # find PP range
-        model_args.is_first_node = is_first_node
-        model_args.is_last_node = is_last_node
         lis = [int(k.split(".")[0]) for k in experts]
         model_args.first_layer = min(lis)
         model_args.last_layer = max(lis)
@@ -588,7 +601,7 @@ class Transformer(nn.Module):
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), group=group)
+            model = Transformer(args=model_args, experts=Experts(experts), comms=comms)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -599,10 +612,6 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    local_group,
-    local_leader: int,
-    prev_node_leader: int,
-    next_node_leader: int,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -634,118 +643,59 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
-    if model.args.is_first_node:
-        # prefill / prompt evaluation stage
-        interm_ys = model.forward(
-            torch.tensor(
-                sum(encoded_prompts, []), device=model.device, dtype=torch.long
-            ),
-            seqlens=seqlens,
-            cache=cache,
-        )  # .shape = (n_p_tkns, model.args.dim)
-        prelogits = torch.zeros(
-            (n_p_tkns, model.args.vocab_size), dtype=model.dtype, device=model.device
-        )
-
-        if WORLD_RANK == local_leader:
-            dist.send(interm_ys, next_node_leader)
-            dist.recv(prelogits, prev_node_leader)
-        dist.broadcast(prelogits, local_leader, group=local_group)
-
-        last_positions = (
-            torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-        )
-        last_token_prelogits = prelogits.index_select(0, last_positions)
-
-        prefill_time = time.time() - tic
-        tic = time.time()
-
-        # decode
-        generated_tensors = []
-        is_finished = torch.tensor([False for _ in range(B)])
-
-        for ti in range(2):
-            if ti > 0:
-                if WORLD_RANK == local_leader:
-                    dist.recv(last_token_prelogits, prev_node_leader)
-                dist.broadcast(last_token_prelogits, local_leader, group=local_group)
-
-            next_token = sample(
-                last_token_prelogits, temperature=temperature, top_p=0.8
-            )
-            is_finished = is_finished | (next_token == eos_id).cpu()
-
-            # if is_finished.all():
-            #     continue_sig = torch.tensor([0], device=model.device)
-            #     dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-            #     break
-
-            # generated_tensors.append(next_token[:, None])
-            # continue_sig = torch.tensor([1], device=model.device)
-            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
-
-            # .shape = (B, model.args.dim)
-            interm_ys = model.forward(next_token, seqlens=[1] * B, cache=cache)
-            if WORLD_RANK == local_leader:
-                dist.send(interm_ys, next_node_leader)
-
-        # generated_tokens: List[List[int]]
-        # n_gen_tkns = 0
-        # if generated_tensors:
-        #     generated_tokens = torch.cat(generated_tensors, 1).tolist()
-        #     n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
-        # else:
-        #     generated_tokens = []
-        # responses = [tokenizer.decode(y) for y in generated_tokens]
-
-        # decode_time = time.time() - tic
-
-        # return (
-        #     seqlens,
-        #     responses,
-        #     n_p_tkns,
-        #     prefill_time,
-        #     n_gen_tkns,
-        #     decode_time,
-        # )
-    else:
-        prefill_interm_ys = torch.zeros(
+    # prefill / prompt evaluation stage
+    prefill_xs = (
+        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long)
+        if model.is_first_node
+        else torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
-        if WORLD_RANK == local_leader:
-            dist.recv(prefill_interm_ys, prev_node_leader)
-        dist.broadcast(prefill_interm_ys, local_leader, group=local_group)
+    )
+    prelogits = model.forward(prefill_xs, seqlens=seqlens, cache=cache)
+    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+    last_token_prelogits = prelogits.index_select(0, last_positions)
 
-        # prefill / prompt evaluation stage
-        # interm_ys.shape could be (n_p_tkns, model.args.vocab_size) if node_id is the last node
-        maybe_prelogits = model.forward(prefill_interm_ys, seqlens=seqlens, cache=cache)
+    prefill_time = time.time() - tic
+    tic = time.time()
 
-        if WORLD_RANK == local_leader:
-            dist.send(maybe_prelogits, next_node_leader)
+    # decode
+    decode_xs = torch.zeros((B, model.args.dim), dtype=model.dtype, device=model.device)
+    generated_tensors = []
+    is_finished = torch.tensor([False for _ in range(B)])
 
-        decode_interm_ys = torch.zeros(
-            (B, model.args.dim), dtype=model.dtype, device=model.device
+    for _ in range(max_tokens):
+        next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
+        is_finished = is_finished | (next_token == eos_id).cpu()
+
+        if is_finished.all():
+            break
+
+        generated_tensors.append(next_token[:, None])
+        last_token_prelogits = model.forward(
+            next_token if model.is_first_node else decode_xs,
+            seqlens=[1] * B,
+            cache=cache,
         )
-        # decode
-        for ti in range(2):
-            # continue_sig = torch.tensor([0], device=model.device)
-            # dist.all_reduce(continue_sig, op=dist.ReduceOp.MAX)
 
-            # if continue_sig[0] == 0:
-            #     break
+    generated_tokens: List[List[int]]
+    n_gen_tkns = 0
+    if generated_tensors:
+        generated_tokens = torch.cat(generated_tensors, 1).tolist()
+        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
+    else:
+        generated_tokens = []
+    responses = [tokenizer.decode(y) for y in generated_tokens]
 
-            if WORLD_RANK == local_leader:
-                dist.recv(decode_interm_ys, prev_node_leader)
-            dist.broadcast(decode_interm_ys, local_leader, group=local_group)
+    decode_time = time.time() - tic
 
-            maybe_prelogits = model.forward(
-                decode_interm_ys, seqlens=[1] * B, cache=cache
-            )
-
-            if WORLD_RANK == local_leader:
-                dist.send(maybe_prelogits, next_node_leader)
-
-        # return (None, None, None, None, None, None)
+    return (
+        seqlens,
+        responses,
+        n_p_tkns,
+        prefill_time,
+        n_gen_tkns,
+        decode_time,
+    )
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -770,7 +720,7 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def get_cluster_info(node_id, gpu):
+def get_comms(node_id, gpu):
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
     local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
     dist.all_gather_into_tensor(global_map, local_map)
@@ -826,40 +776,26 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    (
-        local_group,
-        local_leader,
-        prev_node_leader,
-        next_node_leader,
-        is_first_node,
-        is_last_node,
-    ) = get_cluster_info(node_id, gpu)
-    print(WORLD_RANK)
+    comms = get_comms(node_id, gpu)
 
-    # tokenizer = MistralTokenizer.v1()
-    # model = Transformer.load(
-    #     model_path=Path(model_path),
-    #     node_id=node_id,
-    #     gpu=gpu,
-    #     group=local_group,
-    #     is_first_node=is_first_node,
-    #     is_last_node=is_last_node,
-    # )
+    tokenizer = MistralTokenizer.v1()
+    model = Transformer.load(
+        model_path=Path(model_path),
+        node_id=node_id,
+        gpu=gpu,
+        comms=comms
+    )
 
-    # # warmup
-    # generate(
-    #     ["hello, how are you?"],
-    #     tokenizer,
-    #     model,
-    #     local_group,
-    #     local_leader,
-    #     prev_node_leader,
-    #     next_node_leader,
-    #     max_tokens=128,
-    #     max_batch_size=1,
-    #     # temperature=0,
-    #     eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-    # )
+    # warmup
+    generate(
+        ["hello, how are you?"],
+        tokenizer,
+        model,
+        max_tokens=128,
+        max_batch_size=1,
+        # temperature=0,
+        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    )
 
     # torch.cuda.cudart().cudaProfilerStart()
     # prefill_tps = []
@@ -878,10 +814,6 @@ def main(
     #         prompt_batch,
     #         tokenizer,
     #         model,
-    #         local_group,
-    #         local_leader,
-    #         prev_node_leader,
-    #         next_node_leader,
     #         max_tokens=max_tokens,
     #         max_batch_size=len(prompt_batch),
     #         # temperature=0,
@@ -941,6 +873,7 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(0)
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
