@@ -411,27 +411,31 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.expert_start_idx=expert_start_idx
-        self.expert_end_idx=expert_end_idx
+        self.group = group
+        self.selected_experts = torch.tensor(
+            [[3, 4] for _ in range(5000)]
+        )
 
     
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        # gate_logits = self.gate(inputs)[:, 3:]
-        # gate_logits = self.gate(inputs)[:, :3]
-        weights = gate_logits[:, [0, 3]]
-        selected_experts = torch.tensor(
-            [[0, 3] for _ in range(inputs.shape[0])], device=inputs.device
-        )
-        # weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        outputs = []
-        start_idx = 0
-        # only do deployed expert -> no redundent
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0: 
+        selected_experts = selected_experts.to("cpu")
+        eis, bis, nes = [], [], []
+        for ei in range(self.num_experts):
+            batch_idx, nth_expert = torch.where(self.selected_experts[:inputs.shape[0]] == ei)
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx.to(device=inputs.device))
+                nes.append(nth_expert.to(device=inputs.device))
+
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            if ey is None:
                 continue
             end_idx = start_idx + num_tokens
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
