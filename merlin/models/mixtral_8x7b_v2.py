@@ -729,8 +729,8 @@ def get_atten_stats(model: Transformer):
 
     for block in model.layers.values():
         ete += block.atten_end.elapsed_time(block.atten_start)
-        comp += block.attention.comm_start(block.attention.comp_start)
-        comm += block.attention.comm_end(block.attention.comm_start)
+        comp += block.attention.comm_start.elapsed_time(block.attention.comp_start)
+        comm += block.attention.comm_end.elapsed_time(block.attention.comm_start)
         n_layers += 1
 
     print(f"total end-to-end time: {ete} ms")
