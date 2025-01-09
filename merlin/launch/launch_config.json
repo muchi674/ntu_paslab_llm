@@ -19,7 +19,7 @@
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v1-3-5",
             "node_id": 0,
             "profile": true,
-            "profiling_output": "n51-v1-one-each-bs1"
+            "profiling_output": "n51-v1-only-46-bs1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
