@@ -412,7 +412,8 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        
+        self.comm_start = torch.cuda.Event(enable_timing=True)
+        self.comm_end = torch.cuda.Event(enable_timing=True)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -436,9 +437,11 @@ class MoeLayer(nn.Module):
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         
-        torch.cuda.nvtx.range_push("all_reduce")
+        torch.cuda.synchronize()
+        self.comm_start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        torch.cuda.nvtx.range_pop()
+        self.comm_end.record()
+
         return results
 
 
@@ -490,10 +493,7 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-
-        tic = time.time()
         r = self.feed_forward.forward(self.ffn_norm(h))
-        toc = time.time()
         out = h + r
         return out
 
@@ -810,6 +810,14 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+        
+        print("=" * 20)
+        total_comm_time = 0
+        for block in model.layers.values():
+            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
+            total_comm_time += comm_time
+
+        print("total communication time:", total_comm_time)
 
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
