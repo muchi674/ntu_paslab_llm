@@ -393,7 +393,7 @@ class Attention(nn.Module):
         )
 
         # exp. compare v1 v2
-        # dist.barrier(group=self.group)
+        dist.barrier(group=self.group)
 
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
         return torch.sum(local_world_out, dim=0)
