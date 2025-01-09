@@ -386,7 +386,7 @@ class Attention(nn.Module):
         assert isinstance(output, torch.Tensor)
 
         # exp. compare v1 v2
-        dist.barrier()
+        # dist.barrier()
 
         return self.wo(output)  # type: ignore
 
