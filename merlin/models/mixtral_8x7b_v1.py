@@ -402,7 +402,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-my_selected_experts = torch.tensor([[0, 3] for _ in range(5000)])
+
 class MoeLayer(nn.Module):
     def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
@@ -424,7 +424,7 @@ class MoeLayer(nn.Module):
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(my_selected_experts[:inputs.shape[0]] == ei)
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
@@ -435,30 +435,10 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        end.record()
-
-        torch.cuda.synchronize()
-        if need_profile:
-            if is_prefill:
-                self.prefill_comp_time.append(start.elapsed_time(end))
-            else: 
-                self.decode_comp_time.append(start.elapsed_time(end))
-
-        # communication
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
+        
+        torch.cuda.nvtx.range_push("all_reduce")
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        end.record()
-
-        torch.cuda.synchronize()
-        if need_profile:
-            if is_prefill:
-                self.prefill_comm_time.append(start.elapsed_time(end))
-            else: 
-                self.decode_comm_time.append(start.elapsed_time(end))
-
+        torch.cuda.nvtx.range_pop()
         return results
 
 
@@ -510,7 +490,10 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h), is_prefill, need_profile)
+
+        tic = time.time()
+        r = self.feed_forward.forward(self.ffn_norm(h))
+        toc = time.time()
         out = h + r
         return out
 
