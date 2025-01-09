@@ -402,7 +402,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-
+my_selected_experts = torch.tensor([[3, 4] for _ in range(5000)])
 class MoeLayer(nn.Module):
     def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
@@ -412,9 +412,7 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.selected_experts = torch.tensor(
-            [[3, 4] for _ in range(5000)]
-        )
+        
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -426,7 +424,7 @@ class MoeLayer(nn.Module):
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(self.selected_experts[:inputs.shape[0]] == ei)
+            batch_idx, nth_expert = torch.where(my_selected_experts[:inputs.shape[0]] == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
