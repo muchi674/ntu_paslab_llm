@@ -7,7 +7,7 @@
         "prompt_path": "~/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
         "n_prompts": 32,
         "batch_size": 32,
-        "max_tokens": 32,
+        "max_tokens": 256,
         "hide_resp": false
     },
     "nodes": {
@@ -28,7 +28,7 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_v1.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/v1-3-5",
             "node_id": 1,
-            "profile": true,
+            "profile": false,
             "profiling_output": "n46-v1-one-each-bs32"
         }
     }
