@@ -12,6 +12,11 @@ import logging
 import torch
 
 
+def ceildiv(a, b):
+    # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
+    return -(a // -b)
+
+
 class Partitioner:
 
     def __init__(self, model_path: str, design_path: str, output_path: str) -> None:
@@ -34,29 +39,38 @@ class Partitioner:
         next_layer, next_expert = 0, 0
 
         for d in design["design"]:
-            node_id, n_layers, n_experts, tp_size = (
-                d.get("node_id"),
-                d.get("n_layers"),
-                d.get("n_experts"),
-                d["tp_size"],
-            )
+            node_id, n_layers, n_experts, pp_size, ep_size, tp_size = [
+                d.get(k)
+                for k in [
+                    "node_id",
+                    "n_layers",
+                    "n_experts",
+                    "pp_size",
+                    "ep_size",
+                    "tp_size",
+                ]
+            ]
 
             if len(design["design"]) > 1:
                 assert node_id is not None
             assert n_layers is None or n_layers > 0
             assert n_experts is None or n_experts > 0
-            # TODO: consider combining expert + pipeline parallelism
-            assert (n_layers is None) or (n_experts is None)
 
-            ffn_step = -(model_config["intermediate_size"] // -tp_size)  # ceil division
+            # ceil division
+            pp_bin_size = ceildiv(
+                n_layers or model_config["num_hidden_layers"], pp_size or 1
+            )
+            ep_bin_size = ceildiv(
+                n_experts or model_config["num_local_experts"], ep_size or 1
+            )
+            ffn_step = ceildiv(model_config["intermediate_size"], tp_size or 1)
             partitions = []
-            for ti in range(tp_size):
+            for pi in range(pp_size or ep_size or tp_size):
                 if node_id is None:
-                    name = str(ti)
+                    name = str(pi)
                 else:
-                    name = f"{node_id}-{ti}"
+                    name = f"{node_id}-{pi}"
                 partitions.append(name)
-            m = (ffn_step, partitions)
 
             for li in range(
                 next_layer,
@@ -66,6 +80,9 @@ class Partitioner:
                     else model_config["num_hidden_layers"]
                 ),
             ):
+                pis = partitions
+                if pp_size is not None:
+                    pis = [partitions[(li - next_layer) // pp_bin_size]]
                 for ei in range(
                     next_expert,
                     (
@@ -74,12 +91,16 @@ class Partitioner:
                         else model_config["num_local_experts"]
                     ),
                 ):
-                    expert_map[f"{li}-{ei}"] = m
+                    if ep_size is not None:
+                        pis = [partitions[(ei - next_expert) // ep_bin_size]]
+                    expert_map[f"{li}-{ei}"] = (ffn_step, pis)
 
                 if design.get("split_attn_weights", False):
                     attn_tp_map.setdefault(str(li), []).append(partitions)
 
-                if n_layers:
+                if pp_size:
+                    non_expert_pp_map[str(li)] = pis
+                elif n_layers:
                     non_expert_pp_map[str(li)] = partitions
 
             next_layer += n_layers or 0

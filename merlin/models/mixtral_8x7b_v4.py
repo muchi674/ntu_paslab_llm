@@ -404,6 +404,8 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
+        if f"{li}.{ei}.w1" not in self.ws:
+            return None
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
@@ -439,6 +441,8 @@ class MoeLayer(nn.Module):
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            if ey is None:
+                continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
