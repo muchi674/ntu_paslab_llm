@@ -401,7 +401,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-my_selected_experts = torch.tensor([[0, 3] for _ in range(5000)])
+
 class MoeLayer(nn.Module):
     def __init__(
         self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
@@ -425,7 +425,7 @@ class MoeLayer(nn.Module):
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(my_selected_experts[:inputs.shape[0]] == ei)
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
@@ -436,8 +436,10 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
+        
+        torch.cuda.nvtx.range_push("all_reduce")
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        torch.cuda.nvtx.range_pop()
         return results
 
 
@@ -474,7 +476,10 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
+
+        tic = time.time()
         r = self.feed_forward.forward(self.ffn_norm(h))
+        toc = time.time()
         out = h + r
         return out
 
