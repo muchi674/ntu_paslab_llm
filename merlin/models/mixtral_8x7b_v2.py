@@ -349,6 +349,7 @@ class Attention(nn.Module):
         self.comp_start = torch.cuda.Event(enable_timing=True)
         self.comm_start = torch.cuda.Event(enable_timing=True)
         self.comm_end = torch.cuda.Event(enable_timing=True)
+        self.comp_end = torch.cuda.Event(enable_timing=True)
 
     def forward(
         self,
@@ -406,7 +407,11 @@ class Attention(nn.Module):
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
 
         self.comm_end.record()
-        return torch.sum(local_world_out, dim=0)
+        # return torch.sum(local_world_out, dim=0)
+        local_world_out = torch.sum(local_world_out, dim=0)
+        self.comp_end.record()
+
+        return local_world_out
 
 
 class Experts:
@@ -728,9 +733,10 @@ def get_atten_stats(model: Transformer):
     n_layers = 0
 
     for block in model.layers.values():
-        ete += block.atten_end.elapsed_time(block.atten_start)
-        comp += block.attention.comm_start.elapsed_time(block.attention.comp_start)
-        comm += block.attention.comm_end.elapsed_time(block.attention.comm_start)
+        ete += block.atten_start.elapsed_time(block.atten_end)
+        comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
+        comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
+        comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
         n_layers += 1
 
     print(f"total end-to-end time: {ete} ms")
