@@ -470,10 +470,19 @@ class TransformerBlock(nn.Module):
             group=group,
         )
 
+        # eric891224
+        self.li = li
+        self.atten_start = torch.cuda.Event(enable_timing=True)
+        self.atten_end = torch.cuda.Event(enable_timing=True)
+
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        self.atten_start.record()
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        self.atten_end.record()
+        print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
+
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r

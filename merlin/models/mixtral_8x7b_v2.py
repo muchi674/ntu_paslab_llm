@@ -345,12 +345,19 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
+        # eric891224
+        self.comp_start = torch.cuda.Event(enable_timing=True)
+        self.comm_start = torch.cuda.Event(enable_timing=True)
+        self.comm_end = torch.cuda.Event(enable_timing=True)
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
+        self.comp_start.record()
+
         seqlen_sum, model_dim = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -393,9 +400,12 @@ class Attention(nn.Module):
         )
 
         # exp. compare v1 v2
-        dist.barrier(group=self.group)
+        # dist.barrier(group=self.group)
+        self.comm_start.record()
 
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+
+        self.comm_end.record()
         return torch.sum(local_world_out, dim=0)
 
 
@@ -479,10 +489,19 @@ class TransformerBlock(nn.Module):
             group=moe_group,
         )
 
+        # eric891224
+        self.li = li
+        self.atten_start = torch.cuda.Event(enable_timing=True)
+        self.atten_end = torch.cuda.Event(enable_timing=True)
+
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        self.atten_start.record()
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        self.atten_end.record()
+        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
+
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -702,6 +721,24 @@ def get_node_group(node_id, gpu, global_group):
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
     return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
+def get_atten_stats(model: Transformer):
+    ete = 0
+    comp = 0
+    comm = 0
+    n_layers = 0
+
+    for block in model.layers.values():
+        ete += block.atten_end.elapsed_time(block.atten_start)
+        comp += block.attention.comm_start(block.attention.comp_start)
+        comm += block.attention.comm_end(block.attention.comm_start)
+        n_layers += 1
+
+    print(f"total end-to-end time: {ete} ms")
+    print(f"total computation time: {comp} ms")
+    print(f"total communication time: {comm} ms")
+    print(f"avg end-to-end time: {ete/n_layers} ms")
+    print(f"avg computation time: {comp/n_layers} ms")
+    print(f"avg communication time: {comm/n_layers} ms")
 
 def main(
     model_path: str,
@@ -811,6 +848,12 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+        # eric891224
+        print("=" * 20)
+        print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
+        get_atten_stats(model=model)
+        
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)
