@@ -402,7 +402,7 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
-my_selected_experts = torch.tensor([[3, 4] for _ in range(5000)])
+my_selected_experts = torch.tensor([[0, 3] for _ in range(5000)])
 class MoeLayer(nn.Module):
     def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
