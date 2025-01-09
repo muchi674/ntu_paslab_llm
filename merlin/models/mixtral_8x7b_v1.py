@@ -412,27 +412,21 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.prefill_comp_time = []
-        self.prefill_comm_time = []
-        self.decode_comp_time = []
-        self.decode_comm_time = []
+        self.selected_experts = torch.tensor(
+            [[3, 4] for _ in range(5000)]
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        # gate_logits = self.gate(inputs)[:, 3:]
-        # gate_logits = self.gate(inputs)[:, :3]
-        weights = gate_logits[:, [0, 3]]
-        selected_experts = torch.tensor(
-            [[0, 3] for _ in range(inputs.shape[0])], device=inputs.device
-        )
-        # weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            batch_idx, nth_expert = torch.where(self.selected_experts[:inputs.shape[0]] == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
