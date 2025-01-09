@@ -418,8 +418,8 @@ class MoeLayer(nn.Module):
         self.decode_comm_time = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # gate_logits = self.gate(inputs)[:, [0, 3]]
-        gate_logits = self.gate(inputs)[:, 3:]
+        gate_logits = self.gate(inputs)[:, [0, 3]]
+        # gate_logits = self.gate(inputs)[:, 3:]
         # gate_logits = self.gate(inputs)[:, :3]
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
