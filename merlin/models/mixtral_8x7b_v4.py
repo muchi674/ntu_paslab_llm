@@ -488,7 +488,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, comms: tuple):
+    def __init__(self, args: ModelArgs, experts: Experts, comms: list):
         super().__init__()
         self.args = args
         (
@@ -496,13 +496,13 @@ class Transformer(nn.Module):
             self.local_leader,
             self.prev_node_leader,
             self.next_node_leader,
-            self.is_first_node,
-            self.is_last_node,
+            self.is_first_stage,
+            self.is_last_stage,
         ) = comms
         self._precomputed_freqs_cis: torch.Tensor = None
-        if self.is_first_node:
+        if self.is_first_stage:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        elif self.is_last_node:  # assumes inter-node PP
+        elif self.is_last_stage:
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
@@ -548,7 +548,7 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         input_metadata = cache.get_input_metadata(seqlens)
         h = xs
-        if self.is_first_node:
+        if self.is_first_stage:
             h = self.tok_embeddings(h)
         else:
             if WORLD_RANK == self.local_leader:
@@ -562,7 +562,7 @@ class Transformer(nn.Module):
 
         cache.update_seqlens(seqlens)
         ys: torch.Tensor
-        if self.is_last_node:
+        if self.is_last_stage:
             ys = self.output(self.norm(h))
         else:
             if WORLD_RANK == self.local_leader:
@@ -577,7 +577,7 @@ class Transformer(nn.Module):
 
     @staticmethod
     def load(
-        model_path: Path, node_id: int, gpu: torch.device, comms: tuple
+        model_path: Path, node_id: int, gpu: torch.device, comms: list
     ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
@@ -594,6 +594,10 @@ class Transformer(nn.Module):
         )
 
         # find PP range
+        is_first_stage = "tok_embeddings.weight" in non_experts
+        is_last_stage = "output.weight" in non_experts
+        comms.append(is_first_stage)
+        comms.append(is_last_stage)
         lis = [int(k.split(".")[0]) for k in experts]
         model_args.first_layer = min(lis)
         model_args.last_layer = max(lis)
@@ -660,7 +664,7 @@ def generate(
     # prefill / prompt evaluation stage
     prefill_xs = (
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long)
-        if model.is_first_node
+        if model.is_first_stage
         else torch.zeros(
             (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
         )
@@ -686,7 +690,7 @@ def generate(
 
         generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(
-            next_token if model.is_first_node else decode_xs,
+            next_token if model.is_first_stage else decode_xs,
             seqlens=[1] * B,
             cache=cache,
         )
@@ -756,14 +760,7 @@ def get_comms(node_id, gpu):
     prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
     next_node_leader = torch.min(global_map[global_map[:, 0] == next_node][:, 1]).item()
 
-    return (
-        local_group,
-        local_leader,
-        prev_node_leader,
-        next_node_leader,
-        node_id == first_node,
-        node_id == last_node,
-    )
+    return [local_group, local_leader, prev_node_leader, next_node_leader]
 
 
 def main(
