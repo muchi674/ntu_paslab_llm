@@ -407,14 +407,17 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.comp_time = []
-        self.comm_time = []
+        self.prefill_comp_time = []
+        self.prefill_comm_time = []
+        self.decode_comp_time = []
+        self.decode_comm_time = []
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, inputs: torch.Tensor, is_prefill: bool, need_profile: bool) -> torch.Tensor:
+        # computation
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         
-        # computation
         start.record()
         gate_logits = self.gate(inputs)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -448,7 +451,11 @@ class MoeLayer(nn.Module):
         end.record()
 
         torch.cuda.synchronize()
-        self.comp_time.append(start.elapsed_time(end))
+        if need_profile:
+            if is_prefill:
+                self.prefill_comp_time.append(start.elapsed_time(end))
+            else: 
+                self.decode_comp_time.append(start.elapsed_time(end))
 
         # communication
         start = torch.cuda.Event(enable_timing=True)
@@ -459,7 +466,11 @@ class MoeLayer(nn.Module):
         end.record()
 
         torch.cuda.synchronize()
-        self.comm_time.append(start.elapsed_time(end))
+        if need_profile:
+            if is_prefill:
+                self.prefill_comm_time.append(start.elapsed_time(end))
+            else: 
+                self.decode_comm_time.append(start.elapsed_time(end))
 
         return results
 
@@ -493,11 +504,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self, x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[CacheView],
+        is_prefill: bool,
+        need_profile: bool
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward.forward(self.ffn_norm(h), is_prefill, need_profile)
         out = h + r
         return out
 
@@ -550,6 +565,8 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
+        is_prefill: bool,
+        need_profile: bool
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -560,7 +577,7 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, is_prefill, need_profile)
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -600,6 +617,7 @@ def generate(
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
+    need_profile: bool
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
     tic = time.time()
@@ -630,6 +648,7 @@ def generate(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
+        need_profile=need_profile
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
@@ -650,7 +669,13 @@ def generate(
             break
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+        last_token_prelogits = model.forward(
+            next_token,
+            seqlens=[1] * B,
+            cache=cache,
+            is_prefill=False,
+            need_profile=need_profile
+        )
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
@@ -734,6 +759,7 @@ def main(
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        need_profile=False
     )
 
     torch.cuda.cudart().cudaProfilerStart()
@@ -758,6 +784,7 @@ def main(
             max_batch_size=len(prompt_batch),
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            need_profile=True
         )
 
         if WORLD_RANK == 0:
@@ -796,23 +823,39 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-    avg_total_comm_time = 0
-    avg_total_comp_time = 0
+    prefill_time_results = torch.zeros(2, device=gpu)
+    decode_time_results = torch.zeros(2, device=gpu)
     for index, block in model.layers.items():
-        comm_time = block.feed_forward.comm_time
-        comp_time = block.feed_forward.comp_time
-        avg_comm_time = sum(comm_time) / len(comm_time)
-        avg_comp_time = sum(comp_time) / len(comp_time)
-        avg_total_comm_time += avg_comm_time
-        avg_total_comp_time += avg_comp_time
+        block_prefill_time_results = torch.tensor(
+            [
+                block.feed_forward.prefill_comp_time,
+                block.feed_forward.prefill_comm_time
+            ],
+            device=gpu
+        )
+        block_decode_time_results = torch.tensor(
+            [
+                block.feed_forward.decode_comp_time,
+                block.feed_forward.decode_comm_time
+            ],
+            device=gpu
+        )
+        
+        prefill_time_results += block_prefill_time_results.mean(dim=1)
+        decode_time_results += block_decode_time_results.mean(dim=1)
     
-    time_results = torch.tensor([avg_comp_time, avg_comm_time], device=gpu)
-    dist.all_reduce(time_results, op=dist.ReduceOp.AVG, group=group)
+    dist.all_reduce(prefill_time_results, op=dist.ReduceOp.AVG, group=group)
+    dist.all_reduce(decode_time_results, op=dist.ReduceOp.AVG, group=group)
     
     if WORLD_RANK == 0:
         print("=" * 20)
-        print(f"avg total computation time: {time_results[0].item():.2f} ms")
-        print(f"avg total communication time: {time_results[1].item():.2f} ms")
+        print("prefill stage")
+        print(f"avg ffn computation time: {prefill_time_results[0].item():.2f} ms")
+        print(f"avg ffn communication time: {prefill_time_results[1].item():.2f} ms")
+        print("=" * 20)
+        print("decode stage")
+        print(f"avg ffn computation time: {decode_time_results[0].item():.2f} ms")
+        print(f"avg ffn communication time: {decode_time_results[1].item():.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)

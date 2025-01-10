@@ -836,8 +836,6 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-    avg_total_comm_time = 0
-    avg_total_comp_time = 0
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
     for index, block in model.layers.items():
