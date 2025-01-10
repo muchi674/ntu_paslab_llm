@@ -412,10 +412,17 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
+        self.comp_time = []
+        self.comm_time = []
         self.comm_start = torch.cuda.Event(enable_timing=True)
         self.comm_end = torch.cuda.Event(enable_timing=True)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        # computation
+        start.record()
         gate_logits = self.gate(inputs)
         
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -436,11 +443,22 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        
+        end.record()
+
         torch.cuda.synchronize()
-        self.comm_start.record()
+        self.comp_time.append(start.elapsed_time(end))
+
+
+        # communication
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        self.comm_end.record()
+        end.record()
+
+        torch.cuda.synchronize()
+        self.comm_time.append(start.elapsed_time(end))
 
         return results
 
@@ -814,11 +832,12 @@ def main(
         print("=" * 20)
         total_comm_time = 0
         for index, block in model.layers.items():
-            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
-            total_comm_time += comm_time
-            print(f"communication time of layer {index}: {comm_time:.2f} ms")
+            comm_time = block.feed_forward.comm_time
+            avg_comm_time = sum(comm_time) / len(comm_time)
+            total_comm_time += avg_comm_time
+            print(f"avg communication time of a layer {index}: {avg_comm_time:.2f} ms")
 
-        print(f"total communication time: {total_comm_time:.2f} ms")
+        print(f"avg total communication time: {total_comm_time:.2f} ms")
 
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
