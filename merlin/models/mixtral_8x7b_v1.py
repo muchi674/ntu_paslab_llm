@@ -813,9 +813,10 @@ def main(
         
         print("=" * 20)
         total_comm_time = 0
-        for block in model.layers.values():
+        for index, block in model.layers.items():
             comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
             total_comm_time += comm_time
+            print(f"communicatino time of layer {index}: {comm_time} ms")
 
         print("total communication time:", total_comm_time)
 
