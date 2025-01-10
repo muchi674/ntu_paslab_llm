@@ -407,7 +407,9 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-    
+        self.comm_start = torch.cuda.Event(enable_timing=True)
+        self.comm_end = torch.cuda.Event(enable_timing=True)
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
@@ -436,17 +438,16 @@ class MoeLayer(nn.Module):
             outputs.append(expert_out)
             start_idx = end_idx
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0) # new_empty
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        final_out = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weight.dtype)
-            .mul_(topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
-        )
-        return final_out
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        
+        torch.cuda.synchronize()
+        self.comm_start.record()
+        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        self.comm_end.record()
+
+        return results
 
 
 class RMSNorm(torch.nn.Module):
@@ -780,6 +781,15 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+        print("=" * 20)
+        total_comm_time = 0
+        for index, block in model.layers.items():
+            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
+            total_comm_time += comm_time
+            print(f"communication time of layer {index}: {comm_time:.2f} ms")
+
+        print(f"total communication time: {total_comm_time:.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
