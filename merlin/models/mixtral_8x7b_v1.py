@@ -828,25 +828,24 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
-        
-        print("=" * 20)
-        total_comm_time = 0
-        for index, block in model.layers.items():
-            comm_time = block.feed_forward.comm_time
-            avg_comm_time = sum(comm_time) / len(comm_time)
-            total_comm_time += avg_comm_time
-            print(f"avg communication time of a layer {index}: {avg_comm_time:.2f} ms")
 
+    avg_total_comm_time = 0
+    avg_total_comp_time = 0
+    for index, block in model.layers.items():
+        comm_time = block.feed_forward.comm_time
+        comp_time = block.feed_forward.comp_time
+        avg_comm_time = sum(comm_time) / len(comm_time)
+        avg_comp_time = sum(comp_time) / len(comp_time)
+        avg_total_comm_time += avg_comm_time
+        avg_total_comp_time += avg_comp_time
+    
+    time_results = torch.tensor([avg_comp_time, avg_comm_time])
+    dist.all_reduce(time_results, op=dist.ReduceOp.AVG, group=group)
+    
+    if WORLD_RANK == 0:
         print("=" * 20)
-        total_comp_time = 0
-        for index, block in model.layers.items():
-            comp_time = block.feed_forward.comp_time
-            avg_comp_time = sum(comp_time) / len(comp_time)
-            total_comp_time += avg_comp_time
-            print(f"avg computation time of a layer {index}: {avg_comp_time:.2f} ms")
-        
-        print(f"avg total communication time: {total_comm_time:.2f} ms")
-        print(f"avg total computation time: {total_comp_time:.2f} ms")
+        print(f"avg total computation time: {time_results.item()[0]:.2f} ms")
+        print(f"avg total communication time: {time_results.item()[1]:.2f} ms")
 
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
