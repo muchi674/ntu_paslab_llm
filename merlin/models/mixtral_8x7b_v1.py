@@ -844,8 +844,8 @@ def main(
     
     if WORLD_RANK == 0:
         print("=" * 20)
-        print(f"avg total computation time: {time_results.item()[0]:.2f} ms")
-        print(f"avg total communication time: {time_results.item()[1]:.2f} ms")
+        print(f"avg total computation time: {time_results[0].item():.2f} ms")
+        print(f"avg total communication time: {time_results[1].item():.2f} ms")
 
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
