@@ -821,7 +821,16 @@ def main(
             total_comm_time += avg_comm_time
             print(f"avg communication time of a layer {index}: {avg_comm_time:.2f} ms")
 
+        print("=" * 20)
+        total_comp_time = 0
+        for index, block in model.layers.items():
+            comp_time = block.feed_forward.comp_time
+            avg_comp_time = sum(comp_time) / len(comp_time)
+            total_comp_time += avg_comp_time
+            print(f"avg computation time of a layer {index}: {avg_comp_time:.2f} ms")
+        
         print(f"avg total communication time: {total_comm_time:.2f} ms")
+        print(f"avg total computation time: {total_comp_time:.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
