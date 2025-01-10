@@ -773,7 +773,7 @@ def main(
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        need_profile = False
+        need_profile=False
     )
 
     torch.cuda.cudart().cudaProfilerStart()
@@ -841,14 +841,20 @@ def main(
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)
     for index, block in model.layers.items():
-        block_prefill_time_results = torch.tensor([
-            block.feed_forward.prefill_comp_time,
-            block.feed_forward.prefill_comm_time
-        ])
-        block_decode_time_results = torch.tensor([
-            block.feed_forward.decode_comp_time,
-            block.feed_forward.decode_comm_time
-        ])
+        block_prefill_time_results = torch.tensor(
+            [
+                block.feed_forward.prefill_comp_time,
+                block.feed_forward.prefill_comm_time
+            ],
+            device=gpu
+        )
+        block_decode_time_results = torch.tensor(
+            [
+                block.feed_forward.decode_comp_time,
+                block.feed_forward.decode_comm_time
+            ],
+            device=gpu
+        )
         
         prefill_time_results += block_prefill_time_results.mean(dim=1)
         decode_time_results += block_decode_time_results.mean(dim=1)
