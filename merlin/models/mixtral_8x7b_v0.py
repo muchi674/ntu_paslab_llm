@@ -648,6 +648,7 @@ def generate(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
+        is_prefill=True,
         need_profile=need_profile
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
