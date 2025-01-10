@@ -408,6 +408,8 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
+        self.comm_start = torch.cuda.Event(enable_timing=True)
+        self.comm_end = torch.cuda.Event(enable_timing=True)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -427,7 +429,12 @@ class MoeLayer(nn.Module):
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        
+        torch.cuda.synchronize()
+        self.comm_start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        self.comm_end.record()
+
         return results
 
 
@@ -762,6 +769,15 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+        print("=" * 20)
+        total_comm_time = 0
+        for index, block in model.layers.items():
+            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
+            total_comm_time += comm_time
+            print(f"communication time of layer {index}: {comm_time:.2f} ms")
+
+        print(f"total communication time: {total_comm_time:.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
