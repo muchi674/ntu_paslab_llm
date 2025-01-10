@@ -816,9 +816,9 @@ def main(
         for index, block in model.layers.items():
             comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
             total_comm_time += comm_time
-            print(f"communicatino time of layer {index}: {comm_time} ms")
+            print(f"communication time of layer {index}: {comm_time:.2f} ms")
 
-        print("total communication time:", total_comm_time)
+        print(f"total communication time: {total_comm_time:.2f} ms")
 
     prefill_time_results = torch.zeros(2, device=gpu)
     decode_time_results = torch.zeros(2, device=gpu)

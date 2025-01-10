@@ -407,66 +407,33 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.prefill_comp_time = []
-        self.prefill_comm_time = []
-        self.decode_comp_time = []
-        self.decode_comm_time = []
+        self.comm_start = torch.cuda.Event(enable_timing=True)
+        self.comm_end = torch.cuda.Event(enable_timing=True)
 
-
-    def forward(self, inputs: torch.Tensor, is_prefill: bool, need_profile: bool) -> torch.Tensor:
-        # computation
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
-        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
-        return y
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        results = torch.zeros_like(inputs)
 
-    @torch.no_grad()
-    def moe_infer(self, x, topk_ids, topk_weight):
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu()
-        idxs = topk_ids.view(-1)
-        _, idxs = idxs.sort(dim=-1)
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-        outputs = []
-        start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-            end_idx = start_idx + num_tokens
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
-            outputs.append(expert_out)
-            start_idx = end_idx
+        selected_experts = selected_experts.to("cpu")
+        eis, bis, nes = [], [], []
+        for ei in range(self.num_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx.to(device=inputs.device))
+                nes.append(nth_expert.to(device=inputs.device))
 
-        torch.cuda.synchronize(device=inputs.device)
-        tic = time.time()
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        torch.cuda.synchronize(device=inputs.device)
-        toc = time.time()
-
-        if need_profile:
-            if is_prefill:
-                self.prefill_comp_time.append((toc-tic)*1000)
-            else: 
-                self.decode_comp_time.append((toc-tic)*1000)
-
-        # communication
-        torch.cuda.synchronize(device=inputs.device)
-        tic = time.time()
+        
+        torch.cuda.synchronize()
+        self.comm_start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        torch.cuda.synchronize(device=inputs.device)
-        toc = time.time()
-
-        if need_profile:
-            if is_prefill:
-                self.prefill_comm_time.append((toc-tic)*1000)
-            else: 
-                self.decode_comm_time.append((toc-tic)*1000)
+        self.comm_end.record()
 
         return results
 
@@ -820,39 +787,14 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-    prefill_time_results = torch.zeros(2, device=gpu)
-    decode_time_results = torch.zeros(2, device=gpu)
-    for index, block in model.layers.items():
-        block_prefill_time_results = torch.tensor(
-            [
-                block.feed_forward.prefill_comp_time,
-                block.feed_forward.prefill_comm_time
-            ],
-            device=gpu
-        )
-        block_decode_time_results = torch.tensor(
-            [
-                block.feed_forward.decode_comp_time,
-                block.feed_forward.decode_comm_time
-            ],
-            device=gpu
-        )
-        
-        prefill_time_results += block_prefill_time_results.mean(dim=1)
-        decode_time_results += block_decode_time_results.mean(dim=1)
-    
-    dist.all_reduce(prefill_time_results, op=dist.ReduceOp.AVG, group=group)
-    dist.all_reduce(decode_time_results, op=dist.ReduceOp.AVG, group=group)
-    
-    if WORLD_RANK == 0:
         print("=" * 20)
-        print("prefill stage")
-        print(f"avg ffn computation time: {prefill_time_results[0].item():.2f} ms")
-        print(f"avg ffn communication time: {prefill_time_results[1].item():.2f} ms")
-        print("=" * 20)
-        print("decode stage")
-        print(f"avg ffn computation time: {decode_time_results[0].item():.2f} ms")
-        print(f"avg ffn communication time: {decode_time_results[1].item():.2f} ms")
+        total_comm_time = 0
+        for index, block in model.layers.items():
+            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
+            total_comm_time += comm_time
+            print(f"communication time of layer {index}: {comm_time:.2f} ms")
+
+        print(f"total communication time: {total_comm_time:.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
