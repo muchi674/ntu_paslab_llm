@@ -407,11 +407,15 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.comm_start = torch.cuda.Event(enable_timing=True)
-        self.comm_end = torch.cuda.Event(enable_timing=True)
+        self.comp_time = []
+        self.comm_time = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        orig_shape = inputs.shape
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        # computation
+        start.record()
         gate_logits = self.gate(inputs)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
@@ -441,11 +445,21 @@ class MoeLayer(nn.Module):
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        
+        end.record()
+
         torch.cuda.synchronize()
-        self.comm_start.record()
+        self.comp_time.append(start.elapsed_time(end))
+
+        # communication
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        self.comm_end.record()
+        end.record()
+
+        torch.cuda.synchronize()
+        self.comm_time.append(start.elapsed_time(end))
 
         return results
 
@@ -782,14 +796,23 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
+    avg_total_comm_time = 0
+    avg_total_comp_time = 0
+    for index, block in model.layers.items():
+        comm_time = block.feed_forward.comm_time
+        comp_time = block.feed_forward.comp_time
+        avg_comm_time = sum(comm_time) / len(comm_time)
+        avg_comp_time = sum(comp_time) / len(comp_time)
+        avg_total_comm_time += avg_comm_time
+        avg_total_comp_time += avg_comp_time
+    
+    time_results = torch.tensor([avg_comp_time, avg_comm_time], device=gpu)
+    dist.all_reduce(time_results, op=dist.ReduceOp.AVG, group=group)
+    
+    if WORLD_RANK == 0:
         print("=" * 20)
-        total_comm_time = 0
-        for index, block in model.layers.items():
-            comm_time = block.feed_forward.comm_start.elapsed_time(block.feed_forward.comm_end)
-            total_comm_time += comm_time
-            print(f"communication time of layer {index}: {comm_time:.2f} ms")
-
-        print(f"total communication time: {total_comm_time:.2f} ms")
+        print(f"avg total computation time: {time_results[0].item():.2f} ms")
+        print(f"avg total communication time: {time_results[1].item():.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
