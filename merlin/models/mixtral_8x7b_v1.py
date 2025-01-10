@@ -839,7 +839,7 @@ def main(
         avg_total_comm_time += avg_comm_time
         avg_total_comp_time += avg_comp_time
     
-    time_results = torch.tensor([avg_comp_time, avg_comm_time])
+    time_results = torch.tensor([avg_comp_time, avg_comm_time], device=gpu)
     dist.all_reduce(time_results, op=dist.ReduceOp.AVG, group=group)
     
     if WORLD_RANK == 0:
