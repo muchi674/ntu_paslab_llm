@@ -82,6 +82,7 @@ class ModelArgs:
     first_layer: int = None
     last_layer: int = None
     n_assigned_layers: int = None
+    attn_tp: bool = None
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -386,15 +387,15 @@ class Attention(nn.Module):
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
         output: torch.Tensor = self.wo(output)
-        # # all_reduce is not used to prevent hangs
-        # local_world_out = torch.zeros(
-        #     (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
-        #     dtype=output.dtype,
-        #     device=output.device,
-        # )
-        # dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-        # return torch.sum(local_world_out, dim=0)
-
+        if self.args.attn_tp:
+            # all_reduce is not used to prevent hangs
+            local_world_out = torch.zeros(
+                (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+            return torch.sum(local_world_out, dim=0)
         return output
 
 
@@ -592,12 +593,6 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        # # adjust for tensor parallel attention
-        # assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
-        # assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
-        # model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
-        # model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
-
         # find PP range
         lis = [int(k.split(".")[0]) for k in experts]
         model_args.first_layer = min(lis)
@@ -605,6 +600,19 @@ class Transformer(nn.Module):
         model_args.n_assigned_layers = (
             model_args.last_layer - model_args.first_layer + 1
         )
+
+        if (
+            non_experts[f"layers.{model_args.first_layer}.attention.wq.weight"].shape[0]
+            < model_args.n_heads * model_args.head_dim
+        ):
+            # adjust for tensor parallel attention
+            assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
+            assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+            model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
+            model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
+            model_args.attn_tp = True
+        else:
+            model_args.attn_tp = False
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts), comms=comms)
@@ -786,10 +794,7 @@ def main(
 
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(
-        model_path=Path(model_path),
-        node_id=node_id,
-        gpu=gpu,
-        comms=comms
+        model_path=Path(model_path), node_id=node_id, gpu=gpu, comms=comms
     )
 
     # warmup
