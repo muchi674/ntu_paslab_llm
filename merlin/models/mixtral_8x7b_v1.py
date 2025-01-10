@@ -838,21 +838,33 @@ def main(
 
     avg_total_comm_time = 0
     avg_total_comp_time = 0
+    prefill_time_results = torch.zeros(2, device=gpu)
+    decode_time_results = torch.zeros(2, device=gpu)
     for index, block in model.layers.items():
-        comm_time = block.feed_forward.comm_time
-        comp_time = block.feed_forward.comp_time
-        avg_comm_time = sum(comm_time) / len(comm_time)
-        avg_comp_time = sum(comp_time) / len(comp_time)
-        avg_total_comm_time += avg_comm_time
-        avg_total_comp_time += avg_comp_time
+        block_prefill_time_results = torch.tensor([
+            block.feed_forward.prefill_comp_time,
+            block.feed_forward.prefill_comm_time
+        ])
+        block_decode_time_results = torch.tensor([
+            block.feed_forward.decode_comp_time,
+            block.feed_forward.decode_comm_time
+        ])
+        
+        prefill_time_results += block_prefill_time_results.mean(dim=1)
+        decode_time_results += block_decode_time_results.mean(dim=1)
     
-    time_results = torch.tensor([avg_comp_time, avg_comm_time], device=gpu)
-    dist.all_reduce(time_results, op=dist.ReduceOp.AVG, group=group)
+    dist.all_reduce(prefill_time_results, op=dist.ReduceOp.AVG, group=group)
+    dist.all_reduce(decode_time_results, op=dist.ReduceOp.AVG, group=group)
     
     if WORLD_RANK == 0:
         print("=" * 20)
-        print(f"avg total computation time: {time_results[0].item():.2f} ms")
-        print(f"avg total communication time: {time_results[1].item():.2f} ms")
+        print("prefill stage")
+        print(f"avg ffn computation time: {prefill_time_results[0].item():.2f} ms")
+        print(f"avg ffn communication time: {prefill_time_results[1].item():.2f} ms")
+        print("=" * 20)
+        print("decode stage")
+        print(f"avg ffn computation time: {decode_time_results[0].item():.2f} ms")
+        print(f"avg ffn communication time: {decode_time_results[1].item():.2f} ms")
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
