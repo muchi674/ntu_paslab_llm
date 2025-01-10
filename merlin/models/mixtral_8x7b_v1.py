@@ -412,15 +412,16 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
         self.group = group
-        self.comp_time = []
-        self.comm_time = []
+        self.prefill_comp_time = []
+        self.prefill_comm_time = []
+        self.decode_comp_time = []
+        self.decode_comm_time = []
 
-    
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, is_prefill: bool, need_profile: bool) -> torch.Tensor:
+        # computation
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        
-        # computation
+
         start.record()
         gate_logits = self.gate(inputs)
         
@@ -445,8 +446,11 @@ class MoeLayer(nn.Module):
         end.record()
 
         torch.cuda.synchronize()
-        self.comp_time.append(start.elapsed_time(end))
-
+        if need_profile:
+            if is_prefill:
+                self.prefill_comp_time.append(start.elapsed_time(end))
+            else: 
+                self.decode_comp_time.append(start.elapsed_time(end))
 
         # communication
         start = torch.cuda.Event(enable_timing=True)
@@ -457,7 +461,11 @@ class MoeLayer(nn.Module):
         end.record()
 
         torch.cuda.synchronize()
-        self.comm_time.append(start.elapsed_time(end))
+        if need_profile:
+            if is_prefill:
+                self.prefill_comm_time.append(start.elapsed_time(end))
+            else: 
+                self.decode_comm_time.append(start.elapsed_time(end))
 
         return results
 
@@ -502,11 +510,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self, x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        cache: Optional[CacheView],
+        is_prefill: bool,
+        need_profile: bool
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward.forward(self.ffn_norm(h), is_prefill, need_profile)
         out = h + r
         return out
 
@@ -559,6 +571,8 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
+        is_prefill: bool,
+        need_profile: bool
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -569,7 +583,7 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, freqs_cis, cache_view, is_prefill, need_profile)
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -617,6 +631,7 @@ def generate(
     max_batch_size: int = 64,
     temperature: float = 0.0,
     eos_id: Optional[int] = None,
+    need_profile: bool
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
     tic = time.time()
@@ -647,6 +662,8 @@ def generate(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
+        is_prefill=True,
+        need_profile=need_profile
     )
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
@@ -667,7 +684,13 @@ def generate(
             break
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+        last_token_prelogits = model.forward(
+            next_token,
+            seqlens=[1] * B,
+            cache=cache,
+            is_prefill=False,
+            need_profile=need_profile
+        )
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
@@ -750,6 +773,7 @@ def main(
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        need_profile = False
     )
 
     torch.cuda.cudart().cudaProfilerStart()
@@ -773,6 +797,7 @@ def main(
             max_batch_size=len(prompt_batch),
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            need_profile=True
         )
 
         if WORLD_RANK == 0:
