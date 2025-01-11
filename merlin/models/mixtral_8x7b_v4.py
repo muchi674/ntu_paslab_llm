@@ -82,7 +82,8 @@ class ModelArgs:
     first_layer: int = None
     last_layer: int = None
     n_assigned_layers: int = None
-    attn_tp: bool = None
+    attn_tp: bool = False
+    intra_node_parallel: bool = False
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -494,8 +495,8 @@ class Transformer(nn.Module):
         (
             self.local_group,
             self.local_leader,
-            self.prev_node_leader,
-            self.next_node_leader,
+            self.prev_stage_leader,
+            self.next_stage_leader,
             self.is_first_stage,
             self.is_last_stage,
         ) = comms
@@ -552,8 +553,9 @@ class Transformer(nn.Module):
             h = self.tok_embeddings(h)
         else:
             if WORLD_RANK == self.local_leader:
-                dist.recv(h, self.prev_node_leader)
-            dist.broadcast(h, self.local_leader, group=self.local_group)
+                dist.recv(h, self.prev_stage_leader)
+            if self.local_group is not None:
+                dist.broadcast(h, self.local_leader, group=self.local_group)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for li in range(self.args.first_layer, self.args.last_layer + 1):
@@ -566,7 +568,7 @@ class Transformer(nn.Module):
             ys = self.output(self.norm(h))
         else:
             if WORLD_RANK == self.local_leader:
-                dist.send(h, self.next_node_leader)
+                dist.send(h, self.next_stage_leader)
             ys = torch.zeros(
                 (xs.shape[0], self.args.vocab_size),
                 dtype=self.dtype,
@@ -576,9 +578,7 @@ class Transformer(nn.Module):
         return ys.to(torch.float32)
 
     @staticmethod
-    def load(
-        model_path: Path, node_id: int, gpu: torch.device, comms: list
-    ) -> "Transformer":
+    def load(model_path: Path, node_id: int, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
@@ -596,8 +596,6 @@ class Transformer(nn.Module):
         # find PP range
         is_first_stage = "tok_embeddings.weight" in non_experts
         is_last_stage = "output.weight" in non_experts
-        comms.append(is_first_stage)
-        comms.append(is_last_stage)
         lis = [int(k.split(".")[0]) for k in experts]
         model_args.first_layer = min(lis)
         model_args.last_layer = max(lis)
@@ -605,18 +603,64 @@ class Transformer(nn.Module):
             model_args.last_layer - model_args.first_layer + 1
         )
 
+        # detect parallelization of expert weights (TP or EP)
+        if (
+            any(
+                f"{model_args.first_layer}.{ei}.w1" not in experts
+                for ei in range(model_args.moe["num_experts"])
+            )
+            or experts[f"{model_args.first_layer}.0.w1"].shape[0]
+            < model_args.hidden_dim
+        ):
+            model_args.intra_node_parallel = True
+
+        # adjust for tensor parallel attention
         if (
             non_experts[f"layers.{model_args.first_layer}.attention.wq.weight"].shape[0]
             < model_args.n_heads * model_args.head_dim
         ):
-            # adjust for tensor parallel attention
             assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
             assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
             model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
             model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
             model_args.attn_tp = True
+
+        comms: list
+        if model_args.intra_node_parallel:
+            global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
+            local_map = torch.tensor(
+                [node_id, WORLD_RANK], dtype=torch.int64, device=gpu
+            )
+            dist.all_gather_into_tensor(global_map, local_map)
+            first_node = torch.min(global_map[:, 0]).item()
+            last_node = torch.max(global_map[:, 0]).item()
+            local_group, local_leader = None, None
+
+            for ni in range(first_node, last_node + 1):
+                ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
+                node_group = dist.new_group(
+                    ranks_on_node, backend="nccl", use_local_synchronization=True
+                )
+                if node_id == ni:
+                    local_group = node_group
+                    local_leader = min(ranks_on_node)
+
+            prev_node = node_id - 1 if node_id != first_node else last_node
+            next_node = node_id + 1 if node_id != last_node else first_node
+            prev_stage_lead = torch.min(
+                global_map[global_map[:, 0] == prev_node][:, 1]
+            ).item()
+            next_stage_lead = torch.min(
+                global_map[global_map[:, 0] == next_node][:, 1]
+            ).item()
+
+            comms = [local_group, local_leader, prev_stage_lead, next_stage_lead]
         else:
-            model_args.attn_tp = False
+            prev_stage_lead = WORLD_RANK - 1 if WORLD_RANK > 0 else WORLD_SIZE - 1
+            next_stage_lead = WORLD_RANK + 1 if WORLD_RANK < WORLD_SIZE - 1 else 0
+            comms = [None, WORLD_RANK, prev_stage_lead, next_stage_lead]
+        comms.append(is_first_stage)
+        comms.append(is_last_stage)
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts), comms=comms)
@@ -738,31 +782,6 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
-def get_comms(node_id, gpu):
-    global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
-    local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
-    dist.all_gather_into_tensor(global_map, local_map)
-    first_node = torch.min(global_map[:, 0]).item()
-    last_node = torch.max(global_map[:, 0]).item()
-    local_group, local_leader = None, None
-
-    for ni in range(first_node, last_node + 1):
-        ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
-        node_group = dist.new_group(
-            ranks_on_node, backend="nccl", use_local_synchronization=True
-        )
-        if node_id == ni:
-            local_group = node_group
-            local_leader = min(ranks_on_node)
-
-    prev_node = node_id - 1 if node_id != first_node else last_node
-    next_node = node_id + 1 if node_id != last_node else first_node
-    prev_node_leader = torch.min(global_map[global_map[:, 0] == prev_node][:, 1]).item()
-    next_node_leader = torch.min(global_map[global_map[:, 0] == next_node][:, 1]).item()
-
-    return [local_group, local_leader, prev_node_leader, next_node_leader]
-
-
 def main(
     model_path: str,
     node_id: int,
@@ -787,12 +806,9 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    comms = get_comms(node_id, gpu)
 
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(
-        model_path=Path(model_path), node_id=node_id, gpu=gpu, comms=comms
-    )
+    model = Transformer.load(model_path=Path(model_path), node_id=node_id, gpu=gpu)
 
     # warmup
     generate(
