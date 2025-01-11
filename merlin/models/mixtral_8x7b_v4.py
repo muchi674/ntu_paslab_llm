@@ -553,7 +553,10 @@ class Transformer(nn.Module):
             h = self.tok_embeddings(h)
         else:
             if WORLD_RANK == self.local_leader:
-                dist.recv(h, self.prev_stage_leader)
+                for req in dist.batch_isend_irecv(
+                    [dist.P2POp(dist.irecv, h, self.prev_stage_leader)]
+                ):
+                    req.wait()
             if self.local_group is not None:
                 dist.broadcast(h, self.local_leader, group=self.local_group)
         freqs_cis = self.freqs_cis[input_metadata.positions]
@@ -568,7 +571,10 @@ class Transformer(nn.Module):
             ys = self.output(self.norm(h))
         else:
             if WORLD_RANK == self.local_leader:
-                dist.send(h, self.next_stage_leader)
+                for req in dist.batch_isend_irecv(
+                    [dist.P2POp(dist.isend, h, self.next_stage_leader)]
+                ):
+                    req.wait()
             ys = torch.zeros(
                 (xs.shape[0], self.args.vocab_size),
                 dtype=self.dtype,
@@ -657,8 +663,8 @@ class Transformer(nn.Module):
 
             comms = [local_group, local_leader, prev_stage_lead, next_stage_lead]
         else:
-            prev_stage_lead = WORLD_RANK - 1 if WORLD_RANK > 0 else WORLD_SIZE - 1
-            next_stage_lead = WORLD_RANK + 1 if WORLD_RANK < WORLD_SIZE - 1 else 0
+            prev_stage_lead = (WORLD_RANK + 1) % WORLD_SIZE
+            next_stage_lead = (WORLD_RANK - 1 + WORLD_SIZE) % WORLD_SIZE
             comms = [None, WORLD_RANK, prev_stage_lead, next_stage_lead]
         comms.append(is_first_stage)
         comms.append(is_last_stage)
@@ -882,7 +888,6 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     torch.cuda.cudart().cudaProfilerStop()
-    torch.cuda.synchronize()
     dist.barrier()
     dist.destroy_process_group()
 
