@@ -1,7 +1,7 @@
 {
+    "split_attn_weights": false,
     "design": [
         {
-            "n_experts": 8,
             "tp_size": 6
         }
     ]
