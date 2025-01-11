@@ -83,7 +83,6 @@ class ModelArgs:
     last_layer: int = None
     n_assigned_layers: int = None
     attn_tp: bool = False
-    intra_node_parallel: bool = False
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -446,7 +445,8 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        if self.group is not None:
+            dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
 
@@ -604,6 +604,7 @@ class Transformer(nn.Module):
         )
 
         # detect parallelization of expert weights (TP or EP)
+        intra_node_parallel = False
         if (
             any(
                 f"{model_args.first_layer}.{ei}.w1" not in experts
@@ -612,7 +613,7 @@ class Transformer(nn.Module):
             or experts[f"{model_args.first_layer}.0.w1"].shape[0]
             < model_args.hidden_dim
         ):
-            model_args.intra_node_parallel = True
+            intra_node_parallel = True
 
         # adjust for tensor parallel attention
         if (
@@ -626,7 +627,7 @@ class Transformer(nn.Module):
             model_args.attn_tp = True
 
         comms: list
-        if model_args.intra_node_parallel:
+        if intra_node_parallel:
             global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
             local_map = torch.tensor(
                 [node_id, WORLD_RANK], dtype=torch.int64, device=gpu
