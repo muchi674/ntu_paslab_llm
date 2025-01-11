@@ -663,8 +663,8 @@ class Transformer(nn.Module):
 
             comms = [local_group, local_leader, prev_stage_lead, next_stage_lead]
         else:
-            prev_stage_lead = (WORLD_RANK + 1) % WORLD_SIZE
-            next_stage_lead = (WORLD_RANK - 1 + WORLD_SIZE) % WORLD_SIZE
+            prev_stage_lead = (WORLD_RANK - 1 + WORLD_SIZE) % WORLD_SIZE
+            next_stage_lead = (WORLD_RANK + 1) % WORLD_SIZE
             comms = [None, WORLD_RANK, prev_stage_lead, next_stage_lead]
         comms.append(is_first_stage)
         comms.append(is_last_stage)
