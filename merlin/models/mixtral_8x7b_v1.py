@@ -419,10 +419,10 @@ class MoeLayer(nn.Module):
 
     def forward(self, inputs: torch.Tensor, is_prefill: bool, need_profile: bool) -> torch.Tensor:
         # computation
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        #start = torch.cuda.Event(enable_timing=True)
+        #end = torch.cuda.Event(enable_timing=True)
 
-        start.record()
+        #start.record()
         gate_logits = self.gate(inputs)
         
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -443,29 +443,29 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        end.record()
+        #end.record()
 
-        torch.cuda.synchronize()
-        if need_profile:
-            if is_prefill:
-                self.prefill_comp_time.append(start.elapsed_time(end))
-            else: 
-                self.decode_comp_time.append(start.elapsed_time(end))
+        #torch.cuda.synchronize()
+        #if need_profile:
+        #    if is_prefill:
+        #        self.prefill_comp_time.append(start.elapsed_time(end))
+        #    else: 
+        #        self.decode_comp_time.append(start.elapsed_time(end))
 
         # communication
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        #start = torch.cuda.Event(enable_timing=True)
+        #end = torch.cuda.Event(enable_timing=True)
 
-        start.record()
+        #start.record()
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        end.record()
+        #end.record()
 
-        torch.cuda.synchronize()
-        if need_profile:
-            if is_prefill:
-                self.prefill_comm_time.append(start.elapsed_time(end))
-            else: 
-                self.decode_comm_time.append(start.elapsed_time(end))
+        #torch.cuda.synchronize()
+        #if need_profile:
+        #    if is_prefill:
+        #        self.prefill_comm_time.append(start.elapsed_time(end))
+        #    else: 
+        #        self.decode_comm_time.append(start.elapsed_time(end))
 
         return results
 
