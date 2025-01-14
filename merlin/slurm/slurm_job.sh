@@ -15,10 +15,6 @@
 export UCX_NET_DEVICES=mlx5_0:1
 export UCX_IB_GPU_DIRECT_RDMA=1
 
-# use custom pytorch image
-SIF=/home/paslab504q/paslab_llm.sif
-SINGULARITY="singularity run --nv $SIF"
-
 # enable NCCL log
 # export NCCL_DEBUG=INFO
 

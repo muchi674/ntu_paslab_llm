@@ -23,7 +23,11 @@
 + `WORLD_SIZE`: total number of processes/gpus (nnodes * nproc-per-node), set by torchrun
 + `RANK`: global processes/gpu id, set by torchrun
 
-## Build image (local)
+## Build image [in the local machine] (optional)
+
+(Optional): The environment can be set up on the login node using tools like Conda and `pip install`. Activate the target environment before running a job, as it will be shared across computing nodes.
+
+For those requiring packages installed with `sudo`:
 
 Build the image in our local machine from the definition (`paslab_llm.def`)
 
@@ -42,12 +46,43 @@ $ sftp <location>
 sftp> put paslab_llm.sif
 ```
 
-## Submit job (in the login node)
+## Environment setup [in the login node]
+
+The environment is shared to all nodes
+
+```bash
+$ module load miniconda3 # You can install it yourself if the `miniconda3` module is not available in the environment
+$ conda create -n merlin python=3.10
+$ conda activate merlin
+$ pip install -r requirements.txt
+```
+
+## Slurm commands [in the login node]
+
+Submit a job
 
 ```bash
 $ ls
 model.py paslab_llm.sif slurm_job.sh
 $ sbatch -o "R_$(date +%Y%m%d%H%M%S)_%j.log" slurm_job.sh
+```
+
+Check the job status
+
+```bash
+$ sacct
+```
+
+Cancel a submitted job
+
+```bash
+$ scancel JOB_ID
+```
+
+Check the slurm queue status
+
+```bash
+$ squeue
 ```
 
 # References
