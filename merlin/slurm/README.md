@@ -18,7 +18,8 @@
 
 ### Environment variables
 
-+ `SLURM_PROCID`: task ID, which is also the node ID since our ntasks-per-node is set to 1, set by slurm
++ ~~`SLURM_PROCID`: task ID, which is also the node ID since our ntasks-per-node is set to 1, set by slurm~~ (use `GROUP_RANK`)
++ `GROUP_RANK`: node id, set by torchrun
 + `LOCAL_RANK`: local processes/gpu id, set by torchrun
 + `WORLD_SIZE`: total number of processes/gpus (nnodes * nproc-per-node), set by torchrun
 + `RANK`: global processes/gpu id, set by torchrun
