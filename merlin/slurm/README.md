@@ -7,6 +7,7 @@
 🚧: requires configuration
 
 + `--account=GOVxxxxxx`: project ID 🚧
++ `--partition=normal`: use `scontrol show partition` to show all avaliable partitions
 + `--nodes=2`: total number of nodes 🚧
 + `--mem=8G`: main memory 🚧
 + `--ntasks-per-node=1`: fixed to 1, one torchrun per node https://stackoverflow.com/a/65897194
@@ -72,6 +73,9 @@ Check the job status
 
 ```bash
 $ sacct
+# or
+$ sacct -X -j JOB_ID
+$ scontrol show job JOB_ID
 ```
 
 Cancel a submitted job
@@ -80,10 +84,11 @@ Cancel a submitted job
 $ scancel JOB_ID
 ```
 
-Check the slurm queue status
+Check the supercomputer status
 
 ```bash
-$ squeue
+$ squeue # show the queue status
+$ sinfo -N -l # show the info for nodes
 ```
 
 # References
