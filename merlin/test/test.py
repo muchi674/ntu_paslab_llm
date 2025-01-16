@@ -54,34 +54,37 @@ def test(input_size):
     tmp = selected_experts.to("cpu")
     eis, bis, nes = [], [], []
     ### original
-    with nvtx.annotate("data transferr", color="purple"):
-        for ei in range(8):
-            batch_idx, nth_expert = torch.where(tmp == ei)
-            with nvtx.annotate("one sec", color="blue"):
-                if torch.numel(batch_idx) > 0:
-                    eis.append(ei)
-                    bis.append(batch_idx.to(device=device))
-                    nes.append(nth_expert.to(device=device))
-
-    ### one memcpy
-    # with nvtx.annotate("full range", color="purple"):
-    #     #select_shape = []   # for one memcpy version, save the tensor's size
-        
+    # with nvtx.annotate("data transferr", color="purple"):
     #     for ei in range(8):
     #         batch_idx, nth_expert = torch.where(tmp == ei)
-    #         if torch.numel(batch_idx) > 0:
-    #             eis.append(ei)
-    #             bis.append(batch_idx)
-    #             nes.append(nth_expert)
-    #             #select_shape.append(len(batch_idx))
-    #     with nvtx.annotate("data transferr", color="blue"):
-    #         concat_bis = torch.cat(bis, dim=0)
-    #         concat_bis_cpu = concat_bis.cpu()
-    #         #bis = torch.split(concat_bis_cpu, [len(t) for t in bis])
+    #         with nvtx.annotate("one sec", color="blue"):
+    #             if torch.numel(batch_idx) > 0:
+    #                 eis.append(ei)
+    #                 with nvtx.annotate("each trans", color="blue"):
+    #                     bis.append(batch_idx.to(device=device))
+    #                 with nvtx.annotate("each trans", color="blue"):
+    #                     nes.append(nth_expert.to(device=device))
 
-    #         concat_nes = torch.cat(bis, dim=0)
-    #         concat_nes_cpu = concat_nes.cpu()
-    #         #nes = torch.split(concat_nes_cpu, [len(t) for t in nes])
+    ### one memcpy
+    with nvtx.annotate("full range", color="purple"):
+        #select_shape = []   # for one memcpy version, save the tensor's size
+        
+        for ei in range(8):
+            batch_idx, nth_expert = torch.where(tmp == ei)
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx)
+                nes.append(nth_expert)
+                #select_shape.append(len(batch_idx))
+        concat_bis = torch.cat(bis, dim=0)
+        concat_nes = torch.cat(bis, dim=0)
+        with nvtx.annotate("data transferr", color="blue"):
+            
+            concat_bis_cpu = concat_bis.to(device=device)
+            #bis = torch.split(concat_bis_cpu, [len(t) for t in bis])
+
+            concat_nes_cpu = concat_nes.to(device=device)
+            #nes = torch.split(concat_nes_cpu, [len(t) for t in nes])
 
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
