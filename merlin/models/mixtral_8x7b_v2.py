@@ -429,12 +429,18 @@ class MoeLayer(nn.Module):
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
+        for ei in range(8):
+            batch_idx, nth_expert = torch.where(tmp == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+                bis.append(batch_idx)
+                nes.append(nth_expert)
+                #select_shape.append(len(batch_idx))
+        concat_bis = torch.cat(bis, dim=0).to(device=device)
+        concat_nes = torch.cat(bis, dim=0).to(device=device)
+            
+        bis = torch.split(concat_bis_cpu, [len(t) for t in bis])
+        nes = torch.split(concat_nes_cpu, [len(t) for t in nes])
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
