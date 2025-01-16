@@ -1,0 +1,29 @@
+Starting program execution...
+Running program with input size: 32
+1.1620521545410156
+-------------------------
+Running program with input size: 64
+1.1742115020751953
+-------------------------
+Running program with input size: 128
+1.1763572692871094
+-------------------------
+Running program with input size: 256
+1.180887222290039
+-------------------------
+Running program with input size: 512
+1.2102127075195312
+-------------------------
+Running program with input size: 1024
+1.252889633178711
+-------------------------
+Running program with input size: 2048
+1.3015270233154297
+-------------------------
+Running program with input size: 4096
+1.4829635620117188
+-------------------------
+Running program with input size: 8192
+1.7223358154296875
+-------------------------
+Program execution finished!
