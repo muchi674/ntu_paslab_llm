@@ -612,6 +612,7 @@ def generate(
 
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
+        print(f"{WORLD_RANK}: {next_token}, {eos_id}\n")
         is_finished = is_finished | (next_token == eos_id).cpu()
 
         if is_finished.all():
