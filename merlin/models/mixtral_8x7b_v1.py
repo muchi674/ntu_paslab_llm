@@ -612,17 +612,13 @@ def generate(
 
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        print(f"{WORLD_RANK}: iter{_}, {next_token}, {eos_id}\n")
         is_finished = is_finished | (next_token == eos_id).cpu()
 
         if is_finished.all():
-            print(f"{WORLD_RANK}, here0\n")
             break
 
         generated_tensors.append(next_token[:, None])
-        print(f"{WORLD_RANK}, here1\n")
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        print(f"{WORLD_RANK}, here2\n")
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
