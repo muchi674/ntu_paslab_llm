@@ -612,7 +612,7 @@ def generate(
 
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        print(f"{WORLD_RANK}: {next_token}, {eos_id}\n")
+        print(f"{WORLD_RANK}: iter{_}, {next_token}, {eos_id}\n")
         is_finished = is_finished | (next_token == eos_id).cpu()
 
         if is_finished.all():
@@ -783,6 +783,7 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(0)
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control
