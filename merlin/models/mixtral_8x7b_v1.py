@@ -602,7 +602,9 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
+    print(f"{WORLD_RANK}, here0 ")
     dist.barrier()
+    print(f"{WORLD_RANK}, here1 ")
     prefill_time = time.time() - tic
     tic = time.time()
 
