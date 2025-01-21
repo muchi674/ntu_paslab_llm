@@ -344,12 +344,20 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
+        # eric891224
+        self.comp_start = torch.cuda.Event(enable_timing=True)
+        # self.comm_start = torch.cuda.Event(enable_timing=True)
+        # self.comm_end = torch.cuda.Event(enable_timing=True)
+        self.comp_end = torch.cuda.Event(enable_timing=True)
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
+        self.comp_start.record()
+
         seqlen_sum, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -388,7 +396,12 @@ class Attention(nn.Module):
         # exp. compare v1 v2
         # dist.barrier()
 
-        return self.wo(output)  # type: ignore
+        # return self.wo(output)  # type: ignore
+        output = self.wo(output)
+    
+        self.comp_end.record()
+        return output
+
 
 
 class Experts:
@@ -684,6 +697,28 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
+def get_atten_stats(model: Transformer):
+    ete = 0
+    comp = 0
+    comm = 0
+    n_layers = 0
+
+    for block in model.layers.values():
+        # ete += block.atten_start.elapsed_time(block.atten_end)
+        ete += block.attention.comp_start.elapsed_time(block.attention.comp_end)
+        comp += block.attention.comp_start.elapsed_time(block.attention.comp_end)
+        # comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
+        # comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
+        # comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
+        n_layers += 1
+
+    print(f"total end-to-end time: {ete} ms")
+    print(f"total computation time: {comp} ms")
+    print(f"total communication time: {comm} ms")
+    print(f"avg end-to-end time: {ete/n_layers} ms")
+    print(f"avg computation time: {comp/n_layers} ms")
+    print(f"avg communication time: {comm/n_layers} ms")
+
 def main(
     model_path: str,
     node_id: int,
@@ -783,6 +818,11 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+        # eric891224
+        print("=" * 20)
+        print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
+        get_atten_stats(model=model)
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)

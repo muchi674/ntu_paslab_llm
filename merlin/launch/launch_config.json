@@ -5,9 +5,9 @@
     "username": "eric891224",
     "shared_exec_args": {
         "prompt_path": "~/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 128,
-        "batch_size": 16,
-        "max_tokens": 128,
+        "n_prompts": 512,
+        "batch_size": 64,
+        "max_tokens": 64,
         "hide_resp": false
     },
     "nodes": {
@@ -18,7 +18,7 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_v2.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v2-3-5",
             "node_id": 0,
-            "profile": false,
+            "profile": true,
             "profiling_output": "n51-v2.35-bs16"
         },
         "10.10.10.2": {
