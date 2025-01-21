@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import time
 
-torch.manual_seed(1234)
+torch.manual_seed(5678)
 
 @dataclass
 class ModelArgs:
@@ -27,7 +27,6 @@ class Experts:
         w3: torch.Tensor = self.ws[f"{ei}.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
     
-count = [0 for _ in range(8)]
 class MoeLayer(nn.Module):
     def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
@@ -68,26 +67,28 @@ class MoeLayer(nn.Module):
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
                 nes.append(nth_expert.to(device=inputs.device))
-        
+       
         # count tokens for each expert 
+        # count = [0 for _ in range(8)]
         # for i in range(selected_experts.shape[0]):
         #     for j in range(selected_experts.shape[1]):
         #         count[selected_experts[i][j].item()] += 1
+        # print("===============================")
+        # print(count)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
+        torch.cuda.synchronize(device=inputs.device)
+        tic = time.time()
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(ei, inputs[batch_idx])
-            if ey is None:
-                continue
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        end.record()
+            # if ey is None:
+            #     continue
+            # results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        torch.cuda.synchronize(device=inputs.device)
+        toc = time.time()
 
         torch.cuda.synchronize(device=inputs.device)
         if need_profile:
-           self.comp_time.append(start.elapsed_time(end))
+           self.comp_time.append((toc-tic)*1000)
 
         return results
 
@@ -96,8 +97,8 @@ device = "cuda:0"
 args = ModelArgs()
 
 # =========================== #
-experts_on_node = [i for i in range(3, 8)]
-tp_size = 4
+experts_on_node = [i for i in range(0, 8)]
+tp_size = 6
 batch_size = 32
 # =========================== #
 
