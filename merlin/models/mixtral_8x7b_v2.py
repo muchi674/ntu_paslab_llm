@@ -772,7 +772,11 @@ def get_atten_timer_stats(model: Transformer):
         comp += block.attention.comp_records[key] * f_s2ms
         comm += block.attention.comm_records[key] * f_s2ms
 
-    result = f"Rank {WORLD_RANK}\ntotal end-to-end (transformer block level) time: {bete} ms\ntotal end-to-end time: {ete} ms\ntotal computation time: {comp} ms\ntotal communication time: {comm} ms"
+    result = f"Rank {WORLD_RANK}\n"
+    + f"total end-to-end (transformer block level) time: {bete} ms\n"
+    + f"total end-to-end time: {ete} ms\n"
+    + f"total computation time: {comp} ms\n"
+    + f"total communication time: {comm} ms\n"
 
     print(result)
     # print(f"Rank {WORLD_RANK} total end-to-end (transformer block level) time: {bete} ms")
@@ -923,14 +927,16 @@ def main(
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
 
-    dist.barrier(group=node_group)
-    get_atten_timer_stats(model=model)
+    # dist.barrier(group=node_group)
+    # get_atten_timer_stats(model=model)
 
         
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)
     dist.destroy_process_group()
+
+    get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
