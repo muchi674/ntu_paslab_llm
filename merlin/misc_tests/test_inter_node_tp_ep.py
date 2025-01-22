@@ -52,7 +52,8 @@ def test(
 ):
     adjusted_d = ceildiv(interm_d, tp_size)
     x = torch.ones((n_tokens, model_d), dtype=dtype, device=GPU)
-    print(f"[{WORLD_RANK}] expert shape: ({adjusted_d}, {model_d})\n")
+    if LOCAL_RANK == 0:
+        print(f"expert shape: ({adjusted_d}, {model_d})\n")
     experts = {}
     for ei in local_experts:
         experts[f"{ei}.w1"] = torch.rand((adjusted_d, model_d), dtype=dtype, device=GPU)
@@ -85,9 +86,10 @@ def init_processes(node_id):
     )
 
     for case in test_cases:
-        print(case)
         n_tokens = case.pop("n_tokens")
         for args in case.values():
+            if LOCAL_RANK == 0:
+                print(args)
             tp_size, activated_experts, msg = args
             test(expert_map[node_id], n_tokens, tp_size, activated_experts, msg)
         print()
@@ -101,4 +103,5 @@ if __name__ == "__main__":
     parser.add_argument("--node-id", type=int)
     args = parser.parse_args()
     init_processes(args.node_id)
-    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node_tp_ep.py --node-id 0
+    # torchrun --nnodes=2 --node-rank=1 --nproc-per-node=4 --master-addr=10.10.10.1 --master-port=9091 test_inter_node_tp_ep.py --node-id 1
