@@ -727,19 +727,22 @@ def get_node_group(node_id, gpu, global_group):
     return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
 def get_atten_stats(model: Transformer):
+    bete = 0
     ete = 0
     comp = 0
     comm = 0
     n_layers = 0
 
     for block in model.layers.values():
-        # ete += block.atten_start.elapsed_time(block.atten_end)
+        bete += block.atten_start.elapsed_time(block.atten_end)
         ete += block.attention.comp_start.elapsed_time(block.attention.comp_end)
         comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
         comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
         comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
         n_layers += 1
 
+
+    print(f"total end-to-end (transformer block level) time: {bete} ms")
     print(f"total end-to-end time: {ete} ms")
     print(f"total computation time: {comp} ms")
     print(f"total communication time: {comm} ms")
