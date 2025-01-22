@@ -772,10 +772,13 @@ def get_atten_timer_stats(model: Transformer):
         comp += block.attention.comp_records[key] * f_s2ms
         comm += block.attention.comm_records[key] * f_s2ms
 
-    print(f"Rank {WORLD_RANK} total end-to-end (transformer block level) time: {bete} ms")
-    print(f"Rank {WORLD_RANK} total end-to-end time: {ete} ms")
-    print(f"Rank {WORLD_RANK} total computation time: {comp} ms")
-    print(f"Rank {WORLD_RANK} total communication time: {comm} ms")
+    result = f"Rank {WORLD_RANK}\ntotal end-to-end (transformer block level) time: {bete} ms\ntotal end-to-end time: {ete} ms\ntotal computation time: {comp} ms\ntotal communication time: {comm} ms"
+
+    print(result)
+    # print(f"Rank {WORLD_RANK} total end-to-end (transformer block level) time: {bete} ms")
+    # print(f"Rank {WORLD_RANK} total end-to-end time: {ete} ms")
+    # print(f"Rank {WORLD_RANK} total computation time: {comp} ms")
+    # print(f"Rank {WORLD_RANK} total communication time: {comm} ms")
     # print(f"avg end-to-end (transformer block level) time: {bete/n_layers} ms")
     # print(f"avg end-to-end time: {ete/n_layers} ms")
     # print(f"avg computation time: {comp/n_layers} ms")
