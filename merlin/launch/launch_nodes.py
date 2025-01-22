@@ -132,7 +132,6 @@ def main():
             f"ssh -i ~/.ssh/id_merlin {username}@{url} -p {ssh_port} "
             + "'"
             + f'export PATH="$PATH:/home/{username}/miniconda3/condabin/" && '
-            + f"source ~/.bashrc && "
             + f"cd /home/{username}/ntu_paslab_llm/merlin && "
             + f"git pull  origin noly_ep && "
             + f"conda activate merlin && "

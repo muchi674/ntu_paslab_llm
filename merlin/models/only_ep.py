@@ -420,7 +420,7 @@ class MoeLayer(nn.Module):
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
-        for ei in range(self.num_experts - 2):
+        for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
