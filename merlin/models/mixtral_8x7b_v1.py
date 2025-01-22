@@ -494,7 +494,7 @@ class TransformerBlock(nn.Module):
         self.atten_start.record()
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         self.atten_end.record()
-        print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
+        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
 
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
@@ -705,14 +705,14 @@ def get_atten_stats(model: Transformer):
 
     for block in model.layers.values():
         # ete += block.atten_start.elapsed_time(block.atten_end)
-        ete += block.attention.comp_start.elapsed_time(block.attention.comp_end)
+        ete += block.atten_start.elapsed_time(block.atten_end)
         comp += block.attention.comp_start.elapsed_time(block.attention.comp_end)
         # comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
         # comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
         # comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
         n_layers += 1
 
-    print(f"total end-to-end time: {ete} ms")
+    print(f"total end-to-end (transformer block level) time: {ete} ms")
     print(f"total computation time: {comp} ms")
     print(f"total communication time: {comm} ms")
     print(f"avg end-to-end time: {ete/n_layers} ms")
