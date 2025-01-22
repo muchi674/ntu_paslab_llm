@@ -346,10 +346,14 @@ class Attention(nn.Module):
         self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
         # eric891224
-        self.comp_start = torch.cuda.Event(enable_timing=True)
-        self.comm_start = torch.cuda.Event(enable_timing=True)
-        self.comm_end = torch.cuda.Event(enable_timing=True)
-        self.comp_end = torch.cuda.Event(enable_timing=True)
+        # timer-based
+        self.comp_records = dict()
+        self.comm_records = dict()
+        # event-based
+        # self.comp_start = torch.cuda.Event(enable_timing=True)
+        # self.comm_start = torch.cuda.Event(enable_timing=True)
+        # self.comm_end = torch.cuda.Event(enable_timing=True)
+        # self.comp_end = torch.cuda.Event(enable_timing=True)
 
     def forward(
         self,
@@ -357,7 +361,9 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        self.comp_start.record()
+        # self.comp_start.record()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
 
         seqlen_sum, model_dim = x.shape
 
@@ -402,14 +408,26 @@ class Attention(nn.Module):
 
         # exp. compare v1 v2
         # dist.barrier(group=self.group)
-        self.comm_start.record()
+        torch.cuda.synchronize()
+        td = time.perf_counter()
+        self.comp_records[f'{WORLD_RANK}'] = td - ts
+
+        # self.comm_start.record()
 
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
 
-        self.comm_end.record()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
+        self.comm_records[f'{WORLD_RANK}'] = ts - td
+
+        # self.comm_end.record()
         # return torch.sum(local_world_out, dim=0)
         local_world_out = torch.sum(local_world_out, dim=0)
-        self.comp_end.record()
+
+        # self.comp_end.record()
+        torch.cuda.synchronize()
+        td = time.perf_counter()
+        self.comp_records[f'{WORLD_RANK}'] += td - ts
 
         return local_world_out
 
@@ -496,17 +514,28 @@ class TransformerBlock(nn.Module):
 
         # eric891224
         self.li = li
-        self.atten_start = torch.cuda.Event(enable_timing=True)
-        self.atten_end = torch.cuda.Event(enable_timing=True)
+        # timer-based
+        self.records = dict()
+        # event-based
+        # self.atten_start = torch.cuda.Event(enable_timing=True)
+        # self.atten_end = torch.cuda.Event(enable_timing=True)
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        self.atten_start.record()
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
-        self.atten_end.record()
-        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
+        # self.atten_start.record()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
 
+        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+
+        torch.cuda.synchronize()
+        te = time.perf_counter()
+        self.records[f'{WORLD_RANK}'] = te - ts
+
+        # self.atten_end.record()
+        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
+        
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -726,6 +755,33 @@ def get_node_group(node_id, gpu, global_group):
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
     return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
+def get_atten_timer_stats(model: Transformer):
+    bete = 0
+    ete = 0
+    comp = 0
+    comm = 0
+    n_layers = 32
+
+    f_s2ms = 1000
+
+    key = f'{WORLD_RANK}'
+
+    for block in model.layers.values():
+        bete += block.records[key] * f_s2ms
+        ete += (block.attention.comp_records[key] + block.attention.comm_records[key]) * f_s2ms
+        comp += block.attention.comp_records[key] * f_s2ms
+        comm += block.attention.comm_records[key] * f_s2ms
+
+    print(f"Rank {WORLD_RANK} total end-to-end (transformer block level) time: {bete} ms")
+    print(f"Rank {WORLD_RANK} total end-to-end time: {ete} ms")
+    print(f"Rank {WORLD_RANK} total computation time: {comp} ms")
+    print(f"Rank {WORLD_RANK} total communication time: {comm} ms")
+    # print(f"avg end-to-end (transformer block level) time: {bete/n_layers} ms")
+    # print(f"avg end-to-end time: {ete/n_layers} ms")
+    # print(f"avg computation time: {comp/n_layers} ms")
+    # print(f"avg communication time: {comm/n_layers} ms")
+        
+
 def get_atten_stats(model: Transformer):
     bete = 0
     ete = 0
@@ -861,8 +917,11 @@ def main(
 
         # eric891224
         print("=" * 20)
-        print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
-        get_atten_stats(model=model)
+        # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
+        # get_atten_stats(model=model)
+
+    get_atten_timer_stats(model=model)
+
         
 
     torch.cuda.cudart().cudaProfilerStop()
