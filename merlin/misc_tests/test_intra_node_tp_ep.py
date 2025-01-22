@@ -93,8 +93,10 @@ def init_process(rank):
     """Initialize the distributed environment."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "9091"
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size, device_id=device
+    )
 
     for case in test_cases:
         print(case)
