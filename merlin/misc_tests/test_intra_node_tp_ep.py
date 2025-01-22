@@ -106,6 +106,9 @@ def init_process(rank):
             test(device, tp_size, n_tokens, n_activated_experts, msg)
         print()
 
+    dist.barrier()
+    dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     # assume running on 46
