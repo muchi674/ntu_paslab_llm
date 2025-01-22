@@ -1,0 +1,4 @@
+node 10.10.10.1
+[launched successfully]
+node 10.10.10.2
+[launched successfully]
