@@ -134,7 +134,7 @@ def main():
             + f'export PATH="$PATH:/home/{username}/miniconda3/condabin/" && '
             + f"source ~/.bashrc && "
             + f"cd /home/{username}/ntu_paslab_llm/merlin && "
-            #+ f"git pull  origin merlin && "
+            + f"git pull  origin noly_ep && "
             + f"conda activate merlin && "
             + f"python /home/{username}/ntu_paslab_llm/merlin/launch/run_node.py "
         )
