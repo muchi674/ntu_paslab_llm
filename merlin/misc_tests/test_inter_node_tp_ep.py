@@ -53,7 +53,7 @@ def test(
     adjusted_d = ceildiv(interm_d, tp_size)
     x = torch.ones((n_tokens, model_d), dtype=dtype, device=GPU)
     if LOCAL_RANK == 0:
-        print(f"expert shape: ({adjusted_d}, {model_d})\n")
+        print(f"expert shape: ({adjusted_d}, {model_d})")
     experts = {}
     for ei in local_experts:
         experts[f"{ei}.w1"] = torch.rand((adjusted_d, model_d), dtype=dtype, device=GPU)
@@ -77,7 +77,8 @@ def test(
         torch.cuda.synchronize(device=GPU)
         dist.barrier()
         latencies.append((time.time() - tic) * 1000)
-    print(f"[{WORLD_RANK}] avg {msg} latency: {round(mean(latencies), 2)} ms\n")
+    if LOCAL_RANK == 0:
+        print(f"avg {msg} latency: {round(mean(latencies), 2)} ms")
 
 
 def init_processes(node_id):
@@ -92,7 +93,8 @@ def init_processes(node_id):
                 print(args)
             tp_size, activated_experts, msg = args
             test(expert_map[node_id], n_tokens, tp_size, activated_experts, msg)
-        print()
+            if LOCAL_RANK == 0:
+                print("-" * 20 + "\n")
 
     dist.barrier()
     dist.destroy_process_group()
