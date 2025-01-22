@@ -23,8 +23,8 @@ test_cases = [
     {
         "n_tokens": 1,
         "tp_args": (6, [0, 1], "TP"),  # tp_size, activated_experts, msg,
-        "tp_ep_args": (LOCAL_WORLD_SIZE, [0, 1], "EP+TP"),  # both experts on 51
-        "ep_args": (1, [0, 1], "EP"),  # both experts on 51
+        "tp_ep_args": (LOCAL_WORLD_SIZE, [0, 3], "EP+TP"),  # both experts on 51
+        "ep_args": (1, [0, 3], "EP"),  # both experts on 51
     }
 ]
 
