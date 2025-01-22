@@ -408,7 +408,7 @@ class Attention(nn.Module):
         # self.comp_end.record()
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}'] += te - ts
+        self.comp_records[f'{WORLD_RANK}'] = te - ts
         return output
 
 
