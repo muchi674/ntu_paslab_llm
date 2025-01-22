@@ -920,6 +920,7 @@ def main(
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
 
+    dist.barrier(group=node_group)
     get_atten_timer_stats(model=model)
 
         
