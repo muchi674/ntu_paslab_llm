@@ -345,10 +345,14 @@ class Attention(nn.Module):
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
         # eric891224
-        self.comp_start = torch.cuda.Event(enable_timing=True)
+        # timer-based
+        self.comp_records = dict()
+        self.comm_records = dict()
+        # event-based
+        # self.comp_start = torch.cuda.Event(enable_timing=True)
         # self.comm_start = torch.cuda.Event(enable_timing=True)
         # self.comm_end = torch.cuda.Event(enable_timing=True)
-        self.comp_end = torch.cuda.Event(enable_timing=True)
+        # self.comp_end = torch.cuda.Event(enable_timing=True)
 
     def forward(
         self,
@@ -356,7 +360,9 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        self.comp_start.record()
+        # self.comp_start.record()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
 
         seqlen_sum, _ = x.shape
 
@@ -399,7 +405,10 @@ class Attention(nn.Module):
         # return self.wo(output)  # type: ignore
         output = self.wo(output)
     
-        self.comp_end.record()
+        # self.comp_end.record()
+        torch.cuda.synchronize()
+        te = time.perf_counter()
+        self.comp_records[f'{WORLD_RANK}'] += te - ts
         return output
 
 
@@ -485,15 +494,26 @@ class TransformerBlock(nn.Module):
 
         # eric891224
         self.li = li
-        self.atten_start = torch.cuda.Event(enable_timing=True)
-        self.atten_end = torch.cuda.Event(enable_timing=True)
+        # timer-based
+        self.records = dict()
+        # event-based
+        # self.atten_start = torch.cuda.Event(enable_timing=True)
+        # self.atten_end = torch.cuda.Event(enable_timing=True)
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        self.atten_start.record()
+        # self.atten_start.record()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
+
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
-        self.atten_end.record()
+
+        torch.cuda.synchronize()
+        te = time.perf_counter()
+        self.records[f'{WORLD_RANK}'] = te - ts
+
+        # self.atten_end.record()
         # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
 
         h = x + r
@@ -696,6 +716,32 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.multinomial(probs_sort, num_samples=1)
     return torch.gather(probs_idx, -1, next_token)
 
+def get_atten_timer_stats(model: Transformer):
+    bete = 0
+    ete = 0
+    comp = 0
+    comm = 0
+    n_layers = 32
+
+    f_s2ms = 1000
+
+    key = f'{WORLD_RANK}'
+
+    for block in model.layers.values():
+        bete += block.records[key] * f_s2ms
+        ete += (block.attention.comp_records[key]) * f_s2ms
+        comp += block.attention.comp_records[key] * f_s2ms
+        # comm += block.attention.comm_records[key] * f_s2ms
+
+    result = (
+    f"Rank {WORLD_RANK}\n"
+    + f"total end-to-end (transformer block level) time: {bete} ms\n"
+    + f"total end-to-end time: {ete} ms\n"
+    + f"total computation time: {comp} ms\n"
+    + f"total communication time: {comm} ms\n"
+    )
+
+    print(result)
 
 def get_atten_stats(model: Transformer):
     ete = 0
@@ -820,13 +866,15 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
         # eric891224
-        print("=" * 20)
-        print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
-        get_atten_stats(model=model)
+        # print("=" * 20)
+        # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
+        # get_atten_stats(model=model)
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
     dist.destroy_process_group()
+
+    get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
