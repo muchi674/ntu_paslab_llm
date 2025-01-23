@@ -857,7 +857,7 @@ def get_node_atten_timer_stats(model: Transformer):
 
     ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
 
-    dist.all_gather_object()
+    # dist.all_gather_object()
 
     print_stats(
         bete_p,
