@@ -346,8 +346,8 @@ class Attention(nn.Module):
 
         # eric891224
         # timer-based
-        self.comp_records = dict()
-        self.comm_records = dict()
+        self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+        # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
         # self.comp_start = torch.cuda.Event(enable_timing=True)
         # self.comm_start = torch.cuda.Event(enable_timing=True)
@@ -360,6 +360,10 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
+        if cache.prefill:
+            self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+            # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+
         # self.comp_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
@@ -408,7 +412,7 @@ class Attention(nn.Module):
         # self.comp_end.record()
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}'] = te - ts
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'] = te - ts
         return output
 
 
@@ -756,14 +760,16 @@ def get_atten_timer_stats(model: Transformer):
 
     for block in model.layers.values():
         bete_p += mean(block.records[key_p]) * f_s2ms
-        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
+        # ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
         comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
-        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
+        # comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
+        ete_p += comp_p#+comm_p 
 
         bete_d += mean(block.records[key_d]) * f_s2ms
-        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
+        # ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
         comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
-        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+        # comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+        ete_d += comp_d #+ comm_d
     
     print_stats(
         bete_p,
