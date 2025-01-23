@@ -837,7 +837,8 @@ def get_node_atten_timer_stats(model: Transformer):
     n_layers = 32
 
     print(LOCAL_WORLD_SIZE)
-    # for block in model.layers.values():
+    for block in model.layers.values():
+        print(len(block.records.keys()), (block.records.keys()))
     #     for key, val in block.records.items():
     #         if '_p' in key:
     #             bete_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
