@@ -777,10 +777,10 @@ def print_stats(
 ):
     result = (
     f"Rank {WORLD_RANK}\n"
-    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms"
-    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms"
-    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms"
-    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms"
+    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
+    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
+    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
+    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms\n"
     )
     
     print(result)
