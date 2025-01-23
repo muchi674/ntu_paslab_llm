@@ -859,14 +859,14 @@ def get_node_atten_timer_stats(model: Transformer, group):
 
     g_bete_p = g_bete_d = g_ete_p = g_ete_d = g_comp_p = g_comp_d = g_comm_p = g_comm_d = [None for _ in range(LOCAL_WORLD_SIZE)]
 
-    dist.all_gather_object(g_bete_p, [bete_p], group)
-    dist.all_gather_object(g_bete_d, [bete_p], group)
-    dist.all_gather_object(g_ete_p, [ete_p], group)
-    dist.all_gather_object(g_ete_d, [ete_d], group)
-    dist.all_gather_object(g_comp_p, [comp_p], group)
-    dist.all_gather_object(g_comp_d, [comp_d], group)
-    dist.all_gather_object(g_comm_p, [comm_p], group)
-    dist.all_gather_object(g_comm_d, [comm_d], group)
+    # dist.all_gather_object(g_bete_p, [bete_p], group)
+    # dist.all_gather_object(g_bete_d, [bete_p], group)
+    # dist.all_gather_object(g_ete_p, [ete_p], group)
+    # dist.all_gather_object(g_ete_d, [ete_d], group)
+    # dist.all_gather_object(g_comp_p, [comp_p], group)
+    # dist.all_gather_object(g_comp_d, [comp_d], group)
+    # dist.all_gather_object(g_comm_p, [comm_p], group)
+    # dist.all_gather_object(g_comm_d, [comm_d], group)
 
 
 
@@ -883,7 +883,7 @@ def get_node_atten_timer_stats(model: Transformer, group):
     # )
 
     if LOCAL_RANK == 0:
-        print(g_bete_p)
+        print(type(bete_p))
         # print_stats(
         #     g_bete_p,
         #     g_bete_d,
