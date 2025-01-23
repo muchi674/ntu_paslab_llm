@@ -836,7 +836,7 @@ def get_node_atten_timer_stats(model: Transformer, group):
     f_s2ms = 1000
     n_layers = 32
 
-    print(LOCAL_WORLD_SIZE)
+    # print(LOCAL_WORLD_SIZE)
     for block in model.layers.values():
         # print(len(block.records.keys()), (block.records.keys()))
         for key, val in block.records.items():
@@ -1038,10 +1038,10 @@ def main(
     dist.barrier(group=node_group)
     # get stats of each rank
     get_atten_timer_stats(model=model)
-    dist.barrier(group=node_group)
+    # dist.barrier(group=node_group)
     # # get avg stats of this node
     # if LOCAL_RANK == 0:
-    get_node_atten_timer_stats(model=model, group=node_group)
+    # get_node_atten_timer_stats(model=model, group=node_group)
 
         
 
