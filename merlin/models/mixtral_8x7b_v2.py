@@ -773,10 +773,11 @@ def print_stats(
     comp_p = "N/A",
     comp_d = "N/A",
     comm_p = "N/A",
-    comm_d = "N/A"
+    comm_d = "N/A",
+    description = f'Rank {WORLD_RANK}'
 ):
     result = (
-    f"Rank {WORLD_RANK}\n"
+    f"{description}\n"
     + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
     + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
     + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
@@ -819,35 +820,55 @@ def get_atten_timer_stats(model: Transformer):
         comp_p,
         comp_d,
         comm_p,
-        comm_d
+        comm_d,
     )
 
-# TODO
 def get_node_atten_timer_stats(model: Transformer):
-    bete_p = 0
-    bete_d = 0
-    ete_p = 0
-    ete_d = 0
-    comp_p = 0
-    comp_d = 0
-    comm_p = 0
-    comm_d = 0
+    bete_p = []
+    bete_d = []
+    # ete_p = []
+    # ete_d = []
+    comp_p = []
+    comp_d = []
+    comm_p = []
+    comm_d = []
 
     f_s2ms = 1000
 
-    key_p = f'{WORLD_RANK}_p'
-    key_d = f'{WORLD_RANK}_d'
-
     for block in model.layers.values():
-        bete_p += mean(block.records[key_p]) * f_s2ms
-        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
-        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
-        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
+        for key, val in block.records.items():
+            if '_p' in key:
+                bete_p += val
+            elif '_d' in key:
+                bete_d += val
+        for key, val in block.attention.comp_records.items():
+            if '_p' in key:
+                comp_p += val
+            elif '_d' in key:
+                comp_d += val
+        for key, val in block.attention.comm_records.items():
+            if '_p' in key:
+                comm_p += val
+            elif '_d' in key:
+                comm_d += val
+        
+    bete_p, bete_d = mean(bete_p) * f_s2ms, mean(bete_d) * f_s2ms
+    comp_p, comp_d = mean(comp_p) * f_s2ms, mean(comp_d) * f_s2ms
+    comm_p, comm_d = mean(comm_p) * f_s2ms, mean(comm_d) * f_s2ms
+    ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
 
-        bete_d += mean(block.records[key_d]) * f_s2ms
-        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
-        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
-        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+    print_stats(
+        bete_p,
+        bete_d,
+        ete_p,
+        ete_d,
+        comp_p,
+        comp_d,
+        comm_p,
+        comm_d,
+        'Nodes Average'
+    )
+
 
 def get_atten_stats(model: Transformer):
     bete = 0
@@ -987,16 +1008,19 @@ def main(
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
 
-    # dist.barrier(group=node_group)
-    # get_atten_timer_stats(model=model)
+    dist.barrier(group=node_group)
+    # get stats of each rank
+    get_atten_timer_stats(model=model)
+    dist.barrier(group=node_group)
+    # get avg stats of this node
+    if LOCAL_RANK == 0:
+        get_node_atten_timer_stats(model=model)
 
         
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)
     dist.destroy_process_group()
-
-    get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
