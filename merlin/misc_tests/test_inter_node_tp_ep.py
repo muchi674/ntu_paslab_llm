@@ -21,7 +21,7 @@ n_warmups, n_samples = 100, 10000
 expert_map = {0: (0, 1, 2), 1: (3, 4, 5, 6, 7)}  # node_id: experts responsible
 test_cases = [
     {
-        "n_tokens": 1,
+        "n_tokens": 4,
         "tp_args": (6, [0, 1], "TP"),  # tp_size, activated_experts, msg,
         "tp_ep_args": (LOCAL_WORLD_SIZE, [0, 3], "EP+TP"),  # both experts on 51
         "ep_args": (1, [0, 3], "EP"),  # both experts on 51
@@ -110,5 +110,5 @@ if __name__ == "__main__":
     parser.add_argument("--node-id", type=int)
     args = parser.parse_args()
     init_processes(args.node_id)
-    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node_tp_ep.py --node-id 0
-    # torchrun --nnodes=2 --node-rank=1 --nproc-per-node=4 --master-addr=10.10.10.1 --master-port=9091 test_inter_node_tp_ep.py --node-id 1
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9090 test_inter_node_tp_ep.py --node-id 0
+    # torchrun --nnodes=2 --node-rank=1 --nproc-per-node=4 --master-addr=10.10.10.1 --master-port=9090 test_inter_node_tp_ep.py --node-id 1
