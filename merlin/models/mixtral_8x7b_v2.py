@@ -839,19 +839,19 @@ def get_node_atten_timer_stats(model: Transformer):
     for block in model.layers.values():
         for key, val in block.records.items():
             if '_p' in key:
-                bete_p += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                bete_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
             elif '_d' in key:
-                bete_d += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                bete_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
         for key, val in block.attention.comp_records.items():
             if '_p' in key:
-                comp_p += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                comp_p += mean(val) / LOCAL_WORLD_SIZE  * f_s2ms
             elif '_d' in key:
-                comp_d += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                comp_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
         for key, val in block.attention.comm_records.items():
             if '_p' in key:
-                comm_p += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                comm_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
             elif '_d' in key:
-                comm_d += mean(val) / LOCAL_WORLD_SIZE / n_layers * f_s2ms
+                comm_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
 
     ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
 
