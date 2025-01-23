@@ -811,7 +811,16 @@ def get_atten_timer_stats(model: Transformer):
         comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
         comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
     
-
+    print_stats(
+        bete_p,
+        bete_d,
+        ete_p,
+        ete_d,
+        comp_p,
+        comp_d,
+        comm_p,
+        comm_d
+    )
     # result = (
     # f"Rank {WORLD_RANK}\n"
     # + f"total end-to-end (transformer block level) time: {bete} ms\n"
