@@ -495,7 +495,7 @@ class TransformerBlock(nn.Module):
         # eric891224
         self.li = li
         # timer-based
-        self.records = dict()
+        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
         # self.atten_start = torch.cuda.Event(enable_timing=True)
         # self.atten_end = torch.cuda.Event(enable_timing=True)
@@ -503,6 +503,9 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        if cache.prefill:
+            self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+
         # self.atten_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
@@ -511,7 +514,7 @@ class TransformerBlock(nn.Module):
 
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.records[f'{WORLD_RANK}'] = te - ts
+        self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
         # self.atten_end.record()
         # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
@@ -716,32 +719,63 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.multinomial(probs_sort, num_samples=1)
     return torch.gather(probs_idx, -1, next_token)
 
+def print_stats(
+    bete_p = "N/A",
+    bete_d = "N/A",
+    ete_p = "N/A",
+    ete_d = "N/A",
+    comp_p = "N/A",
+    comp_d = "N/A",
+    comm_p = "N/A",
+    comm_d = "N/A"
+):
+    result = (
+    f"Rank {WORLD_RANK}\n"
+    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
+    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
+    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
+    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms\n"
+    )
+    
+    print(result)
+
 def get_atten_timer_stats(model: Transformer):
-    bete = 0
-    ete = 0
-    comp = 0
-    comm = 0
-    n_layers = 32
+    bete_p = 0
+    bete_d = 0
+    ete_p = 0
+    ete_d = 0
+    comp_p = 0
+    comp_d = 0
+    comm_p = 0
+    comm_d = 0
 
     f_s2ms = 1000
 
-    key = f'{WORLD_RANK}'
+    key_p = f'{WORLD_RANK}_p'
+    key_d = f'{WORLD_RANK}_d'
 
     for block in model.layers.values():
-        bete += block.records[key] * f_s2ms
-        ete += (block.attention.comp_records[key]) * f_s2ms
-        comp += block.attention.comp_records[key] * f_s2ms
-        # comm += block.attention.comm_records[key] * f_s2ms
+        bete_p += mean(block.records[key_p]) * f_s2ms
+        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
+        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
+        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
 
-    result = (
-    f"Rank {WORLD_RANK}\n"
-    + f"total end-to-end (transformer block level) time: {bete} ms\n"
-    + f"total end-to-end time: {ete} ms\n"
-    + f"total computation time: {comp} ms\n"
-    + f"total communication time: {comm} ms\n"
+        bete_d += mean(block.records[key_d]) * f_s2ms
+        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
+        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
+        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+    
+    print_stats(
+        bete_p,
+        bete_d,
+        ete_p,
+        ete_d,
+        comp_p,
+        comp_d,
+        comm_p,
+        comm_d
     )
 
-    print(result)
 
 def get_atten_stats(model: Transformer):
     ete = 0

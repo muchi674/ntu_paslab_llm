@@ -821,16 +821,33 @@ def get_atten_timer_stats(model: Transformer):
         comm_p,
         comm_d
     )
-    # result = (
-    # f"Rank {WORLD_RANK}\n"
-    # + f"total end-to-end (transformer block level) time: {bete} ms\n"
-    # + f"total end-to-end time: {ete} ms\n"
-    # + f"total computation time: {comp} ms\n"
-    # + f"total communication time: {comm} ms\n"
-    # )
 
-    # print(result)
-        
+# TODO
+def get_node_atten_timer_stats(model: Transformer):
+    bete_p = 0
+    bete_d = 0
+    ete_p = 0
+    ete_d = 0
+    comp_p = 0
+    comp_d = 0
+    comm_p = 0
+    comm_d = 0
+
+    f_s2ms = 1000
+
+    key_p = f'{WORLD_RANK}_p'
+    key_d = f'{WORLD_RANK}_d'
+
+    for block in model.layers.values():
+        bete_p += mean(block.records[key_p]) * f_s2ms
+        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
+        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
+        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
+
+        bete_d += mean(block.records[key_d]) * f_s2ms
+        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
+        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
+        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
 
 def get_atten_stats(model: Transformer):
     bete = 0
