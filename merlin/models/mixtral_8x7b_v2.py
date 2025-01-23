@@ -837,7 +837,7 @@ def get_node_atten_timer_stats(model: Transformer):
 
     for block in model.layers.values():
         for key, val in block.records.items():
-            print(key)
+            print(key, val)
             # if '_p' in key:
             #     bete_p += val
             # elif '_d' in key:
