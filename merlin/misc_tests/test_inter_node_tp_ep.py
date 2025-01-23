@@ -19,13 +19,16 @@ dtype = torch.bfloat16
 model_d = 4096
 interm_d = 14336
 n_warmups, n_samples = 100, 10000
-expert_map = {0: (0, 1, 2), 1: (3, 4, 5, 6, 7)}  # node_id: experts responsible
+expert_map = {
+    "TP": {0: (0, 1, 2, 3, 4, 5, 6, 7), 1: (0, 1, 2, 3, 4, 5, 6, 7)},
+    "EP+TP": {0: (0, 1, 2), 1: (3, 4, 5, 6, 7)},
+}
 test_cases = [
     {
-        "batch_size": 16,
-        "tp_args": (6, "TP"),  # tp_size, activated_experts, msg,
-        "tp_ep_args": (LOCAL_WORLD_SIZE, "EP+TP"),  # both experts on 51
-        "ep_args": (1, "EP"),  # both experts on 51
+        "batch_size": 1,
+        "tp_args": (6, "TP"),  # tp_size, identifier,
+        "tp_ep_args": (LOCAL_WORLD_SIZE, "EP+TP"),
+        # "ep_args": (1, "EP"),
     }
 ]
 
@@ -48,7 +51,7 @@ def test(
     local_experts: tuple[int],
     batch_size: int,
     tp_size: int,
-    msg: str,
+    identifier: str,
 ):
     x = torch.ones((batch_size, model_d), dtype=dtype, device=GPU)
     gate_logits = torch.rand((batch_size, 8), dtype=dtype, device=GPU)
@@ -99,7 +102,7 @@ def test(
         dist.barrier()
         latencies.append((time.time() - tic) * 1000)
     if LOCAL_RANK == 0:
-        print(f"avg {msg} latency: {round(mean(latencies), 2)} ms")
+        print(f"avg {identifier} latency: {round(mean(latencies), 2)} ms")
 
 
 def init_processes(node_id):
@@ -112,8 +115,8 @@ def init_processes(node_id):
         for args in case.values():
             if LOCAL_RANK == 0:
                 print(args)
-            tp_size, msg = args
-            test(expert_map[node_id], batch_size, tp_size, msg)
+            tp_size, identifier = args
+            test(expert_map[identifier][node_id], batch_size, tp_size, identifier)
             if LOCAL_RANK == 0:
                 print("-" * 20 + "\n")
 
