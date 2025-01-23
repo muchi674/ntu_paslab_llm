@@ -836,36 +836,37 @@ def get_node_atten_timer_stats(model: Transformer):
     f_s2ms = 1000
     n_layers = 32
 
-    for block in model.layers.values():
-        for key, val in block.records.items():
-            if '_p' in key:
-                bete_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
-            elif '_d' in key:
-                bete_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
-        for key, val in block.attention.comp_records.items():
-            if '_p' in key:
-                comp_p += mean(val) / LOCAL_WORLD_SIZE  * f_s2ms
-            elif '_d' in key:
-                comp_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
-        for key, val in block.attention.comm_records.items():
-            if '_p' in key:
-                comm_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
-            elif '_d' in key:
-                comm_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
+    print(LOCAL_WORLD_SIZE)
+    # for block in model.layers.values():
+    #     for key, val in block.records.items():
+    #         if '_p' in key:
+    #             bete_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
+    #         elif '_d' in key:
+    #             bete_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
+    #     for key, val in block.attention.comp_records.items():
+    #         if '_p' in key:
+    #             comp_p += mean(val) / LOCAL_WORLD_SIZE  * f_s2ms
+    #         elif '_d' in key:
+    #             comp_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
+    #     for key, val in block.attention.comm_records.items():
+    #         if '_p' in key:
+    #             comm_p += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
+    #         elif '_d' in key:
+    #             comm_d += mean(val) / LOCAL_WORLD_SIZE * f_s2ms
 
-    ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
+    # ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
 
-    print_stats(
-        bete_p,
-        bete_d,
-        ete_p,
-        ete_d,
-        comp_p,
-        comp_d,
-        comm_p,
-        comm_d,
-        'Nodes Average'
-    )
+    # print_stats(
+    #     bete_p,
+    #     bete_d,
+    #     ete_p,
+    #     ete_d,
+    #     comp_p,
+    #     comp_d,
+    #     comm_p,
+    #     comm_d,
+    #     'Nodes Average'
+    # )
 
 
 def get_atten_stats(model: Transformer):
