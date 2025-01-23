@@ -25,7 +25,7 @@ expert_map = {
 }
 test_cases = [
     {
-        "batch_size": 1,
+        "batch_size": 4,
         "tp_args": (6, "TP"),  # tp_size, identifier,
         "tp_ep_args": (LOCAL_WORLD_SIZE, "EP+TP"),
         # "ep_args": (1, "EP"),
