@@ -52,6 +52,7 @@ def test(
 ):
     adjusted_d = ceildiv(interm_d, tp_size)
     x = torch.ones((n_tokens, model_d), dtype=dtype, device=GPU)
+    results = torch.zeros_like(x)
     if LOCAL_RANK == 0:
         print(f"expert shape: ({adjusted_d}, {model_d})")
     experts = {}
@@ -63,7 +64,9 @@ def test(
     # warmup
     for _ in range(n_warmups):
         for ei in activated_experts:
-            expert_forward(experts, ei, x)
+            ey = expert_forward(experts, ei, x)
+            if ey is not None:
+                results += ey * 0
     torch.cuda.synchronize(device=GPU)
     dist.barrier()
 
@@ -72,7 +75,9 @@ def test(
         tic = time.time()
 
         for ei in activated_experts:
-            expert_forward(experts, ei, x)
+            ey = expert_forward(experts, ei, x)
+            if ey is not None:
+                results += ey * 0
 
         torch.cuda.synchronize(device=GPU)
         dist.barrier()
