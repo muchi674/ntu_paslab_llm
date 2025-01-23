@@ -760,16 +760,14 @@ def get_atten_timer_stats(model: Transformer):
 
     for block in model.layers.values():
         bete_p += mean(block.records[key_p]) * f_s2ms
-        # ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
+        ete_p += (mean(block.attention.comp_records[key_p])) * f_s2ms
         comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
         # comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
-        ete_p += comp_p#+comm_p 
 
         bete_d += mean(block.records[key_d]) * f_s2ms
-        # ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
+        ete_d += (mean(block.attention.comp_records[key_d])) * f_s2ms
         comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
         # comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
-        ete_d += comp_d #+ comm_d
     
     print_stats(
         bete_p,
