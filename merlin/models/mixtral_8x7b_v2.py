@@ -823,6 +823,54 @@ def get_atten_timer_stats(model: Transformer):
         comm_d,
     )
 
+def get_node_atten_timer_stats(model: Transformer):
+    bete_p = 0
+    bete_d = 0
+    ete_p = 0
+    ete_d = 0
+    comp_p = 0
+    comp_d = 0
+    comm_p = 0
+    comm_d = 0
+
+    f_s2ms = 1000
+    n_layers = 32
+
+    print(LOCAL_WORLD_SIZE)
+    for block in model.layers.values():
+        print(len(block.records.keys()), (block.records.keys()))
+        for key, val in block.records.items():
+            if '_p' in key:
+                bete_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                bete_d += mean(val) * f_s2ms
+        for key, val in block.attention.comp_records.items():
+            if '_p' in key:
+                comp_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                comp_d += mean(val) * f_s2ms
+        for key, val in block.attention.comm_records.items():
+            if '_p' in key:
+                comm_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                comm_d += mean(val) * f_s2ms
+
+    ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
+
+    dist.all_gather_object()
+
+    print_stats(
+        bete_p,
+        bete_d,
+        ete_p,
+        ete_d,
+        comp_p,
+        comp_d,
+        comm_p,
+        comm_d,
+        'Nodes Average'
+    )
+
 
 def get_atten_stats(model: Transformer):
     bete = 0
@@ -963,7 +1011,14 @@ def main(
         # get_atten_stats(model=model)
 
     dist.barrier(group=node_group)
-    get_atten_timer_stats(model=model)        
+    # get stats of each rank
+    get_atten_timer_stats(model=model)
+    dist.barrier(group=node_group)
+    # # get avg stats of this node
+    # if LOCAL_RANK == 0:
+    get_node_atten_timer_stats(model=model)
+
+        
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)
