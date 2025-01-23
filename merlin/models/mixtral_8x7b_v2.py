@@ -823,7 +823,7 @@ def get_atten_timer_stats(model: Transformer):
         comm_d,
     )
 
-def get_node_atten_timer_stats(model: Transformer):
+def get_node_atten_timer_stats(model: Transformer, group):
     bete_p = 0
     bete_d = 0
     ete_p = 0
@@ -838,7 +838,7 @@ def get_node_atten_timer_stats(model: Transformer):
 
     print(LOCAL_WORLD_SIZE)
     for block in model.layers.values():
-        print(len(block.records.keys()), (block.records.keys()))
+        # print(len(block.records.keys()), (block.records.keys()))
         for key, val in block.records.items():
             if '_p' in key:
                 bete_p += mean(val) * f_s2ms
@@ -857,19 +857,44 @@ def get_node_atten_timer_stats(model: Transformer):
 
     ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
 
-    # dist.all_gather_object()
+    g_bete_p = g_bete_d = g_ete_p = g_ete_d = g_comp_p = g_comp_d = g_comm_p = g_comm_d = [None for _ in range(LOCAL_WORLD_SIZE)]
 
-    print_stats(
-        bete_p,
-        bete_d,
-        ete_p,
-        ete_d,
-        comp_p,
-        comp_d,
-        comm_p,
-        comm_d,
-        'Nodes Average'
-    )
+    dist.all_gather_object(g_bete_p, [bete_p], group)
+    dist.all_gather_object(g_bete_d, [bete_p], group)
+    dist.all_gather_object(g_ete_p, [ete_p], group)
+    dist.all_gather_object(g_ete_d, [ete_d], group)
+    dist.all_gather_object(g_comp_p, [comp_p], group)
+    dist.all_gather_object(g_comp_d, [comp_d], group)
+    dist.all_gather_object(g_comm_p, [comm_p], group)
+    dist.all_gather_object(g_comm_d, [comm_d], group)
+
+
+
+    # print_stats(
+    #     bete_p,
+    #     bete_d,
+    #     ete_p,
+    #     ete_d,
+    #     comp_p,
+    #     comp_d,
+    #     comm_p,
+    #     comm_d,
+    #     'Nodes Average'
+    # )
+
+    if LOCAL_RANK == 0:
+        print(g_bete_p)
+        # print_stats(
+        #     g_bete_p,
+        #     g_bete_d,
+        #     g_ete_p,
+        #     g_ete_d,
+        #     g_comp_p,
+        #     g_comp_d,
+        #     g_comm_p,
+        #     g_comm_d,
+        #     'Nodes Average'
+        # )
 
 
 def get_atten_stats(model: Transformer):
@@ -1016,7 +1041,7 @@ def main(
     dist.barrier(group=node_group)
     # # get avg stats of this node
     # if LOCAL_RANK == 0:
-    get_node_atten_timer_stats(model=model)
+    get_node_atten_timer_stats(model=model, group=node_group)
 
         
 
