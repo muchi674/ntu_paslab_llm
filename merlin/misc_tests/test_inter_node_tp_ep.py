@@ -6,6 +6,7 @@ import time
 from torch import nn
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 # Environment variables set by torch.distributed.launch
 LOCAL_WORLD_SIZE = torch.cuda.device_count()
@@ -21,10 +22,10 @@ n_warmups, n_samples = 100, 10000
 expert_map = {0: (0, 1, 2), 1: (3, 4, 5, 6, 7)}  # node_id: experts responsible
 test_cases = [
     {
-        "n_tokens": 4,
-        "tp_args": (6, [0, 1], "TP"),  # tp_size, activated_experts, msg,
-        "tp_ep_args": (LOCAL_WORLD_SIZE, [0, 3], "EP+TP"),  # both experts on 51
-        "ep_args": (1, [0, 3], "EP"),  # both experts on 51
+        "batch_size": 1,
+        "tp_args": (6, "TP"),  # tp_size, activated_experts, msg,
+        "tp_ep_args": (LOCAL_WORLD_SIZE, "EP+TP"),  # both experts on 51
+        "ep_args": (1, "EP"),  # both experts on 51
     }
 ]
 
@@ -45,14 +46,25 @@ def expert_forward(ws: dict, ei: int, x: torch.Tensor) -> torch.Tensor:
 
 def test(
     local_experts: tuple[int],
-    n_tokens: int,
+    batch_size: int,
     tp_size: int,
-    activated_experts: tuple[int],
     msg: str,
 ):
+    x = torch.ones((batch_size, model_d), dtype=dtype, device=GPU)
+    gate_logits = torch.rand((batch_size, 8), dtype=dtype, device=GPU)
+    weights, selected_experts = torch.topk(gate_logits, 2)
+    weights = F.softmax(weights, dim=1, dtype=torch.float).to(dtype)
+
+    selected_experts = selected_experts.to("cpu")
+    eis, bis, nes = [], [], []
+    for ei in range(8):
+        batch_idx, nth_expert = torch.where(selected_experts == ei)
+        if torch.numel(batch_idx) > 0:
+            eis.append(ei)
+            bis.append(batch_idx.to(device=GPU))
+            nes.append(nth_expert.to(device=GPU))
+
     adjusted_d = ceildiv(interm_d, tp_size)
-    x = torch.ones((n_tokens, model_d), dtype=dtype, device=GPU)
-    results = torch.zeros_like(x)
     if LOCAL_RANK == 0:
         print(f"expert shape: ({adjusted_d}, {model_d})")
     experts = {}
@@ -63,10 +75,12 @@ def test(
 
     # warmup
     for _ in range(n_warmups):
-        for ei in activated_experts:
-            ey = expert_forward(experts, ei, x)
-            if ey is not None:
-                results += ey * 0
+        results = torch.zeros_like(x)
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+            ey = expert_forward(experts, ei, x[batch_idx])
+            if ey is None:
+                continue
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
     torch.cuda.synchronize(device=GPU)
     dist.barrier()
 
@@ -74,10 +88,12 @@ def test(
     for _ in range(n_samples):
         tic = time.time()
 
-        for ei in activated_experts:
-            ey = expert_forward(experts, ei, x)
-            if ey is not None:
-                results += ey * 0
+        results = torch.zeros_like(x)
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+            ey = expert_forward(experts, ei, x[batch_idx])
+            if ey is None:
+                continue
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         torch.cuda.synchronize(device=GPU)
         dist.barrier()
@@ -92,12 +108,12 @@ def init_processes(node_id):
     )
 
     for case in test_cases:
-        n_tokens = case.pop("n_tokens")
+        batch_size = case.pop("batch_size")
         for args in case.values():
             if LOCAL_RANK == 0:
                 print(args)
-            tp_size, activated_experts, msg = args
-            test(expert_map[node_id], n_tokens, tp_size, activated_experts, msg)
+            tp_size, msg = args
+            test(expert_map[node_id], batch_size, tp_size, msg)
             if LOCAL_RANK == 0:
                 print("-" * 20 + "\n")
 
