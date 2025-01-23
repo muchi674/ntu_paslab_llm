@@ -347,8 +347,8 @@ class Attention(nn.Module):
 
         # eric891224
         # timer-based
-        self.comp_records = dict()
-        self.comm_records = dict()
+        self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+        self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
         # self.comp_start = torch.cuda.Event(enable_timing=True)
         # self.comm_start = torch.cuda.Event(enable_timing=True)
@@ -361,6 +361,9 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
+        if cache.prefill:
+            self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+            self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # self.comp_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
@@ -409,8 +412,9 @@ class Attention(nn.Module):
         # exp. compare v1 v2
         # dist.barrier(group=self.group)
         torch.cuda.synchronize()
-        td = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}'] = td - ts
+        te = time.perf_counter()
+        temp_comp = te - ts
+        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
         # self.comm_start.record()
 
@@ -418,7 +422,8 @@ class Attention(nn.Module):
 
         torch.cuda.synchronize()
         ts = time.perf_counter()
-        self.comm_records[f'{WORLD_RANK}'] = ts - td
+        # self.comm_records[f'{WORLD_RANK}'] = ts - te
+        self.comm_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(ts - te)
 
         # self.comm_end.record()
         # return torch.sum(local_world_out, dim=0)
@@ -426,8 +431,10 @@ class Attention(nn.Module):
 
         # self.comp_end.record()
         torch.cuda.synchronize()
-        td = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}'] += td - ts
+        te = time.perf_counter()
+        temp_comp += te - ts
+        # self.comp_records[f'{WORLD_RANK}'] += te - ts
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(temp_comp)
 
         return local_world_out
 
@@ -515,7 +522,7 @@ class TransformerBlock(nn.Module):
         # eric891224
         self.li = li
         # timer-based
-        self.records = dict()
+        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
         # self.atten_start = torch.cuda.Event(enable_timing=True)
         # self.atten_end = torch.cuda.Event(enable_timing=True)
@@ -523,6 +530,9 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        if cache.prefill:
+            self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+
         # self.atten_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
@@ -531,7 +541,7 @@ class TransformerBlock(nn.Module):
 
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.records[f'{WORLD_RANK}'] = te - ts
+        self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
         # self.atten_end.record()
         # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
@@ -755,40 +765,62 @@ def get_node_group(node_id, gpu, global_group):
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
     return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
+def print_stats(
+    bete_p = "N/A",
+    bete_d = "N/A",
+    ete_p = "N/A",
+    ete_d = "N/A",
+    comp_p = "N/A",
+    comp_d = "N/A",
+    comm_p = "N/A",
+    comm_d = "N/A"
+):
+    result = (
+    f"Rank {WORLD_RANK}\n"
+    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms"
+    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms"
+    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms"
+    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms"
+    )
+    
+    print(result)
+
 def get_atten_timer_stats(model: Transformer):
-    bete = 0
-    ete = 0
-    comp = 0
-    comm = 0
-    n_layers = 32
+    bete_p = 0
+    bete_d = 0
+    ete_p = 0
+    ete_d = 0
+    comp_p = 0
+    comp_d = 0
+    comm_p = 0
+    comm_d = 0
 
     f_s2ms = 1000
 
-    key = f'{WORLD_RANK}'
+    key_p = f'{WORLD_RANK}_p'
+    key_d = f'{WORLD_RANK}_d'
 
     for block in model.layers.values():
-        bete += block.records[key] * f_s2ms
-        ete += (block.attention.comp_records[key] + block.attention.comm_records[key]) * f_s2ms
-        comp += block.attention.comp_records[key] * f_s2ms
-        comm += block.attention.comm_records[key] * f_s2ms
+        bete_p += mean(block.records[key_p]) * f_s2ms
+        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
+        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
+        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
 
-    result = (
-    f"Rank {WORLD_RANK}\n"
-    + f"total end-to-end (transformer block level) time: {bete} ms\n"
-    + f"total end-to-end time: {ete} ms\n"
-    + f"total computation time: {comp} ms\n"
-    + f"total communication time: {comm} ms\n"
-    )
+        bete_d += mean(block.records[key_d]) * f_s2ms
+        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
+        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
+        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+    
 
-    print(result)
-    # print(f"Rank {WORLD_RANK} total end-to-end (transformer block level) time: {bete} ms")
-    # print(f"Rank {WORLD_RANK} total end-to-end time: {ete} ms")
-    # print(f"Rank {WORLD_RANK} total computation time: {comp} ms")
-    # print(f"Rank {WORLD_RANK} total communication time: {comm} ms")
-    # print(f"avg end-to-end (transformer block level) time: {bete/n_layers} ms")
-    # print(f"avg end-to-end time: {ete/n_layers} ms")
-    # print(f"avg computation time: {comp/n_layers} ms")
-    # print(f"avg communication time: {comm/n_layers} ms")
+    # result = (
+    # f"Rank {WORLD_RANK}\n"
+    # + f"total end-to-end (transformer block level) time: {bete} ms\n"
+    # + f"total end-to-end time: {ete} ms\n"
+    # + f"total computation time: {comp} ms\n"
+    # + f"total communication time: {comm} ms\n"
+    # )
+
+    # print(result)
         
 
 def get_atten_stats(model: Transformer):
