@@ -412,7 +412,7 @@ class Attention(nn.Module):
         # self.comp_end.record()
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'] = te - ts
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
         return output
 
 
