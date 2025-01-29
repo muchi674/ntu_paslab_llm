@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import List, Optional, Tuple
-import random
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -390,8 +390,8 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
 
-    def forward(self, li: int, x: torch.Tensor) -> torch.Tensor:
-        w1: torch.Tensor = self.ws[f"layers.{li}.block_sparse_moe.w1"].T #fit .pt
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        w1: torch.Tensor = self.ws[f"layers.{li}.block_sparse_moe.w1"].T
         w2: torch.Tensor = self.ws[f"layers.{li}.block_sparse_moe.w2"]
         w3: torch.Tensor = self.ws[f"layers.{li}.block_sparse_moe.w3"].T
         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
@@ -411,10 +411,7 @@ class MoeLayer(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        #gate_logits = gate_logits[:, :6]
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-            
-        
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
@@ -428,7 +425,7 @@ class MoeLayer(nn.Module):
                 nes.append(nth_expert.to(device=inputs.device))
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, inputs[batch_idx]) # no ei
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
@@ -792,3 +789,4 @@ if __name__ == "__main__":
         args.max_tokens,
         args.hide_resp,
     )
+
