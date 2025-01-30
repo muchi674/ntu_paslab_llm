@@ -31,6 +31,7 @@ MODEL_SPECS = {
     },
 }
 HW_SPECS = {
+    # TODO: write micro-benchmark programs to test this
     "inter_comm": {
         "collective_overhead": 150 / 1000**2,  # in microsecond
         "collective_bandwidth": 1.25 * (10**9),
@@ -44,6 +45,7 @@ HW_SPECS = {
 }
 SETUP = [
     {
+        # TODO: write micro-benchmark programs to test this
         "intra_comm": {
             "collective_overhead": 20 / 1000**2,  # in microsecond
             "collective_bandwidth": 20 * (10**9),
@@ -80,6 +82,11 @@ def ceildiv(a, b):
     # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
     return -(a // -b)
 
+def find_parallel_strategies():
+    # TODO: given SETUP, output optimal cut for
+    # PP, TP, EP, PP+TP, PP+EP, TP+EP
+    # we can leave DP and CP for now
+    pass
 
 def estimate_lower_bound_exec_time(
     batch_size: int,
