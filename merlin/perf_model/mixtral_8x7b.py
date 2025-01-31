@@ -82,18 +82,112 @@ def ceildiv(a, b):
     # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
     return -(a // -b)
 
-def find_parallel_strategies():
-    # TODO: given SETUP, output optimal cut for
-    # PP, TP, EP, PP+TP, PP+EP, TP+EP
-    # we can leave DP and CP for now
-    pass
+
+def distribute(n_items, n_bins):
+    # from: https://stackoverflow.com/questions/54353083/distribute-an-integer-amount-by-a-set-of-slots-as-evenly-as-possible
+    base, extra = divmod(n_items, n_bins)
+    return [base + (i < extra) for i in range(n_bins)]
+
+
+def find_parallel_strategies(batch_size: int, prompt_len: int):
+    strategies = {}
+
+    total_n_gpus = sum(node["n_gpus"] for node in SETUP)
+    pp_gpu_layers = distribute(MODEL_SPECS["n_layers"], total_n_gpus)
+    ep_gpu_experts = distribute(MODEL_SPECS["expert"]["n_experts"], total_n_gpus)
+    pp_node_layers = []
+    ep_node_experts = []
+    i = 0
+    for node in SETUP:
+        j = i + node["n_gpus"]
+        pp_node_layers.append(sum(pp_gpu_layers[i:j]))
+        ep_node_experts.append(sum(ep_gpu_experts[i:j]))
+        i = j
+
+    strategies["naive PP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    }
+    strategies["inter-attn-inter-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
+        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    }
+    strategies["intra-attn-inter-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    }
+    strategies["inter EP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "experts_strategy": {
+            "experts_are_intra": False,
+            "experts_parallelism": "ep",
+            "experts_allocation": ep_node_experts,
+        },
+    }
+    strategies["inter PP + intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
+    }
+    strategies["inter PP + intra-attn-intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
+    }
+    strategies["inter PP + intra EP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    }
+    strategies["inter EP + intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "experts_strategy": {
+            "experts_are_intra": False,
+            "experts_parallelism": "ep+tp",
+            "experts_allocation": ep_node_experts,
+        },
+    }
+    strategies["inter EP + intra-attn-intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+        "experts_strategy": {
+            "experts_are_intra": False,
+            "experts_parallelism": "ep+tp",
+            "experts_allocation": ep_node_experts,
+        },
+    }
+    strategies["inter EP + inter-attn-intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
+        "experts_strategy": {
+            "experts_are_intra": False,
+            "experts_parallelism": "ep+tp",
+            "experts_allocation": ep_node_experts,
+        },
+    }
+
+    return strategies
+
 
 def estimate_lower_bound_exec_time(
     batch_size: int,
     prompt_len: int,
-    pp_strategy: dict,
-    attn_strategy: dict,
-    experts_strategy: dict,
+    pp_strategy: dict = {},
+    attn_strategy: dict = {},
+    experts_strategy: dict = {},
 ):
     precision_bytes, n_layers, model_d, vocab_d, attn_specs, expert_specs = itemgetter(
         "precision_bytes", "n_layers", "model_d", "vocab_d", "attn", "expert"
