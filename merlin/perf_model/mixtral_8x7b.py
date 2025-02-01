@@ -1,4 +1,8 @@
 from operator import itemgetter
+import argparse
+import logging
+
+import torch
 
 MODEL_SPECS = {
     "precision_bytes": 2,
@@ -324,3 +328,58 @@ def estimate_lower_bound_exec_time(
         exec_time_by_node.append(exec_time)
 
     return exec_time_by_node
+
+
+def main(
+    start_batch_size: int,
+    start_prompt_len: int,
+    end_batch_size: int = None,
+    end_prompt_len: int = None,
+):
+    res = [
+        [
+            "strategy",
+            "batch_size",
+            "prompt_len",
+            "attn_compute",
+            "attn_comm",
+            "experts_compute",
+            "experts_comm",
+            "extra_comm",
+            "total",
+        ]
+    ]
+    end_batch_size = end_batch_size or start_batch_size
+    end_prompt_len = end_prompt_len or start_prompt_len
+    while start_batch_size <= end_batch_size:
+        while start_prompt_len <= end_prompt_len:
+            strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
+            for name, args in strategies.items():
+                exec_time_by_node = estimate_lower_bound_exec_time(**args)
+                exec_time_by_node = torch.tensor(exec_time_by_node)
+                if "pp_strategy" in args:
+                    exec_time_by_node = torch.sum(exec_time_by_node, dim=0)
+                else:
+                    exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
+                res.append(
+                    [name, start_batch_size, start_prompt_len]
+                    + exec_time_by_node.tolist()
+                    + [torch.sum(exec_time_by_node).item()]
+                )
+
+            start_prompt_len *= 2
+        start_batch_size *= 2
+    
+    for row in res:
+        print(", ".join([str(val) for val in row]))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start-bs", type=int)
+    parser.add_argument("--end-bs", type=int)
+    parser.add_argument("--start-plen", type=int)
+    parser.add_argument("--end-plen", type=int)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    main(args.start_bs, args.end_bs, args.start_plen, args.end_plen)
