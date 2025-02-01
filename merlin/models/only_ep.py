@@ -418,7 +418,7 @@ class MoeLayer(nn.Module):
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
-        for ei in range(self.number_experts):
+        for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 if ei == torch.distributed.get_rank():
