@@ -420,9 +420,10 @@ class MoeLayer(nn.Module):
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+                if ei == get_local_rank():
+                    eis.append(ei)
+                    bis.append(batch_idx.to(device=inputs.device))
+                    nes.append(nth_expert.to(device=inputs.device))
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
