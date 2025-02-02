@@ -351,7 +351,11 @@ def main(
     ]
     end_batch_size = end_batch_size or start_batch_size
     end_prompt_len = end_prompt_len or start_prompt_len
-    tmp, start_prompt_len = start_prompt_len, 1  # to print decode info
+    # to print decode info
+    if start_prompt_len > 1:
+        tmp, start_prompt_len = start_prompt_len, 1
+    else:
+        tmp = None
     while start_batch_size <= end_batch_size:
         while start_prompt_len <= end_prompt_len:
             strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
@@ -368,7 +372,7 @@ def main(
                     + [torch.sum(exec_time_by_node).item()]
                 )
 
-            if start_prompt_len == 1:
+            if start_prompt_len == 1 and tmp:
                 start_prompt_len = tmp
             else:
                 start_prompt_len *= 2
