@@ -125,6 +125,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
         "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     }
+    strategies["inter-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    }
     strategies["inter EP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -193,6 +198,9 @@ def estimate_lower_bound_exec_time(
     attn_strategy: dict = {},
     experts_strategy: dict = {},
 ):
+    # TODO:
+    # we are yet to adjust compute time for extra long sequences, which requires
+    # substantially more data to be moved from memory to cache and more FLOPs
     precision_bytes, n_layers, model_d, vocab_d, attn_specs, expert_specs = itemgetter(
         "precision_bytes", "n_layers", "model_d", "vocab_d", "attn", "expert"
     )(MODEL_SPECS)
@@ -347,6 +355,7 @@ def main(
             "experts_comm",
             "extra_comm",
             "total",
+            "t/s",
         ]
     ]
     end_batch_size = end_batch_size or start_batch_size
@@ -366,10 +375,14 @@ def main(
                     exec_time_by_node = torch.sum(exec_time_by_node, dim=0)
                 else:
                     exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
+                total_exec_time = torch.sum(exec_time_by_node).item()
+                throughput = (
+                    1000 / total_exec_time * start_batch_size * start_prompt_len
+                )
                 res.append(
                     [name, start_batch_size, start_prompt_len]
                     + exec_time_by_node.tolist()
-                    + [torch.sum(exec_time_by_node).item()]
+                    + [total_exec_time, throughput]
                 )
 
             if start_prompt_len == 1 and tmp:
