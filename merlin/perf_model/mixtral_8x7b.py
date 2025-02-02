@@ -351,12 +351,13 @@ def main(
     ]
     end_batch_size = end_batch_size or start_batch_size
     end_prompt_len = end_prompt_len or start_prompt_len
+    tmp, start_prompt_len = start_prompt_len, 1  # to print decode info
     while start_batch_size <= end_batch_size:
         while start_prompt_len <= end_prompt_len:
             strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
             for name, args in strategies.items():
                 exec_time_by_node = estimate_lower_bound_exec_time(**args)
-                exec_time_by_node = torch.tensor(exec_time_by_node)
+                exec_time_by_node = torch.tensor(exec_time_by_node) * 1000  # to ms
                 if "pp_strategy" in args:
                     exec_time_by_node = torch.sum(exec_time_by_node, dim=0)
                 else:
@@ -367,11 +368,20 @@ def main(
                     + [torch.sum(exec_time_by_node).item()]
                 )
 
-            start_prompt_len *= 2
+            if start_prompt_len == 1:
+                start_prompt_len = tmp
+            else:
+                start_prompt_len *= 2
         start_batch_size *= 2
-    
+
     for row in res:
-        print(", ".join([str(val) for val in row]))
+        print(
+            ", ".join(
+                [val if isinstance(val, str) else str(round(val, 2)) for val in row]
+                + [""]
+            )
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -382,4 +392,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    main(args.start_bs, args.end_bs, args.start_plen, args.end_plen)
+    main(args.start_bs, args.start_plen, args.end_bs, args.end_plen)
