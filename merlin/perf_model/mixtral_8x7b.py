@@ -158,6 +158,13 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
         "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     }
+    strategies["inter PP + intra EP + intra-attn TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    }
     strategies["inter EP + intra-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -177,16 +184,16 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
             "experts_allocation": ep_node_experts,
         },
     }
-    strategies["inter EP + inter-attn-intra-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
-        "experts_strategy": {
-            "experts_are_intra": False,
-            "experts_parallelism": "ep+tp",
-            "experts_allocation": ep_node_experts,
-        },
-    }
+    # strategies["inter EP + inter-attn-intra-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep+tp",
+    #         "experts_allocation": ep_node_experts,
+    #     },
+    # }
 
     return strategies
 
@@ -199,8 +206,9 @@ def estimate_lower_bound_exec_time(
     experts_strategy: dict = {},
 ):
     # TODO:
-    # we are yet to adjust compute time for extra long sequences, which requires
+    # 1. we are yet to adjust compute time for extra long sequences, which requires
     # substantially more data to be moved from memory to cache and more FLOPs
+    # 2. we are yet to account for data movement cost for KV-cache
     precision_bytes, n_layers, model_d, vocab_d, attn_specs, expert_specs = itemgetter(
         "precision_bytes", "n_layers", "model_d", "vocab_d", "attn", "expert"
     )(MODEL_SPECS)
