@@ -93,6 +93,7 @@ def init_process(rank, world_size, max_mb):
     else:
         avg_latencies = torch.ones((len(inputs),), dtype=torch.float32, device=device)
     dist.all_reduce(avg_latencies, op=dist.ReduceOp.SUM)
+    avg_latencies = avg_latencies.tolist()
 
     if rank == 0:
         print_and_save_res(

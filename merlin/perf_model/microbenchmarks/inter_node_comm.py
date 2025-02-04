@@ -17,6 +17,7 @@ def get_node_group(device):
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
     local_map = torch.tensor([NODE_RANK, WORLD_RANK], dtype=torch.int64, device=device)
     dist.all_gather_into_tensor(global_map, local_map)
+    torch.max(global_map[:, 0])
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
 
 
