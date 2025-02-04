@@ -60,42 +60,33 @@ def init_process(rank, world_size, max_mb):
     #         "INTRA-NODE COMM LATENCY", inputs, avg_latencies, "intra_coll_comm.json"
     #     )
 
+    N = 4000
     avg_latencies = []  # in ms
-    for rank_i in range(0, world_size, 2):
-        receiver = rank_i + 1
-        for ins in inputs:
-            if rank != rank_i and rank != receiver:
-                break
 
-            # warmup
-            for _ in range(2000):
-                if rank == rank_i:
-                    ops = [dist.P2POp(dist.isend, ins, receiver)]
-                else:
-                    ops = [dist.P2POp(dist.irecv, ins, rank_i)]
-                for req in dist.batch_isend_irecv(ops):
-                    req.wait()
+    for ins in inputs:
+        if rank > 1:
+            break
 
-            if rank == rank_i:
-                tic = time.time()
+        # warmup
+        for _ in range(2000):
+            if rank == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
 
-            for _ in range(N):
-                if rank == rank_i:
-                    ops = [dist.P2POp(dist.isend, ins, receiver)]
-                else:
-                    ops = [dist.P2POp(dist.irecv, ins, rank_i)]
-                for req in dist.batch_isend_irecv(ops):
-                    req.wait()
+        tic = time.time()
 
-            if rank == rank_i:
-                avg_latencies.append((time.time() - tic) * 1000 / N)
+        for _ in range(N):
+            if rank == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
 
-    if len(avg_latencies) > 0:
-        avg_latencies = torch.tensor(avg_latencies, dtype=torch.float32, device=device)
-    else:
-        avg_latencies = torch.zeros((len(inputs),), dtype=torch.float32, device=device)
-    dist.all_reduce(avg_latencies, op=dist.ReduceOp.SUM)
-    avg_latencies = (avg_latencies / (world_size // 2)).tolist()
+        avg_latencies.append((time.time() - tic) * 1000 / N)
 
     if rank == 0:
         print_and_save_res(
