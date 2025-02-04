@@ -135,7 +135,7 @@ def main():
             + f"cd /home/{username}/ntu_paslab_llm/merlin && "
             + f"git pull origin merlin-eric891224 && "
             + f"conda activate merlin && "
-            + f"NCCL_GRAPH_MIXING_SUPPORT=0 python /home/{username}/ntu_paslab_llm/merlin/launch/run_node.py "
+            + f"python /home/{username}/ntu_paslab_llm/merlin/launch/run_node.py "
         )
 
         if args.terminate:
