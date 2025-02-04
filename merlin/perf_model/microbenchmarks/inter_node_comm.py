@@ -44,23 +44,23 @@ def init_processes(max_mb):
         )
         batch_size *= 2
 
-    N = 4000
-    avg_latencies = []  # in ms
+    # N = 4000
+    # avg_latencies = []  # in ms
 
-    for ins in inputs:
-        # warmup
-        for _ in range(2000):
-            dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    # for ins in inputs:
+    #     # warmup
+    #     for _ in range(2000):
+    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
 
-        tic = time.time()
-        for _ in range(N):
-            dist.all_reduce(ins, op=dist.ReduceOp.SUM)
-        avg_latencies.append((time.time() - tic) * 1000 / N)
+    #     tic = time.time()
+    #     for _ in range(N):
+    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    #     avg_latencies.append((time.time() - tic) * 1000 / N)
 
-    if WORLD_RANK == 0:
-        print_and_save_res(
-            "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
-        )
+    # if WORLD_RANK == 0:
+    #     print_and_save_res(
+    #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
+    #     )
 
     N = 4000
     avg_latencies = []  # in ms
