@@ -542,10 +542,11 @@ class TransformerBlock(nn.Module):
         x = self.attention_norm(x)
         torch.cuda.nvtx.range_push("atten")
         r = self.attention.forward(x, freqs_cis, cache)
-        torch.cuda.nvtx.range_pop()
+        
         # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
 
         torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         te = time.perf_counter()
         self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
