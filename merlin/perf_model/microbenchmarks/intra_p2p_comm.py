@@ -24,24 +24,34 @@ def init_process(rank, world_size, max_mb):
         )
         batch_size *= 2
 
-    N = 20000
+    N = 4000
     avg_latencies = []  # in ms
 
     for ins in inputs:
         # warmup
         for _ in range(2000):
-            dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+            if rank == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
 
         tic = time.time()
         for _ in range(N):
-            dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+            if rank == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
         avg_latencies.append((time.time() - tic) * 1000 / N)
 
     precision = 2
     if rank == 0:
         data = {}
         print("-" * 20)
-        print("INTRA-NODE COMM LATENCY")
+        print("GPU0&1 P2P COMM LATENCY")
         print("-" * 20)
         print("data_size_bytes, latency_ms, ")
         for ins, latency in zip(inputs, avg_latencies):
@@ -50,8 +60,8 @@ def init_process(rank, world_size, max_mb):
             data[ins] = latency
             print(f"{ins}, {latency}, ")
 
-        with open("intra_node_comm.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        # with open("intra_node_comm.json", "w", encoding="utf-8") as f:
+        #     json.dump(data, f, ensure_ascii=False, indent=4)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -62,7 +72,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-mb", type=int, default=128)
     args = parser.parse_args()
 
-    world_size = torch.cuda.device_count()
+    # world_size = torch.cuda.device_count()
+    world_size = 2
     processes = []
     mp.set_start_method("spawn")
 
