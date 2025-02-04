@@ -537,7 +537,13 @@ class TransformerBlock(nn.Module):
         torch.cuda.synchronize()
         ts = time.perf_counter()
 
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        # torch.cuda.nvtx.range_push("atten")
+
+        x = self.attention_norm(x)
+        torch.cuda.nvtx.range_push("atten")
+        r = self.attention.forward(x, freqs_cis, cache)
+        torch.cuda.nvtx.range_pop()
+        # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
 
         torch.cuda.synchronize()
         te = time.perf_counter()
