@@ -76,7 +76,9 @@ def init_process(rank, world_size, max_mb):
                 for req in dist.batch_isend_irecv(ops):
                     req.wait()
 
-            tic = time.time()
+            if rank == rank_i:
+                tic = time.time()
+
             for _ in range(N):
                 if rank == rank_i:
                     ops = [dist.P2POp(dist.isend, ins, 1)]
@@ -84,16 +86,16 @@ def init_process(rank, world_size, max_mb):
                     ops = [dist.P2POp(dist.irecv, ins, 0)]
                 for req in dist.batch_isend_irecv(ops):
                     req.wait()
-            avg_latencies.append((time.time() - tic) * 1000 / N)
 
-        dist.barrier()
+            if rank == rank_i:
+                avg_latencies.append((time.time() - tic) * 1000 / N)
 
     if len(avg_latencies) > 0:
         avg_latencies = torch.tensor(avg_latencies, dtype=torch.float32, device=device)
     else:
-        avg_latencies = torch.ones((len(inputs),), dtype=torch.float32, device=device)
+        avg_latencies = torch.zeros((len(inputs),), dtype=torch.float32, device=device)
     dist.all_reduce(avg_latencies, op=dist.ReduceOp.SUM)
-    avg_latencies = avg_latencies.tolist()
+    avg_latencies = (avg_latencies / (world_size // 2)).tolist()
 
     if rank == 0:
         print_and_save_res(
