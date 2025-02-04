@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -38,9 +39,16 @@ def init_process(rank, world_size, max_mb):
 
     precision = 2
     if rank == 0:
+        data = {}
         print("data_size_bytes, latency_ms, ")
         for ins, latency in zip(inputs, avg_latencies):
-            print(f"{torch.numel(ins) * precision}, {latency:.3f}, ")
+            ins = str(torch.numel(ins) * precision)
+            latency = round(latency, 3)
+            data[ins] = latency
+            print(f"{ins}, {latency}, ")
+
+        with open("intra_node_comm.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
     dist.barrier()
     dist.destroy_process_group()
