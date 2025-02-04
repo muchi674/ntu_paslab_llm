@@ -70,9 +70,9 @@ def init_process(rank, world_size, max_mb):
             # warmup
             for _ in range(2000):
                 if rank == rank_i:
-                    ops = [dist.P2POp(dist.isend, ins, 1)]
+                    ops = [dist.P2POp(dist.isend, ins, receiver)]
                 else:
-                    ops = [dist.P2POp(dist.irecv, ins, 0)]
+                    ops = [dist.P2POp(dist.irecv, ins, rank_i)]
                 for req in dist.batch_isend_irecv(ops):
                     req.wait()
 
@@ -81,9 +81,9 @@ def init_process(rank, world_size, max_mb):
 
             for _ in range(N):
                 if rank == rank_i:
-                    ops = [dist.P2POp(dist.isend, ins, 1)]
+                    ops = [dist.P2POp(dist.isend, ins, receiver)]
                 else:
-                    ops = [dist.P2POp(dist.irecv, ins, 0)]
+                    ops = [dist.P2POp(dist.irecv, ins, rank_i)]
                 for req in dist.batch_isend_irecv(ops):
                     req.wait()
 
