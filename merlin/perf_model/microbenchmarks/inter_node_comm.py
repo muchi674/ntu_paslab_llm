@@ -41,6 +41,9 @@ def init_processes(max_mb):
     precision = 2
     if WORLD_RANK == 0:
         data = {}
+        print("-" * 20)
+        print("INTER NODE COMM LATENCY")
+        print("-" * 20)
         print("data_size_bytes, latency_ms, ")
         for ins, latency in zip(inputs, avg_latencies):
             ins = str(torch.numel(ins) * precision)
@@ -50,6 +53,28 @@ def init_processes(max_mb):
 
         with open("inter_node_comm.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+
+    
+
+    for ins in inputs:
+        # warmup
+        for _ in range(2000):
+            if WORLD_RANK == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+
+        tic = time.time()
+        for _ in range(N):
+            if rank == 0:
+                ops = [dist.P2POp(dist.isend, ins, 1)]
+            else:
+                ops = [dist.P2POp(dist.irecv, ins, 0)]
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        avg_latencies.append((time.time() - tic) * 1000 / N)
 
     dist.barrier()
     dist.destroy_process_group()

@@ -27,25 +27,28 @@ def init_process(rank, world_size, max_mb):
     N = 4000
     avg_latencies = []  # in ms
 
-    for ins in inputs:
-        # warmup
-        for _ in range(2000):
-            if rank == 0:
-                ops = [dist.P2POp(dist.isend, ins, 1)]
-            else:
-                ops = [dist.P2POp(dist.irecv, ins, 0)]
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
+    for rank_i in range(0, world_size, 2):
+        if rank == rank_i or rank == rank_i + 1:
+            for ins in inputs:
+                # warmup
+                for _ in range(2000):
+                    if rank == rank_i:
+                        ops = [dist.P2POp(dist.isend, ins, 1)]
+                    else:
+                        ops = [dist.P2POp(dist.irecv, ins, 0)]
+                    for req in dist.batch_isend_irecv(ops):
+                        req.wait()
 
-        tic = time.time()
-        for _ in range(N):
-            if rank == 0:
-                ops = [dist.P2POp(dist.isend, ins, 1)]
-            else:
-                ops = [dist.P2POp(dist.irecv, ins, 0)]
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
-        avg_latencies.append((time.time() - tic) * 1000 / N)
+                tic = time.time()
+                for _ in range(N):
+                    if rank == rank_i:
+                        ops = [dist.P2POp(dist.isend, ins, 1)]
+                    else:
+                        ops = [dist.P2POp(dist.irecv, ins, 0)]
+                    for req in dist.batch_isend_irecv(ops):
+                        req.wait()
+                avg_latencies.append((time.time() - tic) * 1000 / N)
+        dist.barrier()
 
     precision = 2
     if rank == 0:
