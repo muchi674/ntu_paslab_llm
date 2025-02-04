@@ -7,10 +7,18 @@ import torch
 import torch.distributed as dist
 
 # Environment variables set by torch.distributed.launch
+NODE_RANK = int(os.environ["GROUP_RANK"])
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
+
+
+def get_global_map(device):
+    global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
+    local_map = torch.tensor([NODE_RANK, WORLD_RANK], dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(global_map, local_map)
+    return global_map
 
 
 def print_and_save_res(
@@ -36,6 +44,7 @@ def init_processes(max_mb):
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=device
     )
+    global_map = get_global_map(device)
     inputs = [torch.ones((1,), dtype=torch.bfloat16, device=device)]
     batch_size = 1
     while 2 * batch_size * 1024 / 1024**2 <= max_mb:
@@ -65,7 +74,9 @@ def init_processes(max_mb):
     N = 4000
     avg_latencies = []  # in ms
     sender = 0
-    receiver = LOCAL_WORLD_SIZE  # first rank of next node
+    receiver = torch.min(
+        global_map[global_map[:, 0] == 1][:, 1]
+    ).item()  # first rank of the second node
 
     for ins in inputs:
         if WORLD_RANK != sender and WORLD_RANK != receiver:
