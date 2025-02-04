@@ -7,9 +7,17 @@ import torch
 import torch.distributed as dist
 
 # Environment variables set by torch.distributed.launch
+NODE_RANK = int(os.environ["GROUP_RANK"])
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
+
+
+def get_node_group(device):
+    global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
+    local_map = torch.tensor([NODE_RANK, WORLD_RANK], dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(global_map, local_map)
+    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
 
 
 def init_processes(max_mb):
@@ -53,8 +61,6 @@ def init_processes(max_mb):
 
         with open("inter_node_comm.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-
-    
 
     for ins in inputs:
         # warmup
