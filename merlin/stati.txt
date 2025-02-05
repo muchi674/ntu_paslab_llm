@@ -1,0 +1,8 @@
+origin
+
+RUN STATISTICS
+avg prefill throughput: 1465.77 t/s
+avg decode throughput: 78.48 t/s
+
+modify
+
