@@ -60,11 +60,11 @@ def init_processes(max_mb):
     # for ins in inputs:
     #     # warmup
     #     for _ in range(2000):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
 
     #     tic = time.time()
     #     for _ in range(N):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
     #     avg_latencies.append((time.time() - tic) * 1000 / N)
 
     # if WORLD_RANK == 0:
@@ -72,7 +72,7 @@ def init_processes(max_mb):
     #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
     #     )
 
-    N = 400
+    N = 2000
     avg_latencies = []  # in ms
     sender = 0
     receiver = torch.min(
@@ -87,7 +87,7 @@ def init_processes(max_mb):
         print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
 
         # warmup
-        for _ in range(200):
+        for _ in range(1000):
             if WORLD_RANK == sender:
                 ops = [dist.P2POp(dist.isend, ins, receiver)]
             else:
@@ -112,7 +112,7 @@ def init_processes(max_mb):
             "AVG INTER P2P COMM LATENCY", inputs, avg_latencies, "inter_p2p_comm.json"
         )
 
-    dist.barrier()
+    dist.monitored_barrier(timeout=timeout)
     dist.destroy_process_group()
 
 

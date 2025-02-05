@@ -42,17 +42,17 @@ def init_process(rank, world_size, max_mb):
         )
         batch_size *= 2
 
-    N = 20000
+    # N = 20000
     # avg_latencies = []  # in ms
 
     # for ins in inputs:
     #     # warmup
     #     for _ in range(2000):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
 
     #     tic = time.time()
     #     for _ in range(N):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
     #     avg_latencies.append((time.time() - tic) * 1000 / N)
 
     # if rank == 0:
