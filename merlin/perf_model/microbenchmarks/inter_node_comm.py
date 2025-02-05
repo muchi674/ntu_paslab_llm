@@ -80,6 +80,7 @@ def init_processes(max_mb):
         global_map[global_map[:, 0] == 1][:, 1]
     ).item()  # first rank of the second node
 
+    inputs = inputs[:10]
     for ins in inputs:
         if WORLD_RANK == sender or WORLD_RANK == receiver:
             print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
@@ -104,9 +105,6 @@ def init_processes(max_mb):
 
             duration = time.time() - tic
             avg_latencies.append(duration * 1000 / N)
-            if timedelta(milliseconds=duration) >= timedelta(minutes=1):
-                warmups //= 2
-                N //= 2
         dist.barrier()
 
     if WORLD_RANK == 0 or WORLD_RANK == receiver:
