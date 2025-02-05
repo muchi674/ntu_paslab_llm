@@ -159,7 +159,7 @@ def main():
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
             + f"--script={os.path.expanduser(script)} "
-            + f"--model-path={model_path} "
+            + f"--model-path={os.path.expanduser(model_path)} "
             + f"--node-id={node_id} "
             + shared_exec_args
             + "'"
