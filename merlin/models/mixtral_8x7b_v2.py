@@ -431,7 +431,7 @@ class MoeLayer(nn.Module):
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
-            print("batch_idx type", batch_idx.dtype())
+            print("batch_idx type", batch_idx.type())
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
