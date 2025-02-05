@@ -1,3 +1,4 @@
+from datetime import timedelta
 import argparse
 import json
 import os
@@ -71,12 +72,13 @@ def init_processes(max_mb):
     #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
     #     )
 
-    N = 200
+    N = 400
     avg_latencies = []  # in ms
     sender = 0
     receiver = torch.min(
         global_map[global_map[:, 0] == 1][:, 1]
     ).item()  # first rank of the second node
+    timeout = timedelta(minutes=30)
 
     for ins in inputs:
         if WORLD_RANK != sender and WORLD_RANK != receiver:
@@ -85,7 +87,7 @@ def init_processes(max_mb):
         print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
 
         # warmup
-        for _ in range(100):
+        for _ in range(200):
             if WORLD_RANK == sender:
                 ops = [dist.P2POp(dist.isend, ins, receiver)]
             else:
@@ -105,7 +107,7 @@ def init_processes(max_mb):
 
         avg_latencies.append((time.time() - tic) * 1000 / N)
 
-    if WORLD_RANK == 0:
+    if WORLD_RANK == 0 or WORLD_RANK == receiver:
         print_and_save_res(
             "AVG INTER P2P COMM LATENCY", inputs, avg_latencies, "inter_p2p_comm.json"
         )
