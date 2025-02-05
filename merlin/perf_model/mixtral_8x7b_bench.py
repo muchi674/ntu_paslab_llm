@@ -1,5 +1,7 @@
 from operator import itemgetter
+from pathlib import Path
 import argparse
+import json
 import logging
 
 import torch
@@ -36,12 +38,6 @@ MODEL_SPECS = {
 }
 HW_SPECS = {
     # TODO: write micro-benchmark programs to test this
-    "inter_comm": {
-        "collective_overhead": 150 / 1000**2,  # in microsecond
-        "collective_bandwidth": 1.25 * (10**9),
-        "p2p_overhead": 50 / 1000**2,
-        "p2p_bandwidth": 1.25 * (10**9),
-    },
     "4090": {
         "bf16_flops": 165.2 * (10**12),
         "mem_bw": 1008 * (10**9),
@@ -49,42 +45,23 @@ HW_SPECS = {
 }
 SETUP = [
     {
-        # TODO: write micro-benchmark programs to test this
-        "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
-        },
         "gpu_id": "4090",
         "n_gpus": 2,
     },
     {
-        "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
-        },
         "gpu_id": "4090",
         "n_gpus": 4,
     },
-    {
-        "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
-        },
-        "gpu_id": "4090",
-        "n_gpus": 2,
-    },
+    # {
+    #     "gpu_id": "4090",
+    #     "n_gpus": 2,
+    # },
 ]
 
 
-def ceildiv(a, b):
-    # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
-    return -(a // -b)
+def get_json(file_path: Path) -> dict:
+    with open(file_path, "r") as f:
+        return json.load(f)
 
 
 def distribute(n_items, n_bins):
@@ -113,12 +90,12 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "prompt_len": prompt_len,
         "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
     }
-    strategies["inter-attn-inter-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    }
+    # strategies["inter-attn-inter-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    # }
     strategies["intra-attn-inter-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -130,15 +107,15 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "prompt_len": prompt_len,
         "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     }
-    strategies["inter EP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "experts_strategy": {
-            "experts_are_intra": False,
-            "experts_parallelism": "ep",
-            "experts_allocation": ep_node_experts,
-        },
-    }
+    # strategies["inter EP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep",
+    #         "experts_allocation": ep_node_experts,
+    #     },
+    # }
     strategies["inter PP + intra-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -158,13 +135,13 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
         "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     }
-    strategies["inter PP + intra EP + intra-attn TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
-    }
+    # strategies["inter PP + intra EP + intra-attn TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    # }
     strategies["inter EP + intra-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -198,7 +175,37 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     return strategies
 
 
+def ceildiv(a, b):
+    # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
+    return -(a // -b)
+
+
+def lookup_latency(table: dict, data_size: int):
+    # NOTE: comm latencies are measured in ms
+    ks = sorted([int(k) for k in table.keys()])
+    lower_k, upper_k = None, None
+    for k in ks:
+        if data_size == k:
+            return table[str(k)] / 1000
+        if data_size < k:
+            upper_k = k
+            break
+        lower_k = k
+
+    if lower_k is None:
+        return table[str(upper_k)] / 1000
+    if upper_k is None:
+        return data_size / upper_k * table[str(upper_k)] / 1000
+    return (
+        table[str(lower_k)]
+        + (data_size - lower_k)
+        / (upper_k - lower_k)
+        * (table[str(upper_k)] - table[str(lower_k)])
+    ) / 1000
+
+
 def estimate_lower_bound_exec_time(
+    bench_res: dict,
     batch_size: int,
     prompt_len: int,
     pp_strategy: dict = {},
@@ -212,9 +219,6 @@ def estimate_lower_bound_exec_time(
     precision_bytes, n_layers, model_d, vocab_d, attn_specs, expert_specs = itemgetter(
         "precision_bytes", "n_layers", "model_d", "vocab_d", "attn", "expert"
     )(MODEL_SPECS)
-    inter_coll_oh, inter_coll_bw, inter_p2p_oh, inter_p2p_bw = itemgetter(
-        "collective_overhead", "collective_bandwidth", "p2p_overhead", "p2p_bandwidth"
-    )(HW_SPECS["inter_comm"])
     total_n_gpus = sum(node["n_gpus"] for node in SETUP)
 
     pp_is_naive = pp_strategy.get("is_naive")
@@ -233,16 +237,12 @@ def estimate_lower_bound_exec_time(
     n_experts = expert_specs["n_experts"]
     top_k = expert_specs["top_k"]
 
-    comm_data_size = precision_bytes * batch_size * prompt_len * model_d
+    model_comm_size = precision_bytes * batch_size * prompt_len * model_d
+    experts_comm_size = model_comm_size * top_k
+
     exec_time_by_node = []
     for node_idx, node in enumerate(SETUP):
         exec_time = []
-        intra_coll_oh, intra_coll_bw, intra_p2p_oh, intra_p2p_bw = itemgetter(
-            "collective_overhead",
-            "collective_bandwidth",
-            "p2p_overhead",
-            "p2p_bandwidth",
-        )(node["intra_comm"])
         n_local_gpus = node["n_gpus"]
         gpu_mem_bw = HW_SPECS[node["gpu_id"]]["mem_bw"]
         gpu_flops = HW_SPECS[node["gpu_id"]]["bf16_flops"]
@@ -261,15 +261,23 @@ def estimate_lower_bound_exec_time(
                 attn_flops / parallel_size / gpu_flops,
             )
             if attn_is_intra:
-                comm_time = intra_coll_oh + comm_data_size / intra_coll_bw
+                comm_time = lookup_latency(
+                    bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
+                )
             else:
-                comm_time = inter_coll_oh + comm_data_size / inter_coll_bw
+                comm_time = lookup_latency(
+                    bench_res["inter_coll_comm"], model_comm_size
+                )
             exec_time.extend([compute_time, comm_time])
 
         # TODO: for now, we are assuming that expert selection follows an uniform dist
         n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
-        intra_node_comm_time = intra_coll_oh + comm_data_size * top_k / intra_coll_bw
-        inter_node_comm_time = inter_coll_oh + comm_data_size * top_k / inter_coll_bw
+        intra_node_comm_time = lookup_latency(
+            bench_res[str(node_idx)]["intra_coll_comm"], experts_comm_size
+        )
+        inter_node_comm_time = lookup_latency(
+            bench_res["inter_coll_comm"], experts_comm_size
+        )
         if experts_parallelism is None:
             compute_time = max(
                 n_act_experts * expert_param_bytes / gpu_mem_bw,
@@ -330,15 +338,19 @@ def estimate_lower_bound_exec_time(
 
         extra_comm_time = 0.0
         if pp_is_naive:
-            extra_comm_time += (intra_p2p_oh + comm_data_size / intra_p2p_bw) * (
-                n_local_gpus - 1
-            )
+            extra_comm_time += lookup_latency(
+                bench_res[str(node_idx)]["intra_p2p_comm"], model_comm_size
+            ) * (n_local_gpus - 1)
         if pp_strategy:
             if node_idx < len(SETUP) - 1:
-                extra_comm_time += inter_p2p_oh + comm_data_size / inter_p2p_bw
+                extra_comm_time += lookup_latency(
+                    bench_res["inter_p2p_comm"], model_comm_size
+                )
             else:
                 out_size = precision_bytes * batch_size * prompt_len * vocab_d
-                extra_comm_time += inter_coll_oh + out_size / inter_coll_bw
+                extra_comm_time += lookup_latency(
+                    bench_res["inter_coll_comm"], out_size
+                )
 
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
@@ -347,12 +359,14 @@ def estimate_lower_bound_exec_time(
 
 
 def main(
+    bench_res: str,
     start_batch_size: int,
     start_prompt_len: int,
     end_batch_size: int = None,
     end_prompt_len: int = None,
     sort: bool = False,
 ):
+    bench_res = get_json(Path(bench_res))
     cols = [
         "strategy",
         "batch_size",
@@ -378,7 +392,9 @@ def main(
             res = []
             strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
             for name, args in strategies.items():
-                exec_time_by_node = estimate_lower_bound_exec_time(**args)
+                exec_time_by_node = estimate_lower_bound_exec_time(
+                    bench_res=bench_res, **args
+                )
                 exec_time_by_node = torch.tensor(exec_time_by_node) * 1000  # to ms
                 if "pp_strategy" in args:
                     exec_time_by_node = torch.sum(exec_time_by_node, dim=0)
@@ -420,6 +436,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--bench-res", type=str)
     parser.add_argument("--start-bs", type=int)
     parser.add_argument("--end-bs", type=int)
     parser.add_argument("--start-plen", type=int)
@@ -428,4 +445,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    main(args.start_bs, args.start_plen, args.end_bs, args.end_plen, args.sort)
+    main(
+        args.bench_res,
+        args.start_bs,
+        args.start_plen,
+        args.end_bs,
+        args.end_plen,
+        args.sort,
+    )
