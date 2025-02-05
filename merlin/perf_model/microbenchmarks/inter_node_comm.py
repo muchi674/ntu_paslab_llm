@@ -71,7 +71,7 @@ def init_processes(max_mb):
     #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
     #     )
 
-    N = 4000
+    N = 200
     avg_latencies = []  # in ms
     sender = 0
     receiver = torch.min(
@@ -82,8 +82,10 @@ def init_processes(max_mb):
         if WORLD_RANK != sender and WORLD_RANK != receiver:
             break
 
+        print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
+
         # warmup
-        for _ in range(2000):
+        for _ in range(100):
             if WORLD_RANK == sender:
                 ops = [dist.P2POp(dist.isend, ins, receiver)]
             else:
