@@ -78,7 +78,6 @@ def init_processes(max_mb):
     receiver = torch.min(
         global_map[global_map[:, 0] == 1][:, 1]
     ).item()  # first rank of the second node
-    timeout = timedelta(minutes=30)
 
     for ins in inputs:
         if WORLD_RANK != sender and WORLD_RANK != receiver:
@@ -112,7 +111,8 @@ def init_processes(max_mb):
             "AVG INTER P2P COMM LATENCY", inputs, avg_latencies, "inter_p2p_comm.json"
         )
 
-    dist.monitored_barrier(timeout=timeout)
+    # this will timeout with big enough N
+    dist.barrier()
     dist.destroy_process_group()
 
 

@@ -1,0 +1,16 @@
+{
+    "inter_coll_comm": {},
+    "inter_p2p_comm": {},
+    "0": {
+        "intra_coll_comm": {},
+        "intra_p2p_comm": {}
+    },
+    "1": {
+        "intra_coll_comm": {},
+        "intra_p2p_comm": {}
+    },
+    "2": {
+        "intra_coll_comm": {},
+        "intra_p2p_comm": {}
+    }
+}
