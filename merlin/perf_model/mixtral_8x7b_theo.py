@@ -36,49 +36,75 @@ MODEL_SPECS = {
 }
 HW_SPECS = {
     # TODO: write micro-benchmark programs to test this
+    # "inter_comm": {
+    #     "collective_overhead": 150 / 1000**2,  # in microsecond
+    #     "collective_bandwidth": 1.25 * (10**9),
+    #     "p2p_overhead": 50 / 1000**2,
+    #     "p2p_bandwidth": 1.25 * (10**9),
+    # },
     "inter_comm": {
-        "collective_overhead": 150 / 1000**2,  # in microsecond
-        "collective_bandwidth": 1.25 * (10**9),
-        "p2p_overhead": 50 / 1000**2,
-        "p2p_bandwidth": 1.25 * (10**9),
+        "collective_overhead": 0.2 / 1000**2,
+        "collective_bandwidth": 40.7 * (10**9),
+        "p2p_overhead": 0.2 / 1000**2,
+        "p2p_bandwidth": 40.7 * (10**9),
     },
     "4090": {
         "bf16_flops": 165.2 * (10**12),
         "mem_bw": 1008 * (10**9),
     },
+    "h100": {
+        "bf16_flops": 1979 * (10**12),
+        "mem_bw": 3350 * (10**9),
+    },
 }
 SETUP = [
     {
         # TODO: write micro-benchmark programs to test this
+        # "intra_comm": {
+        #     "collective_overhead": 20 / 1000**2,  # in microsecond
+        #     "collective_bandwidth": 20 * (10**9),
+        #     "p2p_overhead": 10 / 1000**2,
+        #     "p2p_bandwidth": 30 * (10**9),
+        # },
         "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
+            "collective_overhead": 0.08 / 1000**2,  # in microsecond
+            "collective_bandwidth": 105 * (10**9),
+            "p2p_overhead": 0.08 / 1000**2,
+            "p2p_bandwidth": 105 * (10**9),
         },
-        "gpu_id": "4090",
+        # "gpu_id": "4090",
+        # "n_gpus": 2,
+        "gpu_id": "h100",
         "n_gpus": 2,
     },
     {
+        # "intra_comm": {
+        #     "collective_overhead": 20 / 1000**2,  # in microsecond
+        #     "collective_bandwidth": 20 * (10**9),
+        #     "p2p_overhead": 10 / 1000**2,
+        #     "p2p_bandwidth": 30 * (10**9),
+        # },
         "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
+            "collective_overhead": 0.08 / 1000**2,  # in microsecond
+            "collective_bandwidth": 105 * (10**9),
+            "p2p_overhead": 0.08 / 1000**2,
+            "p2p_bandwidth": 105 * (10**9),
         },
-        "gpu_id": "4090",
-        "n_gpus": 4,
-    },
-    {
-        "intra_comm": {
-            "collective_overhead": 20 / 1000**2,  # in microsecond
-            "collective_bandwidth": 20 * (10**9),
-            "p2p_overhead": 10 / 1000**2,
-            "p2p_bandwidth": 30 * (10**9),
-        },
-        "gpu_id": "4090",
+        # "gpu_id": "4090",
+        # "n_gpus": 4,
+        "gpu_id": "h100",
         "n_gpus": 2,
     },
+    # {
+    #     "intra_comm": {
+    #         "collective_overhead": 20 / 1000**2,  # in microsecond
+    #         "collective_bandwidth": 20 * (10**9),
+    #         "p2p_overhead": 10 / 1000**2,
+    #         "p2p_bandwidth": 30 * (10**9),
+    #     },
+    #     "gpu_id": "4090",
+    #     "n_gpus": 2,
+    # },
 ]
 
 
@@ -113,12 +139,12 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "prompt_len": prompt_len,
         "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
     }
-    strategies["inter-attn-inter-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    }
+    # strategies["inter-attn-inter-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    # }
     strategies["intra-attn-inter-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -130,15 +156,15 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "prompt_len": prompt_len,
         "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     }
-    strategies["inter EP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "experts_strategy": {
-            "experts_are_intra": False,
-            "experts_parallelism": "ep",
-            "experts_allocation": ep_node_experts,
-        },
-    }
+    # strategies["inter EP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep",
+    #         "experts_allocation": ep_node_experts,
+    #     },
+    # }
     strategies["inter PP + intra-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -158,13 +184,13 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
         "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     }
-    strategies["inter PP + intra EP + intra-attn TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
-    }
+    # strategies["inter PP + intra EP + intra-attn TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    # }
     strategies["inter EP + intra-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -368,15 +394,11 @@ def main(
     print(", ".join(cols + [""]))
     end_batch_size = end_batch_size or start_batch_size
     end_prompt_len = end_prompt_len or start_prompt_len
-    # to print decode info
-    if start_prompt_len > 1:
-        tmp, start_prompt_len = start_prompt_len, 1
-    else:
-        tmp = None
     while start_batch_size <= end_batch_size:
-        while start_prompt_len <= end_prompt_len:
+        p_len = min(1, start_prompt_len)
+        while p_len <= end_prompt_len:
             res = []
-            strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
+            strategies = find_parallel_strategies(start_batch_size, p_len)
             for name, args in strategies.items():
                 exec_time_by_node = estimate_lower_bound_exec_time(**args)
                 exec_time_by_node = torch.tensor(exec_time_by_node) * 1000  # to ms
@@ -385,11 +407,9 @@ def main(
                 else:
                     exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
                 total_exec_time = torch.sum(exec_time_by_node).item()
-                throughput = (
-                    1000 / total_exec_time * start_batch_size * start_prompt_len
-                )
+                throughput = 1000 / total_exec_time * start_batch_size * p_len
                 res.append(
-                    [name, start_batch_size, start_prompt_len]
+                    [name, start_batch_size, p_len]
                     + exec_time_by_node.tolist()
                     + [total_exec_time, throughput]
                 )
@@ -411,10 +431,10 @@ def main(
                     )
                 )
 
-            if start_prompt_len == 1 and tmp:
-                start_prompt_len = tmp
+            if p_len == 1 and start_prompt_len > 1:
+                p_len = start_prompt_len
             else:
-                start_prompt_len *= 2
+                p_len *= 2
         start_batch_size *= 2
 
 

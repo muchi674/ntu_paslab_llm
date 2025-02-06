@@ -195,7 +195,7 @@ def lookup_latency(table: dict, data_size: int):
     if lower_k is None:
         return table[str(upper_k)] / 1000
     if upper_k is None:
-        return data_size / upper_k * table[str(upper_k)] / 1000
+        return data_size / ks[-1] * table[str(ks[-1])] / 1000
     return (
         table[str(lower_k)]
         + (data_size - lower_k)
@@ -382,15 +382,11 @@ def main(
     print(", ".join(cols + [""]))
     end_batch_size = end_batch_size or start_batch_size
     end_prompt_len = end_prompt_len or start_prompt_len
-    # to print decode info
-    if start_prompt_len > 1:
-        tmp, start_prompt_len = start_prompt_len, 1
-    else:
-        tmp = None
     while start_batch_size <= end_batch_size:
-        while start_prompt_len <= end_prompt_len:
+        p_len = min(1, start_prompt_len)
+        while p_len <= end_prompt_len:
             res = []
-            strategies = find_parallel_strategies(start_batch_size, start_prompt_len)
+            strategies = find_parallel_strategies(start_batch_size, p_len)
             for name, args in strategies.items():
                 exec_time_by_node = estimate_lower_bound_exec_time(
                     bench_res=bench_res, **args
@@ -402,10 +398,10 @@ def main(
                     exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
                 total_exec_time = torch.sum(exec_time_by_node).item()
                 throughput = (
-                    1000 / total_exec_time * start_batch_size * start_prompt_len
+                    1000 / total_exec_time * start_batch_size * p_len
                 )
                 res.append(
-                    [name, start_batch_size, start_prompt_len]
+                    [name, start_batch_size, p_len]
                     + exec_time_by_node.tolist()
                     + [total_exec_time, throughput]
                 )
@@ -427,10 +423,10 @@ def main(
                     )
                 )
 
-            if start_prompt_len == 1 and tmp:
-                start_prompt_len = tmp
+            if p_len == 1 and start_prompt_len > 1:
+                p_len = start_prompt_len
             else:
-                start_prompt_len *= 2
+                p_len *= 2
         start_batch_size *= 2
 
 
