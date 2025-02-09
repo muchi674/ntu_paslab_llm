@@ -85,11 +85,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         ep_node_experts.append(sum(ep_gpu_experts[i:j]))
         i = j
 
-    # strategies["naive PP"] = {
-    #     "batch_size": batch_size,
-    #     "prompt_len": prompt_len,
-    #     "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
-    # }
+    strategies["naive PP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    }
     # strategies["inter-attn-inter-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -102,11 +102,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
     #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     # }
-    strategies["inter-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    }
+    # strategies["inter-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    # }
     # strategies["inter EP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -354,7 +354,42 @@ def estimate_lower_bound_exec_time(
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
 
-    return exec_time_by_node
+    exec_time_by_node = torch.tensor(exec_time_by_node)  # in seconds
+    breakdown: torch.Tensor
+    if pp_strategy:
+        breakdown = torch.sum(exec_time_by_node, dim=0)
+    else:
+        breakdown = torch.max(exec_time_by_node, dim=0)[0]
+    total_exec_time = torch.sum(breakdown).item()
+    throughput = batch_size * prompt_len / total_exec_time
+
+    # convert to ms for easier reading, throughput in t/s
+    return (breakdown * 1000).tolist(), total_exec_time * 1000, throughput
+
+
+def run_perf_model(bench_res: dict, batch_size: int, prompt_len: int, sort: bool):
+    res = []
+    strategies = find_parallel_strategies(batch_size, prompt_len)
+    for name, args in strategies.items():
+        breakdown, total_exec_time, throughput = estimate_lower_bound_exec_time(
+            bench_res=bench_res, **args
+        )
+        res.append(
+            [name, batch_size, prompt_len] + breakdown + [total_exec_time, throughput]
+        )
+
+    if sort:
+        sorted_indices = torch.argsort(
+            torch.tensor([row[-1] for row in res]), descending=True
+        )
+        res = [res[i] for i in sorted_indices]
+
+    for row in res:
+        print(
+            ", ".join(
+                [val if isinstance(val, str) else str(round(val, 3)) for val in row]
+            )
+        )
 
 
 def main(
@@ -378,52 +413,22 @@ def main(
         "total",
         "t/s",
     ]
-    print(", ".join(cols + [""]))
+    print(", ".join(cols))
     end_batch_size = end_batch_size or start_batch_size
     end_prompt_len = end_prompt_len or start_prompt_len
+
+    # print decode results
+    bs = start_batch_size
+    while bs <= end_batch_size:
+        run_perf_model(bench_res, bs, 1, sort)
+        bs *= 2
+
+    # prefill
     while start_batch_size <= end_batch_size:
-        p_len = min(1, start_prompt_len)
+        p_len = start_prompt_len
         while p_len <= end_prompt_len:
-            res = []
-            strategies = find_parallel_strategies(start_batch_size, p_len)
-            for name, args in strategies.items():
-                exec_time_by_node = estimate_lower_bound_exec_time(
-                    bench_res=bench_res, **args
-                )
-                exec_time_by_node = torch.tensor(exec_time_by_node) * 1000  # to ms
-                if "pp_strategy" in args:
-                    exec_time_by_node = torch.sum(exec_time_by_node, dim=0)
-                else:
-                    exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
-                total_exec_time = torch.sum(exec_time_by_node).item()
-                throughput = start_batch_size * p_len / total_exec_time * 1000
-                res.append(
-                    [name, start_batch_size, p_len]
-                    + exec_time_by_node.tolist()
-                    + [total_exec_time, throughput]
-                )
-
-            if sort:
-                sorted_indices = torch.argsort(
-                    torch.tensor([row[-1] for row in res]), descending=True
-                )
-                res = [res[i] for i in sorted_indices]
-
-            for row in res:
-                print(
-                    ", ".join(
-                        [
-                            val if isinstance(val, str) else str(round(val, 2))
-                            for val in row
-                        ]
-                        + [""]
-                    )
-                )
-
-            if p_len == 1 and start_prompt_len > 1:
-                p_len = start_prompt_len
-            else:
-                p_len *= 2
+            run_perf_model(bench_res, start_batch_size, p_len, sort)
+            p_len *= 2
         start_batch_size *= 2
 
 
