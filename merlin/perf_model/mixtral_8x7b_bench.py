@@ -85,23 +85,23 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         ep_node_experts.append(sum(ep_gpu_experts[i:j]))
         i = j
 
-    strategies["naive PP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
-    }
+    # strategies["naive PP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    # }
     # strategies["inter-attn-inter-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
     #     "attn_strategy": {"attn_is_intra": False, "attn_parallelism": "tp"},
     #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     # }
-    strategies["intra-attn-inter-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    }
+    # strategies["intra-attn-inter-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    # }
     strategies["inter-experts TP"] = {
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -116,25 +116,25 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #         "experts_allocation": ep_node_experts,
     #     },
     # }
-    strategies["inter PP + intra-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
-    }
-    strategies["inter PP + intra-attn-intra-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
-    }
-    strategies["inter PP + intra EP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
-    }
+    # strategies["inter PP + intra-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
+    # }
+    # strategies["inter PP + intra-attn-intra-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "tp"},
+    # }
+    # strategies["inter PP + intra EP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    # }
     # strategies["inter PP + intra EP + intra-attn TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -142,25 +142,25 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
     #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     # }
-    strategies["inter EP + intra-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "experts_strategy": {
-            "experts_are_intra": False,
-            "experts_parallelism": "ep+tp",
-            "experts_allocation": ep_node_experts,
-        },
-    }
-    strategies["inter EP + intra-attn-intra-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {
-            "experts_are_intra": False,
-            "experts_parallelism": "ep+tp",
-            "experts_allocation": ep_node_experts,
-        },
-    }
+    # strategies["inter EP + intra-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep+tp",
+    #         "experts_allocation": ep_node_experts,
+    #     },
+    # }
+    # strategies["inter EP + intra-attn-intra-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep+tp",
+    #         "experts_allocation": ep_node_experts,
+    #     },
+    # }
     # strategies["inter EP + inter-attn-intra-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -216,6 +216,8 @@ def estimate_lower_bound_exec_time(
     # 1. we are yet to adjust compute time for extra long sequences, which requires
     # substantially more data to be moved from memory to cache and more FLOPs
     # 2. we are yet to account for data movement cost for KV-cache
+    # OBSERVATION:
+    # communication data size is hugely dependent on implementation
     precision_bytes, n_layers, model_d, vocab_d, attn_specs, expert_specs = itemgetter(
         "precision_bytes", "n_layers", "model_d", "vocab_d", "attn", "expert"
     )(MODEL_SPECS)
@@ -238,7 +240,6 @@ def estimate_lower_bound_exec_time(
     top_k = expert_specs["top_k"]
 
     model_comm_size = precision_bytes * batch_size * prompt_len * model_d
-    experts_comm_size = model_comm_size * top_k
 
     exec_time_by_node = []
     for node_idx, node in enumerate(SETUP):
@@ -250,11 +251,9 @@ def estimate_lower_bound_exec_time(
         if attn_parallelism is None:
             compute_time = max(attn_param_bytes / gpu_mem_bw, attn_flops / gpu_flops)
             exec_time.extend([compute_time, 0.0])
-        elif (
-            attn_parallelism == "tp"  # partitions weights
-            or attn_parallelism == "dp"  # partitions input
-            or attn_parallelism == "cp"  # partitions input
-        ):
+        elif attn_parallelism == "tp":  # partitions weights
+            # or attn_parallelism == "dp"  # partitions input
+            # or attn_parallelism == "cp"  # partitions input
             parallel_size = n_local_gpus if attn_is_intra else total_n_gpus
             compute_time = max(
                 attn_param_bytes / parallel_size / gpu_mem_bw,
@@ -273,10 +272,10 @@ def estimate_lower_bound_exec_time(
         # TODO: for now, we are assuming that expert selection follows an uniform dist
         n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
         intra_node_comm_time = lookup_latency(
-            bench_res[str(node_idx)]["intra_coll_comm"], experts_comm_size
+            bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
         )
         inter_node_comm_time = lookup_latency(
-            bench_res["inter_coll_comm"], experts_comm_size
+            bench_res["inter_coll_comm"], model_comm_size
         )
         if experts_parallelism is None:
             compute_time = max(
@@ -397,9 +396,7 @@ def main(
                 else:
                     exec_time_by_node = torch.max(exec_time_by_node, dim=0)[0]
                 total_exec_time = torch.sum(exec_time_by_node).item()
-                throughput = (
-                    1000 / total_exec_time * start_batch_size * p_len
-                )
+                throughput = start_batch_size * p_len / total_exec_time * 1000
                 res.append(
                     [name, start_batch_size, p_len]
                     + exec_time_by_node.tolist()
