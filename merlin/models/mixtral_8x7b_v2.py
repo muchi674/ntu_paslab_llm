@@ -442,10 +442,10 @@ class MoeLayer(nn.Module):
                 eis.append(ei)
                 bis.append(batch_idx)
                 nes.append(nth_expert)
-        concat_bis = torch.cat(bis, dim=0)to(device=device)
+        concat_bis = torch.cat(bis, dim=0).to(device=device)
         bis = torch.split(concat_bis, [len(t) for t in bis])
 
-        concat_nes = torch.cat(bis, dim=0)to(device=device)
+        concat_nes = torch.cat(bis, dim=0).to(device=device)
         nes = torch.split(concat_nes, [len(t) for t in nes])
         # bis = bis.to(device=device)
         # nes = nes.to(device=device)
