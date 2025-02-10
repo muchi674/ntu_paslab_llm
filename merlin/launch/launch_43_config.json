@@ -1,7 +1,7 @@
 {
     "world_size": 1,
     "master_addr": "127.0.0.1",
-    "master_port": "9043",
+    "master_port": "9091",
     "username": "eric891224",
     "shared_exec_args": {
         "prompt_path": "~/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
@@ -15,7 +15,7 @@
             "ssh_port": 9043,
             "node_rank": 0,
             "ngpus": 2,
-            "script": "~/ntu_paslab_llm/merlin/misc_tests/test_43.py",
+            "script": "~/ntu_paslab_llm/merlin/misc_tests/test_43_v1.py",
             "model_path": "~/llm_team/merlin_mixtral_weights/v1-3-5",
             "node_id": 0,
             "profile": false,
