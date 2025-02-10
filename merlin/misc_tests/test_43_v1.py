@@ -603,7 +603,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        print(non_experts.items())
+        print(non_experts.keys())
 
         experts = torch.load(
             model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
