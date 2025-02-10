@@ -542,7 +542,7 @@ class Transformer(nn.Module):
                 str(li): TransformerBlock(
                     args=args, li=li, experts=experts, group=group
                 )
-                for li in range(args.n_layers)
+                for li in range(1)#range(args.n_layers)
             }
         )
 
@@ -603,9 +603,9 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        # for key in non_experts.copy().keys():
-        #     if key.startswith('layers') and 'layers.0' not in key:
-        #         del non_experts[key]
+        for key in non_experts.copy().keys():
+            if key.startswith('layers') and 'layers.0' not in key:
+                del non_experts[key]
 
         print(non_experts.keys())
 
@@ -616,6 +616,10 @@ class Transformer(nn.Module):
             mmap=True,
         )
         
+        for key in experts.copy().keys():
+            if not key.startswith('0'):
+                del experts[key]
+
         print(experts.keys())
 
         with torch.device("meta"):
