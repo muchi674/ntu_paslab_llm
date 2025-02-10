@@ -756,6 +756,9 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     torch.cuda.cudart().cudaProfilerStop()
+
+    time.sleep(30)
+
     dist.barrier()
     dist.destroy_process_group()
 
