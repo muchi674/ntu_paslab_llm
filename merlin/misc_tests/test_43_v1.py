@@ -624,7 +624,7 @@ class Transformer(nn.Module):
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts), group=group)
-        # model.load_state_dict(non_experts, assign=True, strict=True)
+        model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
 
