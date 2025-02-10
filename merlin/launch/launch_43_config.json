@@ -1,6 +1,6 @@
 {
     "world_size": 1,
-    "master_addr": "10.10.10.1",
+    "master_addr": "127.0.0.1",
     "master_port": "9043",
     "username": "eric891224",
     "shared_exec_args": {
@@ -11,7 +11,7 @@
         "hide_resp": false
     },
     "nodes": {
-        "10.10.10.1": {
+        "127.0.0.1": {
             "ssh_port": 9043,
             "node_rank": 0,
             "ngpus": 2,
