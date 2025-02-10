@@ -869,6 +869,9 @@ def main(
     decode_tps = []
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
+
+        torch.cuda.nvtx.range_push('generate')
+
         prompt_batch = prompts[start:end]
         (
             seqlens,
@@ -887,6 +890,8 @@ def main(
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
+
+        torch.cuda.nvtx.range_pop()
 
         if WORLD_RANK == 0:
             prefill_tp = n_p_tkns / prefill_time
