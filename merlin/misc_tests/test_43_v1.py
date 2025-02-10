@@ -619,7 +619,8 @@ class Transformer(nn.Module):
         )
         
         for key in experts.copy().keys():
-            if not key.startswith('0'):
+            # if not key.startswith('0'):
+            if key.split('.')[0] not in [str(i) for i in range(n_layers_to_keep)]
                 del experts[key]
 
         print(experts.keys())
