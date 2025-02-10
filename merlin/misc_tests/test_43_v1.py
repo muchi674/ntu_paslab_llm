@@ -603,8 +603,10 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        n_layers_to_keep = 1
+
         for key in non_experts.copy().keys():
-            if key.startswith('layers') and 'layers.0' not in key:
+            if key.startswith('layers') and key.split('.')[1] not in [str(i) for i in range(n_layers_to_keep)]:
                 del non_experts[key]
 
         print(non_experts.keys())
