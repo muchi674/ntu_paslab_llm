@@ -85,11 +85,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         ep_node_experts.append(sum(ep_gpu_experts[i:j]))
         i = j
 
-    strategies["naive PP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
-    }
+    # strategies["naive PP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    # }
     # strategies["inter-attn-inter-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -102,11 +102,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
     #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     # }
-    # strategies["inter-experts TP"] = {
-    #     "batch_size": batch_size,
-    #     "prompt_len": prompt_len,
-    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    # }
+    strategies["inter-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    }
     # strategies["inter EP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
