@@ -542,7 +542,7 @@ class Transformer(nn.Module):
                 str(li): TransformerBlock(
                     args=args, li=li, experts=experts, group=group
                 )
-                for li in range(1)#range(args.n_layers)
+                for li in range(args.n_layers)
             }
         )
 
@@ -596,6 +596,10 @@ class Transformer(nn.Module):
     @staticmethod
     def load(model_path: Path, node_id: int, gpu: torch.device, group) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
+
+        n_layers_to_keep = 1
+        model_args.n_layers = n_layers_to_keep
+
         non_experts = torch.load(
             model_path / "non-experts.pt",
             map_location=gpu,
@@ -603,7 +607,6 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
-        n_layers_to_keep = 1
 
         for key in non_experts.copy().keys():
             if key.startswith('layers') and key.split('.')[1] not in [str(i) for i in range(n_layers_to_keep)]:
