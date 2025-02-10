@@ -612,6 +612,8 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        print(experts.keys())
+
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts), group=group)
         # model.load_state_dict(non_experts, assign=True, strict=True)
