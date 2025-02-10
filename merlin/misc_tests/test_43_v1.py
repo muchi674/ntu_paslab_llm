@@ -603,6 +603,10 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        for key in non_experts.keys():
+            if key.startswith('layers') and 'layers.0' not in key:
+                del non_experts[key]
+
         print(non_experts.keys())
 
         experts = torch.load(
@@ -611,7 +615,7 @@ class Transformer(nn.Module):
             weights_only=True,
             mmap=True,
         )
-
+        
         print(experts.keys())
 
         with torch.device("meta"):
