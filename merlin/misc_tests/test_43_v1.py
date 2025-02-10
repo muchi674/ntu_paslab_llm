@@ -847,7 +847,9 @@ def main(
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), node_id, gpu, group)
 
-    # # warmup
+    print(model)
+
+    # warmup
     # generate(
     #     ["hello, how are you?"],
     #     tokenizer,
