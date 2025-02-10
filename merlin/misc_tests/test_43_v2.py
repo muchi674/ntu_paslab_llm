@@ -1,7 +1,4 @@
-#!/home/joe/miniconda3/envs/mixtral/bin/python
-
-# [POC]: tensor + expert parallel MoE
-# [known issues]: OOM with large batch sizes (64, 128)
+# [POC]: tensor parallel attention, tensor + expert parallel MoE
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -30,6 +27,7 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -234,14 +232,14 @@ class BufferCache:
         head_dim: int,
     ):
         self.max_seq_len = max_seq_len
-        self.n_kv_heads = n_kv_heads
+        self.n_kv_heads = n_kv_heads // LOCAL_WORLD_SIZE
         self.head_dim = head_dim
 
         self.cache_k = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
         )
         self.cache_v = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
+            (n_layers, max_batch_size, max_seq_len, self.n_kv_heads, head_dim)
         )
         # holds the valid length for each batch element in the cache
         self.kv_seqlens: Optional[torch.Tensor] = None
@@ -327,27 +325,30 @@ class BufferCache:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, group):
         super().__init__()
         self.args = args
+        self.group = group
 
-        self.n_heads: int = args.n_heads
+        assert args.n_heads % LOCAL_WORLD_SIZE == 0
+        assert args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+        self.n_heads: int = args.n_heads // LOCAL_WORLD_SIZE
         self.head_dim: int = args.head_dim
-        self.n_kv_heads: int = args.n_kv_heads
+        self.n_kv_heads: int = args.n_kv_heads // LOCAL_WORLD_SIZE
 
         self.repeats = self.n_heads // self.n_kv_heads
 
         self.scale = self.args.head_dim**-0.5
 
-        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(args.dim, self.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
         # eric891224
         # timer-based
         self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+        self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
         # self.comp_start = torch.cuda.Event(enable_timing=True)
         # self.comm_start = torch.cuda.Event(enable_timing=True)
@@ -362,13 +363,12 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         if cache.prefill:
             self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-            # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-
+            self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # self.comp_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
 
-        seqlen_sum, _ = x.shape
+        seqlen_sum, model_dim = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
@@ -401,20 +401,42 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        assert isinstance(output, torch.Tensor)
+        output: torch.Tensor = self.wo(output)
+        # all_reduce is not used to prevent hangs
+        local_world_out = torch.zeros(
+            (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
+            dtype=output.dtype,
+            device=output.device,
+        )
 
         # exp. compare v1 v2
-        # dist.barrier()
+        # dist.barrier(group=self.group)
+        torch.cuda.synchronize()
+        te = time.perf_counter()
+        temp_comp = te - ts
+        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
-        # return self.wo(output)  # type: ignore
-        output = self.wo(output)
-    
+        # self.comm_start.record()
+
+        dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
+        # self.comm_records[f'{WORLD_RANK}'] = ts - te
+        self.comm_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(ts - te)
+
+        # self.comm_end.record()
+        # return torch.sum(local_world_out, dim=0)
+        local_world_out = torch.sum(local_world_out, dim=0)
+
         # self.comp_end.record()
         torch.cuda.synchronize()
         te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
-        return output
+        temp_comp += te - ts
+        # self.comp_records[f'{WORLD_RANK}'] += te - ts
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(temp_comp)
 
+        return local_world_out
 
 
 class Experts:
@@ -463,7 +485,6 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
@@ -483,9 +504,11 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
+    def __init__(
+        self, args: ModelArgs, li: int, experts: Experts, attn_group, moe_group
+    ):
         super().__init__()
-        self.attention = Attention(args)
+        self.attention = Attention(args=args, group=attn_group)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
@@ -493,7 +516,7 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
-            group=group,
+            group=moe_group,
         )
 
         # eric891224
@@ -514,15 +537,22 @@ class TransformerBlock(nn.Module):
         torch.cuda.synchronize()
         ts = time.perf_counter()
 
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        # torch.cuda.nvtx.range_push("atten")
+
+        x = self.attention_norm(x)
+        torch.cuda.nvtx.range_push("atten")
+        r = self.attention.forward(x, freqs_cis, cache)
+        
+        # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
 
         torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         te = time.perf_counter()
         self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
         # self.atten_end.record()
         # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
-
+        
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -530,7 +560,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, group):
+    def __init__(self, args: ModelArgs, experts: Experts, attn_group, moe_group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -540,7 +570,11 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=group
+                    args=args,
+                    li=li,
+                    experts=experts,
+                    attn_group=attn_group,
+                    moe_group=moe_group,
                 )
                 for li in range(args.n_layers)
             }
@@ -594,42 +628,30 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device, group) -> "Transformer":
+    def load(
+        model_path: Path, node_id: int, gpu: torch.device, attn_group, moe_group
+    ) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
-
-        n_layers_to_keep = 1
-        model_args.n_layers = n_layers_to_keep
-
         non_experts = torch.load(
-            model_path / "non-experts.pt",
+            model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
-
-
-        for key in non_experts.copy().keys():
-            if key.startswith('layers') and key.split('.')[1] not in [str(i) for i in range(n_layers_to_keep)]:
-                del non_experts[key]
-
-        # print(non_experts.keys())
-
         experts = torch.load(
             model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
-        
-        for key in experts.copy().keys():
-            # if not key.startswith('0'):
-            if key.split('.')[0] not in [str(i) for i in range(n_layers_to_keep)]:
-                del experts[key]
-
-        # print(experts.keys())
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), group=group)
+            model = Transformer(
+                args=model_args,
+                experts=Experts(experts),
+                attn_group=attn_group,
+                moe_group=moe_group,
+            )
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -640,7 +662,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    group,
+    global_group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -680,7 +702,7 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
-    dist.barrier(group=group)
+    dist.barrier(group=global_group)
     prefill_time = time.time() - tic
     tic = time.time()
 
@@ -708,7 +730,7 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
-    dist.barrier(group=group)
+    dist.barrier(group=global_group)
     decode_time = time.time() - tic
 
     return (
@@ -742,6 +764,14 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.multinomial(probs_sort, num_samples=1)
     return torch.gather(probs_idx, -1, next_token)
 
+
+def get_node_group(node_id, gpu, global_group):
+    global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
+    local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=gpu)
+    dist.all_gather_into_tensor(global_map, local_map, group=global_group)
+    ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
+    return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
+
 def print_stats(
     bete_p = "N/A",
     bete_d = "N/A",
@@ -750,10 +780,11 @@ def print_stats(
     comp_p = "N/A",
     comp_d = "N/A",
     comm_p = "N/A",
-    comm_d = "N/A"
+    comm_d = "N/A",
+    description = f'Rank {WORLD_RANK}'
 ):
     result = (
-    f"Rank {WORLD_RANK}\n"
+    f"{description}\n"
     + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
     + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
     + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
@@ -779,14 +810,14 @@ def get_atten_timer_stats(model: Transformer):
 
     for block in model.layers.values():
         bete_p += mean(block.records[key_p]) * f_s2ms
-        ete_p += (mean(block.attention.comp_records[key_p])) * f_s2ms
+        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
         comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
-        # comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
+        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
 
         bete_d += mean(block.records[key_d]) * f_s2ms
-        ete_d += (mean(block.attention.comp_records[key_d])) * f_s2ms
+        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
         comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
-        # comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
+        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
     
     print_stats(
         bete_p,
@@ -796,26 +827,101 @@ def get_atten_timer_stats(model: Transformer):
         comp_p,
         comp_d,
         comm_p,
-        comm_d
+        comm_d,
     )
+
+def get_node_atten_timer_stats(model: Transformer, group):
+    bete_p = 0
+    bete_d = 0
+    ete_p = 0
+    ete_d = 0
+    comp_p = 0
+    comp_d = 0
+    comm_p = 0
+    comm_d = 0
+
+    f_s2ms = 1000
+    n_layers = 32
+
+    # print(LOCAL_WORLD_SIZE)
+    for block in model.layers.values():
+        # print(len(block.records.keys()), (block.records.keys()))
+        for key, val in block.records.items():
+            if '_p' in key:
+                bete_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                bete_d += mean(val) * f_s2ms
+        for key, val in block.attention.comp_records.items():
+            if '_p' in key:
+                comp_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                comp_d += mean(val) * f_s2ms
+        for key, val in block.attention.comm_records.items():
+            if '_p' in key:
+                comm_p += mean(val) * f_s2ms
+            elif '_d' in key:
+                comm_d += mean(val) * f_s2ms
+
+    ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
+
+    g_bete_p = g_bete_d = g_ete_p = g_ete_d = g_comp_p = g_comp_d = g_comm_p = g_comm_d = [None for _ in range(LOCAL_WORLD_SIZE)]
+
+    # dist.all_gather_object(g_bete_p, [bete_p], group)
+    # dist.all_gather_object(g_bete_d, [bete_p], group)
+    # dist.all_gather_object(g_ete_p, [ete_p], group)
+    # dist.all_gather_object(g_ete_d, [ete_d], group)
+    # dist.all_gather_object(g_comp_p, [comp_p], group)
+    # dist.all_gather_object(g_comp_d, [comp_d], group)
+    # dist.all_gather_object(g_comm_p, [comm_p], group)
+    # dist.all_gather_object(g_comm_d, [comm_d], group)
+
+
+
+    # print_stats(
+    #     bete_p,
+    #     bete_d,
+    #     ete_p,
+    #     ete_d,
+    #     comp_p,
+    #     comp_d,
+    #     comm_p,
+    #     comm_d,
+    #     'Nodes Average'
+    # )
+
+    if LOCAL_RANK == 0:
+        print(type(bete_p))
+        # print_stats(
+        #     g_bete_p,
+        #     g_bete_d,
+        #     g_ete_p,
+        #     g_ete_d,
+        #     g_comp_p,
+        #     g_comp_d,
+        #     g_comm_p,
+        #     g_comm_d,
+        #     'Nodes Average'
+        # )
 
 
 def get_atten_stats(model: Transformer):
+    bete = 0
     ete = 0
     comp = 0
     comm = 0
     n_layers = 0
 
     for block in model.layers.values():
-        # ete += block.atten_start.elapsed_time(block.atten_end)
-        ete += block.atten_start.elapsed_time(block.atten_end)
-        comp += block.attention.comp_start.elapsed_time(block.attention.comp_end)
-        # comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
-        # comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
-        # comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
+        bete += block.atten_start.elapsed_time(block.atten_end)
+        ete += block.attention.comp_start.elapsed_time(block.attention.comp_end)
+        comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
+        comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
+        comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
         n_layers += 1
 
-    print(f"total end-to-end (transformer block level) time: {ete} ms")
+
+    print(f"total end-to-end (transformer block level) time: {bete} ms")
+    print(f"total end-to-end time: {ete} ms")
     print(f"total computation time: {comp} ms")
     print(f"total communication time: {comm} ms")
     print(f"avg end-to-end time: {ete/n_layers} ms")
@@ -846,94 +952,110 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
+    global_group = dist.new_group(
+        list(range(WORLD_SIZE)), use_local_synchronization=True
+    )
+    node_group = get_node_group(node_id, gpu, global_group)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), node_id, gpu, group)
-
-    # warmup
-    generate(
-        ["hello, how are you?"],
-        tokenizer,
-        model,
-        group,
-        max_tokens=16,
-        max_batch_size=1,
-        # temperature=0,
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    model = Transformer.load(
+        model_path=Path(model_path),
+        node_id=node_id,
+        gpu=gpu,
+        attn_group=node_group,
+        moe_group=global_group,
     )
 
-    dist.barrier(group=group)
+    # # warmup
+    # generate(
+    #     ["hello, how are you?"],
+    #     tokenizer,
+    #     model,
+    #     global_group,
+    #     max_tokens=128,
+    #     max_batch_size=1,
+    #     # temperature=0,
+    #     eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    # )
 
-    torch.cuda.cudart().cudaProfilerStart()
-    prefill_tps = []
-    decode_tps = []
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
-        prompt_batch = prompts[start:end]
-        (
-            seqlens,
-            responses,
-            n_p_tkns,
-            prefill_time,
-            n_gen_tkns,
-            decode_time,
-        ) = generate(
-            prompt_batch,
-            tokenizer,
-            model,
-            group,
-            max_tokens=max_tokens,
-            max_batch_size=len(prompt_batch),
-            # temperature=0,
-            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        )
+    # torch.cuda.cudart().cudaProfilerStart()
+    # prefill_tps = []
+    # decode_tps = []
+    # start = 0
+    # for end in range(batch_size, n_prompts + 1, batch_size):
+    #     prompt_batch = prompts[start:end]
+    #     (
+    #         seqlens,
+    #         responses,
+    #         n_p_tkns,
+    #         prefill_time,
+    #         n_gen_tkns,
+    #         decode_time,
+    #     ) = generate(
+    #         prompt_batch,
+    #         tokenizer,
+    #         model,
+    #         global_group,
+    #         max_tokens=max_tokens,
+    #         max_batch_size=len(prompt_batch),
+    #         # temperature=0,
+    #         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    #     )
 
-        if WORLD_RANK == 0:
-            prefill_tp = n_p_tkns / prefill_time
-            decode_tp = n_gen_tkns / decode_time
-            prefill_tps.append(prefill_tp)
-            decode_tps.append(decode_tp)
+    #     if WORLD_RANK == 0:
+    #         prefill_tp = n_p_tkns / prefill_time
+    #         decode_tp = n_gen_tkns / decode_time
+    #         prefill_tps.append(prefill_tp)
+    #         decode_tps.append(decode_tp)
 
-            print("=" * 20)
-            print("PERFORMANCE BREAKDOWN\n")
-            print("PROMPT EVALUATION:")
-            print(f"token count: {n_p_tkns}")
-            print(f"total time in sec(s): {prefill_time:.2f}")
-            print(f"throughput: {prefill_tp:.2f} t/s")
-            print("TOKEN GENERATION:")
-            print(f"token count: {n_gen_tkns}")
-            print(f"total time in sec(s): {decode_time:.2f}")
-            if n_gen_tkns > 0:
-                print(f"throughput: {decode_tp:.2f} t/s")
-            else:
-                responses = ["" for _ in prompt_batch]
-            if not hide_resp:
-                print("=" * 20)
-                print("INS-N-OUTS")
-                print(f"AVG seqlen: {mean(seqlens)}")
-                print(f"seqlens: {seqlens}\n")
-                for p, resp in zip(prompt_batch, responses):
-                    print(f"PROMPT:\n{p}")
-                    print(f"RESPONSE:\n{resp}\n")
+    #         print("=" * 20)
+    #         print("PERFORMANCE BREAKDOWN\n")
+    #         print("PROMPT EVALUATION:")
+    #         print(f"token count: {n_p_tkns}")
+    #         print(f"total time in sec(s): {prefill_time:.2f}")
+    #         print(f"throughput: {prefill_tp:.2f} t/s")
+    #         print("TOKEN GENERATION:")
+    #         print(f"token count: {n_gen_tkns}")
+    #         print(f"total time in sec(s): {decode_time:.2f}")
+    #         if n_gen_tkns > 0:
+    #             print(f"throughput: {decode_tp:.2f} t/s")
+    #         else:
+    #             responses = ["" for _ in prompt_batch]
+    #         if not hide_resp:
+    #             print("=" * 20)
+    #             print("INS-N-OUTS")
+    #             print(f"AVG seqlen: {mean(seqlens)}")
+    #             print(f"seqlens: {seqlens}\n")
+    #             for p, resp in zip(prompt_batch, responses):
+    #                 print(f"PROMPT:\n{p}")
+    #                 print(f"RESPONSE:\n{resp}\n")
 
-        start = end
+    #     start = end
 
     # if WORLD_RANK == 0:
-        # print("=" * 20)
-        # print("RUN STATISTICS")
-        # print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-        # print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    #     print("=" * 20)
+    #     print("RUN STATISTICS")
+    #     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+    #     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-        # eric891224
-        # print("=" * 20)
-        # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
-        # get_atten_stats(model=model)
+    #     # eric891224
+    #     print("=" * 20)
+    #     # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
+    #     # get_atten_stats(model=model)
 
-    torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier(group=group)
+    # dist.barrier(group=node_group)
+    # get stats of each rank
+    # get_atten_timer_stats(model=model)
+
+    # dist.barrier(group=node_group)
+    # # get avg stats of this node
+    # if LOCAL_RANK == 0:
+    # get_node_atten_timer_stats(model=model, group=node_group)
+
+        
+
+    # torch.cuda.cudart().cudaProfilerStop()
+    dist.barrier(group=global_group)
     dist.destroy_process_group()
-
-    get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
