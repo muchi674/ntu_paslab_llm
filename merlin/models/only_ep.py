@@ -411,14 +411,14 @@ class MoeLayer(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
-        #gate_logits = gate_logits[:, :6]
+        gate_logits = gate_logits[:, :6]
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
+        for ei in range(self.num_experts - 2):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 if ei == torch.distributed.get_rank():
