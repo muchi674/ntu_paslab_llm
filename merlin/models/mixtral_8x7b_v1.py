@@ -581,7 +581,10 @@ class Transformer(nn.Module):
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
+        torch.cuda.nvtx.range_push("cache get_input_metadata")
         input_metadata = cache.get_input_metadata(seqlens)
+        torch.cuda.nvtx.range_pop()
+
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
