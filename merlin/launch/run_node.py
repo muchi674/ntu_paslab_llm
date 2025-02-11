@@ -131,6 +131,11 @@ def main():
             "nsys profile "
             + "--capture-range=cudaProfilerApi "
             + "--capture-range-end=stop "
+            # eric891224 for detailed profiling, ref: https://forums.developer.nvidia.com/t/nsight-system-profiling-two-cuda-python-i-e-pytorch-processes-using-the-same-gpu-simultaneously/286266
+            + "--cuda-graph-trace=node"
+            + "--gpu-metrics-devices=all"
+            + "--gpuctxsw=true"
+
         )
         if args.profiling_output:
             prof_cmd += f"-o {args.profiling_output} "
