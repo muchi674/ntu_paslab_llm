@@ -631,6 +631,8 @@ def generate(
     model = model.eval()
     tic = time.time()
 
+    torch.cuda.nvtx.range_push("tokenization")
+
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
             ChatCompletionRequest(messages=[UserMessage(content=p)])
@@ -639,6 +641,9 @@ def generate(
     ]
     B, V = len(encoded_prompts), model.args.vocab_size
     seqlens = [len(x) for x in encoded_prompts]
+
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("create kv cache")
 
     # Cache
     cache_window = max(seqlens) + max_tokens
@@ -652,6 +657,9 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("prefill")
+
     # prefill / prompt evaluation stage
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
@@ -662,8 +670,13 @@ def generate(
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
     dist.barrier(group=group)
+
+    torch.cuda.nvtx.range_pop()
+
     prefill_time = time.time() - tic
     tic = time.time()
+
+    torch.cuda.nvtx.range_push("decode")
 
     # decode
     generated_tensors = []
@@ -690,6 +703,9 @@ def generate(
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
     dist.barrier(group=group)
+
+    torch.cuda.nvtx.range_pop()
+
     decode_time = time.time() - tic
 
     return (
