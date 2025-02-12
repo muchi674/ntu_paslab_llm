@@ -870,7 +870,12 @@ def main(
 
     gpu = torch.device(f"cuda:{LOCAL_RANK}")
 
-    c.cudaSetDeviceFlags(4)
+    # https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html#group__CUDART__TYPES_1g3ade1dbaf4b222b22733cdfdcc026075
+    # 0x00 - cudaDeviceScheduleAuto
+    # 0x04 - cudaDeviceScheduleBlockingSync
+    # 0x01 - cudaDeviceScheduleSpin
+    # 0x02 - cudaDeviceScheduleYield
+    # c.cudaSetDeviceFlags(0)
 
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
