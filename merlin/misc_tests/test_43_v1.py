@@ -976,6 +976,9 @@ def main(
     dist.barrier(group=group)
     dist.destroy_process_group()
 
+    c.cudaGetDeviceFlags(ctypes.byref(i))
+    print("cudaDeviceFlag", i)  # prints flag + 8
+
     get_atten_timer_stats(model=model)
 
 
