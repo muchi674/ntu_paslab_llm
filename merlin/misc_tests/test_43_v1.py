@@ -875,7 +875,7 @@ def main(
     # 0x04 - cudaDeviceScheduleBlockingSync
     # 0x01 - cudaDeviceScheduleSpin
     # 0x02 - cudaDeviceScheduleYield
-    c.cudaSetDeviceFlags(1)
+    c.cudaSetDeviceFlags(0)
 
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
@@ -961,11 +961,11 @@ def main(
 
         start = end
 
-    # if WORLD_RANK == 0:
-        # print("=" * 20)
-        # print("RUN STATISTICS")
-        # print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-        # print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    if WORLD_RANK == 0:
+        print("=" * 20)
+        print("RUN STATISTICS")
+        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
         # eric891224
         # print("=" * 20)
