@@ -8,7 +8,7 @@
         "n_prompts": 8,
         "batch_size": 1,
         "max_tokens": 128,
-        "hide_resp": false
+        "hide_resp": true
     },
     "nodes": {
         "127.0.0.1": {
