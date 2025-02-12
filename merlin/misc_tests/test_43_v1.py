@@ -593,6 +593,8 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
+        print(h.shape)
+
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
@@ -875,7 +877,7 @@ def main(
     # 0x04 - cudaDeviceScheduleBlockingSync
     # 0x01 - cudaDeviceScheduleSpin
     # 0x02 - cudaDeviceScheduleYield
-    c.cudaSetDeviceFlags(0)
+    # c.cudaSetDeviceFlags(0)
 
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
