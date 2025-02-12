@@ -30,6 +30,9 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+import ctypes
+c = ctypes.CDLL('libcudart.so')
+
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -513,7 +516,6 @@ class TransformerBlock(nn.Module):
         # self.atten_start.record()
         torch.cuda.synchronize()
         ts = time.perf_counter()
-        print(x.shape)
 
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
 
@@ -873,6 +875,10 @@ def main(
     group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
     model = Transformer.load(Path(model_path), node_id, gpu, group)
+
+    i = ctypes.c_uint()
+    c.cudaGetDeviceFlags(ctypes.byref(i))
+    print("cudaDeviceFlag", i)  # prints flag + 8
 
     # warmup
     generate(
