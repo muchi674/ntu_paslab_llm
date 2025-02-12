@@ -368,6 +368,8 @@ class Attention(nn.Module):
         torch.cuda.synchronize()
         ts = time.perf_counter()
 
+        print(x.shape)
+
         seqlen_sum, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
