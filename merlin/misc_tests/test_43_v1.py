@@ -612,6 +612,8 @@ class Transformer(nn.Module):
             mmap=True,
         )
 
+        print(model_args.head_dim)
+
 
         for key in non_experts.copy().keys():
             if key.startswith('layers') and key.split('.')[1] not in [str(i) for i in range(n_layers_to_keep)]:
