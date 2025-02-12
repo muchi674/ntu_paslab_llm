@@ -875,7 +875,7 @@ def main(
     # 0x04 - cudaDeviceScheduleBlockingSync
     # 0x01 - cudaDeviceScheduleSpin
     # 0x02 - cudaDeviceScheduleYield
-    c.cudaSetDeviceFlags(1)
+    c.cudaSetDeviceFlags(2)
 
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
