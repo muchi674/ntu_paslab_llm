@@ -268,7 +268,6 @@ class BufferCache:
         return self.cache_k.device
 
     def to(self, device: torch.device, dtype: torch.dtype) -> "BufferCache":
-        print('to device', device)
         self.cache_k = self.cache_k.to(device=device, dtype=dtype)
         self.cache_v = self.cache_v.to(device=device, dtype=dtype)
 
@@ -308,9 +307,9 @@ class BufferCache:
         if during_prefill:
             assert all([pos == 0 for pos in seqpos]), seqpos
             mask = (
-                BlockDiagonalCausalMask.from_seqlens(seqlens)
+                BlockDiagonalCausalMask.from_seqlens(seqlens, device=self.device)
                 .make_local_attention(self.max_seq_len)
-                .to(self.device)
+                # .to(self.device)
             )
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
@@ -319,7 +318,8 @@ class BufferCache:
                 kv_seqlen=(self.kv_seqlens + cached_elements) # vectorized_elementwise_kernel
                 .clamp(max=self.max_seq_len) # vectorized_elementwise_kernel
                 .tolist(),
-            ).to(self.device)
+                device=self.device
+            )#.to(self.device)
 
         return CacheInputMetadata(
             positions=positions,
