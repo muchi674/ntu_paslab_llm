@@ -268,6 +268,7 @@ class BufferCache:
         return self.cache_k.device
 
     def to(self, device: torch.device, dtype: torch.dtype) -> "BufferCache":
+        print('to device', device)
         self.cache_k = self.cache_k.to(device=device, dtype=dtype)
         self.cache_v = self.cache_v.to(device=device, dtype=dtype)
 
