@@ -288,20 +288,20 @@ class BufferCache:
         assert len(seqlens) == len(
             self.kv_seqlens
         ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
-        seqpos = self.kv_seqlens.tolist()
+        seqpos = self.kv_seqlens.tolist() # DtoH
 
         assert len(seqlens) > 0, seqlens
-        cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long)
+        cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long) # HtoD
 
         positions = torch.cat(
             [torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]
-        ).to(device=self.device, dtype=torch.long)
+        ).to(device=self.device, dtype=torch.long) # HtoD
         batch_idx = torch.tensor(
             sum([[i] * seqlen for i, seqlen in enumerate(seqlens)], []),
             device=self.device,
             dtype=torch.long,
-        )
-        cache_positions = positions + batch_idx * self.max_seq_len
+        ) # HtoD
+        cache_positions = positions + batch_idx * self.max_seq_len # vectorized_elementwise_kernel * 2
 
         during_prefill = seqpos[0] == 0
         if during_prefill:
@@ -315,8 +315,8 @@ class BufferCache:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=self.max_seq_len,
-                kv_seqlen=(self.kv_seqlens + cached_elements)
-                .clamp(max=self.max_seq_len)
+                kv_seqlen=(self.kv_seqlens + cached_elements) # vectorized_elementwise_kernel
+                .clamp(max=self.max_seq_len) # vectorized_elementwise_kernel
                 .tolist(),
             ).to(self.device)
 
@@ -368,8 +368,8 @@ class Attention(nn.Module):
             # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
         # self.comp_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
+        # torch.cuda.synchronize()
+        # ts = time.perf_counter()
 
         seqlen_sum, _ = x.shape
 
@@ -413,9 +413,9 @@ class Attention(nn.Module):
         output = self.wo(output)
     
         # self.comp_end.record()
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
+        # torch.cuda.synchronize()
+        # te = time.perf_counter()
+        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
         return output
 
 
@@ -514,14 +514,14 @@ class TransformerBlock(nn.Module):
             self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
         # self.atten_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
+        # torch.cuda.synchronize()
+        # ts = time.perf_counter()
 
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
 
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
+        # torch.cuda.synchronize()
+        # te = time.perf_counter()
+        # self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
 
         # self.atten_end.record()
         # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
@@ -592,8 +592,6 @@ class Transformer(nn.Module):
 
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
-
-        print(h.shape)
 
         for li in range(self.args.n_layers):
             cache_view = cache.get_view(li, input_metadata)
@@ -902,7 +900,7 @@ def main(
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    dist.barrier(group=group)
+    # dist.barrier(group=group)
 
     torch.cuda.cudart().cudaProfilerStart()
     prefill_tps = []
@@ -981,7 +979,7 @@ def main(
     c.cudaGetDeviceFlags(ctypes.byref(i))
     print("cudaDeviceFlag", i)  # prints flag + 8
 
-    get_atten_timer_stats(model=model)
+    # get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
