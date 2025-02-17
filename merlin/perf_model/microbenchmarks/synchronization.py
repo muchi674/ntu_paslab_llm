@@ -122,7 +122,7 @@ class CacheInputMetadata:
 def interleave_list(
     l1: List[torch.Tensor], l2: List[torch.Tensor]
 ) -> List[torch.Tensor]:
-    assert len(l1) == len(l2)
+    # assert len(l1) == len(l2)
     return [v for pair in zip(l1, l2) for v in pair]
 
 
@@ -156,8 +156,8 @@ class CacheView:
         """
         This is a naive implementation and not optimized for speed.
         """
-        assert xk.ndim == xv.ndim == 3  # (B * T, H, D)
-        assert xk.shape == xv.shape
+        # assert xk.ndim == xv.ndim == 3  # (B * T, H, D)
+        # assert xk.shape == xv.shape
 
         if all([s == 0 for s in self.metadata.seqlens]):
             # No cache to interleave
@@ -166,9 +166,9 @@ class CacheView:
         # Make it a list of [(T, H, D)]
         xk: Tuple[torch.Tensor] = torch.split(xk, self.metadata.seqlens)  # type: ignore
         xv: Tuple[torch.Tensor] = torch.split(xv, self.metadata.seqlens)  # type: ignore
-        assert len(xk) == len(
-            self.kv_seqlens
-        ), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
+        # assert len(xk) == len(
+        #     self.kv_seqlens
+        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
 
         # Retrieve cache
         cache_k = [
@@ -232,7 +232,7 @@ class BufferCache:
         self.kv_seqlens: Optional[torch.Tensor] = None
 
     def get_view(self, layer_id: int, metadata: CacheInputMetadata) -> CacheView:
-        assert self.kv_seqlens is not None
+        # assert self.kv_seqlens is not None
         return CacheView(
             self.cache_k[layer_id], self.cache_v[layer_id], metadata, self.kv_seqlens
         )
@@ -256,7 +256,7 @@ class BufferCache:
         return self
 
     def update_seqlens(self, seqlens: List[int]) -> None:
-        assert self.kv_seqlens is not None
+        # assert self.kv_seqlens is not None
         self.kv_seqlens += torch.tensor(seqlens, device=self.device, dtype=torch.long)
 
     def get_input_metadata(self, seqlens: List[int]) -> CacheInputMetadata:
@@ -266,13 +266,13 @@ class BufferCache:
         if self.kv_seqlens is None:
             self.init_kvseqlens(len(seqlens))
 
-        assert isinstance(self.kv_seqlens, torch.Tensor)
-        assert len(seqlens) == len(
-            self.kv_seqlens
-        ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
+        # assert isinstance(self.kv_seqlens, torch.Tensor)
+        # assert len(seqlens) == len(
+        #     self.kv_seqlens
+        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
         seqpos = self.kv_seqlens.tolist()
 
-        assert len(seqlens) > 0, seqlens
+        # assert len(seqlens) > 0, seqlens
         cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long)
 
         positions = torch.cat(
@@ -287,7 +287,7 @@ class BufferCache:
 
         during_prefill = seqpos[0] == 0
         if during_prefill:
-            assert all([pos == 0 for pos in seqpos]), seqpos
+            # assert all([pos == 0 for pos in seqpos]), seqpos
             mask = (
                 BlockDiagonalCausalMask.from_seqlens(
                     seqlens, device=self.device
@@ -372,7 +372,7 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        assert isinstance(output, torch.Tensor)
+        # assert isinstance(output, torch.Tensor)
 
         return self.wo(output)  # type: ignore
 
@@ -482,13 +482,14 @@ class Transformer(nn.Module):
         cache: BufferCache,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
-        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
+        # assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
         input_metadata = cache.get_input_metadata(seqlens)
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for li in range(self.args.n_layers):
+            dist.barrier()
             cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
@@ -547,16 +548,21 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
+    dist.barrier()
+    torch.cuda.nvtx.range_push("prefill")
+
     # prefill / prompt evaluation stage
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
     )
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-    last_token_prelogits = prelogits.index_select(0, last_positions)
 
     dist.barrier()
+    torch.cuda.nvtx.range_pop()
+
+    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
+    last_token_prelogits = prelogits.index_select(0, last_positions)
 
     # decode
     is_finished = torch.tensor([False for _ in range(B)])
@@ -569,9 +575,7 @@ def generate(
             break
 
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        assert last_token_prelogits.shape == (B, V)
-
-    dist.barrier()
+        # assert last_token_prelogits.shape == (B, V)
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -585,7 +589,7 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tens
 
 
 def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    assert 0 <= p <= 1
+    # assert 0 <= p <= 1
 
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
@@ -604,8 +608,8 @@ def main(
     batch_size: int = 1,
     max_tokens: int = 128,
 ):
-    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    assert n_prompts % batch_size == 0
+    # assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    # assert n_prompts % batch_size == 0
     prompts: list[str] = None
     if prompt:
         prompts = [prompt]
@@ -657,8 +661,10 @@ if __name__ == "__main__":
     MAX_TOKENS = 16
     main(
         model_path=MODEL_PATH,
+        prompt=None,
         prompt_path=PROMPT_PATH,
         n_prompts=N_PROMPTS,
         batch_size=BATCH_SIZE,
         max_tokens=MAX_TOKENS,
     )
+    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 synchronization.py
