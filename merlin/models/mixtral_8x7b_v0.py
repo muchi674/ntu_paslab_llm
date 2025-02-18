@@ -464,7 +464,7 @@ class MoeLayer(nn.Module):
         print("into infer...")
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
         print("out of infer...")
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
         
         return y
 
