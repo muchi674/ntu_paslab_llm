@@ -112,12 +112,9 @@ class Attention(nn.Module):
 
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
-        self.sqrt_head_dim = math.sqrt(self.head_dim)
+        self.sqrt_head_dim = self.head_dim**-0.5
         self.n_kv_heads: int = args.n_kv_heads
-
         self.repeats = self.n_heads // self.n_kv_heads
-
-        self.scale = self.args.head_dim**-0.5
 
         self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
@@ -147,10 +144,10 @@ class Attention(nn.Module):
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
-            keys, self.n_rep
+            keys, self.repeats
         )  # (bs, cache_len + seqlen, n_heads, head_dim)
         values = repeat_kv(
-            values, self.n_rep
+            values, self.repeats
         )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
@@ -265,6 +262,7 @@ class Transformer(nn.Module):
         ).type_as(h)
 
         for li in range(self.args.n_layers):
+            dist.barrier()
             h = self.layers[str(li)](h, start_pos, freqs_cis, cache[li], mask)
         return self.output(self.norm(h)).float()
 
@@ -288,9 +286,10 @@ class Mixtral8x7B:
             model = Transformer(args=model_args)
         model.load_state_dict(non_experts, assign=True, strict=True)
         model.freqs_cis = precompute_freqs_cis(
-            model_args.dim // model_args.n_heads,
-            model_args.max_seq_len * 2,
-            model_args.rope_theta,
+            dim=model_args.head_dim,
+            end=128_000,
+            theta=model_args.rope_theta,
+            device=device,
         )
         tokenizer = MistralTokenizer.v1()
 
@@ -324,6 +323,7 @@ class Mixtral8x7B:
                     self.model.args.n_kv_heads,
                     self.model.args.head_dim,
                 ),
+                dtype=torch.bfloat16,
                 device=device,
             )
             for _ in range(self.model.args.n_layers)
@@ -349,14 +349,14 @@ class Mixtral8x7B:
         model = self.model.eval()
         cache = self.get_cache(max_batch_size, max_seq_len, device)
 
-        pad_id = torch.max(torch.tensor(encoded_prompts)).item() + 1
+        pad_id = max(tkn for p in encoded_prompts for tkn in p) + 1
         tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(encoded_prompts):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
         prev_pos = 0
         eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
-        eos_reached = torch.tensor([False] * bsz, device="cpu")
+        eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
         # notice:
@@ -380,7 +380,7 @@ class Mixtral8x7B:
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
             tokens[:, cur_pos] = next_token
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (next_token == eos_id).cpu()
+            eos_reached |= (~input_text_mask[:, cur_pos]) & next_token == eos_id
 
             prev_pos = cur_pos
             if all(eos_reached):
@@ -471,4 +471,4 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         max_gen_len=MAX_GEN_LEN,
     )
-    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 synchronization.py
+    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
