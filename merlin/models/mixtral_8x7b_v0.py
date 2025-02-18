@@ -459,7 +459,7 @@ class MoeLayer(nn.Module):
         orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
         topk_idx, topk_weight = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(input.dtype)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
         inputs_flat = inputs.view(-1, inputs.shape[-1])
         print("into infer...")
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
