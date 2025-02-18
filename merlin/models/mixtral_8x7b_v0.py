@@ -457,13 +457,13 @@ class MoeLayer(nn.Module):
     
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         orig_shape = inputs.shape
-        gate_logits = self.gate(input)
+        gate_logits = self.gate(inputs)
         topk_idx, topk_weight = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(input.dtype)
         inputs_flat = inputs.view(-1, inputs.shape[-1])
-        
+        print("into infer...")
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        
+        print("out of infer...")
         dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
         
         return y
