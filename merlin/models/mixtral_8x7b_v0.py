@@ -439,6 +439,7 @@ class MoeLayer(nn.Module):
         selected_experts = selected_experts.to("cpu")
         return moe_infer_slow(selected_experts, inputs.device, weights)
     
+    @torch.no_grad()
     def moe_infer_slow(self, selected_experts, dev, weight):
         eis, bis, nes = [], [], []
         for ei in range(self.num_experts):
