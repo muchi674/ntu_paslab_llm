@@ -430,74 +430,74 @@ class MoeLayer(nn.Module):
     #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
     #     return results
     
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
-        
-        selected_experts = selected_experts.to("cpu")
-        return moe_infer_slow(selected_experts, inputs.device, weights)
-    
-    @torch.no_grad()
-    def moe_infer_slow(self, selected_experts, dev, weight):
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=dev))
-                nes.append(nth_expert.to(device=dev))
-
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-        return results
-    
     # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-    #     orig_shape = inputs.shape
-    #     gate_logits = self.gate(input)
-    #     topk_idx, topk_weight = torch.topk(gate_logits, self.num_experts_per_tok)
-    #     topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(input.dtype)
-    #     inputs_flat = inputs.view(-1, inputs.shape[-1])
+    #     gate_logits = self.gate(inputs)
+    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+    #     results = torch.zeros_like(inputs)
         
-    #     y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        
-    #     dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
-        
-    #     return y
-
+    #     selected_experts = selected_experts.to("cpu")
+    #     return moe_infer_slow(selected_experts, inputs.device, weights)
+    
     # @torch.no_grad()
-    # def moe_infer(self, x, topk_ids, topk_weight):
-    #     cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-    #     cnts.scatter_(1, topk_ids, 1)
-    #     tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
-    #     idxs = topk_ids.view(-1).argsort()
-    #     sorted_tokens = x[idxs // topk_ids.shape[1]]
-    #     outputs = []
-    #     start_idx = 0
-    #     for i, num_tokens in enumerate(tokens_per_expert):
-    #         if num_tokens == 0:
-    #             continue
-    #         end_idx = start_idx + num_tokens
-    #         expert = self.experts[i]
-    #         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-    #         expert_out = self.expert.forward(self.li, i, tokens_for_this_expert)
-    #         outputs.append(expert_out)
-    #         start_idx = end_idx
+    # def moe_infer_slow(self, selected_experts, dev, weight):
+    #     eis, bis, nes = [], [], []
+    #     for ei in range(self.num_experts):
+    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
+    #         if torch.numel(batch_idx) > 0:
+    #             eis.append(ei)
+    #             bis.append(batch_idx.to(device=dev))
+    #             nes.append(nth_expert.to(device=dev))
 
-    #     outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-    #     new_x = torch.empty_like(outs)
-    #     new_x[idxs] = outs
-    #     final_out = (
-    #         new_x.view(*topk_ids.shape, -1)
-    #         .type(topk_weight.dtype)
-    #         .mul_(topk_weight.unsqueeze(dim=-1))
-    #         .sum(dim=1)
-    #         .type(new_x.dtype)
-    #     )
-    #     return final_out
+    #     for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+    #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+    #     return results
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
+        gate_logits = self.gate(input)
+        topk_idx, topk_weight = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(input.dtype)
+        inputs_flat = inputs.view(-1, inputs.shape[-1])
+        
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
+        
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            expert = self.experts[i]
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = self.expert.forward(self.li, i, tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
 
 
 class RMSNorm(torch.nn.Module):
