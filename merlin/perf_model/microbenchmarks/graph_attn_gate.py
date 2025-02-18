@@ -1,20 +1,14 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 import json
+import math
 import os
 
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch
-
-from xformers.ops.fmha import memory_efficient_attention  # type: ignore
-from xformers.ops.fmha.attn_bias import (  # type: ignore
-    AttentionBias,
-    BlockDiagonalCausalMask,
-    BlockDiagonalCausalWithOffsetPaddedKeysMask,
-)
 
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
@@ -25,11 +19,17 @@ LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
+DEFAULT_SEED = 7
 
-def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
+
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float, device: torch.device
+) -> torch.Tensor:
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
+    )
+    t = torch.arange(end, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
 
@@ -40,23 +40,37 @@ def apply_rotary_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:, None, :]
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(2)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(2)
+    freqs_cis = freqs_cis[None, :, None, :]
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def repeat_kv(
-    keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    keys = torch.repeat_interleave(keys, repeats=repeats, dim=dim)
-    values = torch.repeat_interleave(values, repeats=repeats, dim=dim)
-    return keys, values
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
 
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
         return json.load(f)
+
+
+def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+    # assert 0 <= p <= 1
+
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    return torch.gather(probs_idx, -1, next_token)
 
 
 @dataclass
@@ -91,230 +105,6 @@ class ModelArgs:
         )
 
 
-@dataclass
-class SimpleInputMetadata:
-    # rope absolute positions
-    positions: torch.Tensor
-
-    @staticmethod
-    def from_seqlens(seqlens: List[int], device: torch.device) -> "SimpleInputMetadata":
-        return SimpleInputMetadata(
-            positions=torch.cat([torch.arange(0, seqlen) for seqlen in seqlens]).to(
-                device=device, dtype=torch.long
-            )
-        )
-
-
-@dataclass
-class CacheInputMetadata:
-    # rope absolute positions
-    positions: torch.Tensor
-    # where tokens should go in the cache
-    cache_positions: torch.Tensor
-
-    # if prefill, use block diagonal causal mask
-    # else use causal with padded key mask
-    prefill: bool
-    mask: AttentionBias
-    seqlens: List[int]
-
-
-def interleave_list(
-    l1: List[torch.Tensor], l2: List[torch.Tensor]
-) -> List[torch.Tensor]:
-    # assert len(l1) == len(l2)
-    return [v for pair in zip(l1, l2) for v in pair]
-
-
-class CacheView:
-    def __init__(
-        self,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        metadata: CacheInputMetadata,
-        kv_seqlens: torch.Tensor,
-    ):
-        self.cache_k = cache_k
-        self.cache_v = cache_v
-        self.kv_seqlens = kv_seqlens
-        self.metadata = metadata
-
-    def update(self, xk: torch.Tensor, xv: torch.Tensor) -> None:
-        """
-        to_cache_mask masks the last [max_seq_len] tokens in each sequence
-        """
-        n_kv_heads, head_dim = self.cache_k.shape[-2:]
-        flat_cache_k = self.cache_k.view(-1, n_kv_heads, head_dim)
-        flat_cache_v = self.cache_v.view(-1, n_kv_heads, head_dim)
-
-        flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk)
-        flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv)
-
-    def interleave_kv(
-        self, xk: torch.Tensor, xv: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        This is a naive implementation and not optimized for speed.
-        """
-        # assert xk.ndim == xv.ndim == 3  # (B * T, H, D)
-        # assert xk.shape == xv.shape
-
-        if all([s == 0 for s in self.metadata.seqlens]):
-            # No cache to interleave
-            return xk, xv
-
-        # Make it a list of [(T, H, D)]
-        xk: Tuple[torch.Tensor] = torch.split(xk, self.metadata.seqlens)  # type: ignore
-        xv: Tuple[torch.Tensor] = torch.split(xv, self.metadata.seqlens)  # type: ignore
-        # assert len(xk) == len(
-        #     self.kv_seqlens
-        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
-
-        # Retrieve cache
-        cache_k = [
-            cache_k[:seq_len] for cache_k, seq_len in zip(self.cache_k, self.kv_seqlens)
-        ]
-        cache_v = [
-            cache_v[:seq_len] for cache_v, seq_len in zip(self.cache_v, self.kv_seqlens)
-        ]
-
-        interleaved_k = interleave_list(cache_k, list(xk))
-        interleaved_v = interleave_list(cache_v, list(xv))
-
-        return torch.cat(interleaved_k, dim=0), torch.cat(interleaved_v, dim=0)
-
-    @property
-    def max_seq_len(self) -> int:
-        return self.cache_k.shape[1]
-
-    @property
-    def key(self) -> torch.Tensor:
-        return self.cache_k[: len(self.kv_seqlens)]
-
-    @property
-    def value(self) -> torch.Tensor:
-        return self.cache_v[: len(self.kv_seqlens)]
-
-    @property
-    def prefill(self) -> bool:
-        return self.metadata.prefill
-
-    @property
-    def mask(self) -> AttentionBias:
-        return self.metadata.mask
-
-
-class BufferCache:
-    """
-    This is an example that implements a buffer cache, allowing for variable length sequences.
-    Allocated cache is rectangular which is wasteful (see PagedAttention for better mechanisms)
-    """
-
-    def __init__(
-        self,
-        n_layers: int,
-        max_batch_size: int,
-        max_seq_len: int,
-        n_kv_heads: int,
-        head_dim: int,
-    ):
-        self.max_seq_len = max_seq_len
-        self.n_kv_heads = n_kv_heads
-        self.head_dim = head_dim
-
-        self.cache_k = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
-        )
-        self.cache_v = torch.empty(
-            (n_layers, max_batch_size, max_seq_len, n_kv_heads, head_dim)
-        )
-        # holds the valid length for each batch element in the cache
-        self.kv_seqlens: Optional[torch.Tensor] = None
-
-    def get_view(self, layer_id: int, metadata: CacheInputMetadata) -> CacheView:
-        # assert self.kv_seqlens is not None
-        return CacheView(
-            self.cache_k[layer_id], self.cache_v[layer_id], metadata, self.kv_seqlens
-        )
-
-    def reset(self) -> None:
-        self.kv_seqlens = None
-
-    def init_kvseqlens(self, batch_size: int) -> None:
-        self.kv_seqlens = torch.zeros(
-            (batch_size,), device=self.device, dtype=torch.long
-        )
-
-    @property
-    def device(self) -> torch.device:
-        return self.cache_k.device
-
-    def to(self, device: torch.device, dtype: torch.dtype) -> "BufferCache":
-        self.cache_k = self.cache_k.to(device=device, dtype=dtype)
-        self.cache_v = self.cache_v.to(device=device, dtype=dtype)
-
-        return self
-
-    def update_seqlens(self, seqlens: List[int]) -> None:
-        # assert self.kv_seqlens is not None
-        self.kv_seqlens += torch.tensor(seqlens, device=self.device, dtype=torch.long)
-
-    def get_input_metadata(self, seqlens: List[int]) -> CacheInputMetadata:
-        """
-        Get metadata about cache positions
-        """
-        if self.kv_seqlens is None:
-            self.init_kvseqlens(len(seqlens))
-
-        # assert isinstance(self.kv_seqlens, torch.Tensor)
-        # assert len(seqlens) == len(
-        #     self.kv_seqlens
-        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
-        seqpos = self.kv_seqlens.tolist()
-
-        # assert len(seqlens) > 0, seqlens
-        cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long)
-
-        positions = torch.cat(
-            [torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]
-        ).to(device=self.device, dtype=torch.long)
-        batch_idx = torch.tensor(
-            sum([[i] * seqlen for i, seqlen in enumerate(seqlens)], []),
-            device=self.device,
-            dtype=torch.long,
-        )
-        cache_positions = positions + batch_idx * self.max_seq_len
-
-        during_prefill = seqpos[0] == 0
-        if during_prefill:
-            # assert all([pos == 0 for pos in seqpos]), seqpos
-            mask = (
-                BlockDiagonalCausalMask.from_seqlens(
-                    seqlens, device=self.device
-                ).make_local_attention(self.max_seq_len)
-                # .to(self.device)
-            )
-        else:
-            mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-                q_seqlen=seqlens,
-                kv_padding=self.max_seq_len,
-                kv_seqlen=(
-                    self.kv_seqlens + cached_elements
-                )  # vectorized_elementwise_kernel
-                .clamp(max=self.max_seq_len)  # vectorized_elementwise_kernel
-                .tolist(),
-                device=self.device,
-            )  # .to(self.device)
-
-        return CacheInputMetadata(
-            positions=positions,
-            cache_positions=cache_positions,
-            prefill=during_prefill,
-            mask=mask,
-            seqlens=seqlens,
-        )
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -322,6 +112,7 @@ class Attention(nn.Module):
 
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
+        self.sqrt_head_dim = math.sqrt(self.head_dim)
         self.n_kv_heads: int = args.n_kv_heads
 
         self.repeats = self.n_heads // self.n_kv_heads
@@ -336,45 +127,41 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        start_pos: int,
         freqs_cis: torch.Tensor,
-        cache: Optional[CacheView],
-    ) -> torch.Tensor:
-        seqlen_sum, _ = x.shape
-
+        cache: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
-        xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
-        xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if cache is None:
-            key, val = xk, xv
-        elif cache.prefill:
-            key, val = cache.interleave_kv(xk, xv)
-            cache.update(xk, xv)
-        else:
-            cache.update(xk, xv)
-            key, val = cache.key, cache.value
-            key = key.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
-            val = val.view(
-                seqlen_sum * cache.max_seq_len, self.n_kv_heads, self.head_dim
-            )
+        cache[0, :bsz, start_pos : start_pos + seqlen] = xk
+        cache[1, :bsz, start_pos : start_pos + seqlen] = xv
+        keys = cache[0, :bsz, : start_pos + seqlen]
+        values = cache[1, :bsz, : start_pos + seqlen]
 
-        # Repeat keys and values to match number of query heads
-        key, val = repeat_kv(key, val, self.repeats, dim=1)
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
-        # xformers requires (B=1, S, H, D)
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(
-            xq, key, val, None if cache is None else cache.mask
-        )
-        output = output.view(seqlen_sum, self.n_heads * self.head_dim)
-
-        # assert isinstance(output, torch.Tensor)
-
-        return self.wo(output)  # type: ignore
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
+        scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
 
 
 class MoeLayer(nn.Module):
@@ -387,17 +174,17 @@ class MoeLayer(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
         weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        weights = F.softmax(weights, dim=-1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+        # selected_experts = selected_experts.to("cpu")
+        # eis, bis, nes = [], [], []
+        # for ei in range(self.num_experts):
+        #     batch_idx, nth_expert = torch.where(selected_experts == ei)
+        #     if torch.numel(batch_idx) > 0:
+        #         eis.append(ei)
+        #         bis.append(batch_idx.to(device=inputs.device))
+        #         nes.append(nth_expert.to(device=inputs.device))
 
         return results
 
@@ -428,11 +215,16 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        cache: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        r = self.attention(self.attention_norm(x), start_pos, freqs_cis, cache, mask)
         h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
+        r = self.feed_forward(self.ffn_norm(h))
         out = h + r
         return out
 
@@ -441,7 +233,7 @@ class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self._precomputed_freqs_cis: torch.Tensor = None
+        self.freqs_cis: torch.Tensor = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
@@ -457,52 +249,37 @@ class Transformer(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    @property
-    def freqs_cis(self) -> torch.Tensor:
-        # We cache freqs_cis but need to take care that it is on the right device
-        # and has the right dtype (complex64). The fact that the dtype is different
-        # from the module's dtype means we cannot register it as a buffer
-        if self._precomputed_freqs_cis is None:
-            # default to 10**6
-            theta = self.args.rope_theta or 1000000.0
-            self._precomputed_freqs_cis = precompute_freqs_cis(
-                self.args.head_dim, 128_000, theta
-            )
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache: list[torch.Tensor]):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        if self._precomputed_freqs_cis.device != self.device:
-            self._precomputed_freqs_cis = self._precomputed_freqs_cis.to(
-                device=self.device
-            )
-        return self._precomputed_freqs_cis
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        seqlens: List[int],
-        cache: BufferCache,
-    ) -> torch.Tensor:
-        (num_toks,) = input_ids.shape
-        # assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
-
-        input_metadata = cache.get_input_metadata(seqlens)
-        h = self.tok_embeddings(input_ids)
-        freqs_cis = self.freqs_cis[input_metadata.positions]
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+        mask = torch.triu(mask, diagonal=1)
+        # When performing key-value caching, we compute the attention scores
+        # only for the new sequence. Thus, the matrix of scores is of size
+        # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+        # j > cache_len + i, since row i corresponds to token cache_len + i.
+        mask = torch.hstack(
+            [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+        ).type_as(h)
 
         for li in range(self.args.n_layers):
-            dist.barrier()
-            cache_view = cache.get_view(li, input_metadata)
-            h = self.layers[str(li)](h, freqs_cis, cache_view)
+            h = self.layers[str(li)](h, start_pos, freqs_cis, cache[li], mask)
+        return self.output(self.norm(h)).float()
 
-        cache.update_seqlens(seqlens)
-        outs = self.output(self.norm(h))
-        return outs.float()
+
+class Mixtral8x7B:
 
     @staticmethod
-    def load(model_path: Path, gpu: torch.device) -> "Transformer":
+    def build(model_path: str, device: torch.device) -> "Mixtral8x7B":
+        torch.manual_seed(DEFAULT_SEED)
+
+        model_path = Path(model_path)
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
-            map_location=gpu,
+            map_location=device,
             weights_only=True,
             mmap=True,
         )
@@ -510,94 +287,124 @@ class Transformer(nn.Module):
         with torch.device("meta"):
             model = Transformer(args=model_args)
         model.load_state_dict(non_experts, assign=True, strict=True)
+        model.freqs_cis = precompute_freqs_cis(
+            model_args.dim // model_args.n_heads,
+            model_args.max_seq_len * 2,
+            model_args.rope_theta,
+        )
+        tokenizer = MistralTokenizer.v1()
 
-        return model
+        return Mixtral8x7B(model, tokenizer)
 
+    def __init__(
+        self,
+        model: Transformer,
+        tokenizer: MistralTokenizer,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
 
-@torch.inference_mode()
-def generate(
-    prompts: List[str],
-    tokenizer: MistralTokenizer,
-    model: Transformer,
-    *,
-    max_tokens: int,
-    max_batch_size: int = 64,
-    temperature: float = 0.0,
-    eos_id: Optional[int] = None,
-) -> Tuple[List[str], int, float, int, float]:
-    model = model.eval()
+    def encode_prompts(self, prompts: list[str]) -> list[list[int]]:
+        return [
+            self.tokenizer.encode_chat_completion(
+                ChatCompletionRequest(messages=[UserMessage(content=p)])
+            ).tokens
+            for p in prompts
+        ]
 
-    encoded_prompts: List[List[int]] = [
-        tokenizer.encode_chat_completion(
-            ChatCompletionRequest(messages=[UserMessage(content=p)])
-        ).tokens
-        for p in prompts
-    ]
-    B, V = len(encoded_prompts), model.args.vocab_size
-    seqlens = [len(x) for x in encoded_prompts]
+    def get_cache(
+        self, max_batch_size: int, max_seq_len: int, device: torch.device
+    ) -> list[torch.Tensor]:
+        return [
+            torch.empty(
+                (
+                    2,  # key and value
+                    max_batch_size,
+                    max_seq_len,
+                    self.model.args.n_kv_heads,
+                    self.model.args.head_dim,
+                ),
+                device=device,
+            )
+            for _ in range(self.model.args.n_layers)
+        ]
 
-    # Cache
-    cache_window = max(seqlens) + max_tokens
-    cache = BufferCache(
-        model.args.n_layers,
-        max_batch_size,
-        cache_window,
-        model.args.n_kv_heads,
-        model.args.head_dim,
-    )
-    cache.to(device=model.device, dtype=model.dtype)
-    cache.reset()
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompts: List[str],
+        *,
+        max_batch_size: int,
+        max_gen_len: int,
+        temperature: float,
+        device: torch.device,
+    ) -> Tuple[List[str], int, float, int, float]:
 
-    dist.barrier()
-    torch.cuda.nvtx.range_push("prefill")
+        encoded_prompts = self.encode_prompts(prompts)
+        min_p_len = min(len(p) for p in encoded_prompts)
+        max_p_len = max(len(p) for p in encoded_prompts)
+        max_seq_len = max_p_len + max_gen_len
+        bsz = len(encoded_prompts)
 
-    # prefill / prompt evaluation stage
-    prelogits = model.forward(
-        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
-        seqlens=seqlens,
-        cache=cache,
-    )
+        model = self.model.eval()
+        cache = self.get_cache(max_batch_size, max_seq_len, device)
 
-    dist.barrier()
-    torch.cuda.nvtx.range_pop()
+        pad_id = torch.max(torch.tensor(encoded_prompts)).item() + 1
+        tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
+        for k, t in enumerate(encoded_prompts):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
-    last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
-    last_token_prelogits = prelogits.index_select(0, last_positions)
+        prev_pos = 0
+        eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
+        eos_reached = torch.tensor([False] * bsz, device="cpu")
+        input_text_mask = tokens != pad_id
 
-    # decode
-    is_finished = torch.tensor([False for _ in range(B)])
+        # notice:
+        # 1. it seems that prompts with length < max will generate
+        # max_seq_len - len(prompt) tokens
+        # 2. when batch size > 1, only the first bsz * min_prompt_len tokens
+        # will be processed in parallel. Longer prompts' remaining tokens are
+        # evaluated one-by-one with the min prompt's token generation
+        for cur_pos in range(min_p_len, max_seq_len):
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, cache)
 
-    for _ in range(max_tokens):
-        next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
-        is_finished = is_finished | (next_token == eos_id).cpu()
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = sample_top_p(probs, 0.8)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
 
-        if is_finished.all():
-            break
+            next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            )
+            tokens[:, cur_pos] = next_token
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (next_token == eos_id).cpu()
 
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        # assert last_token_prelogits.shape == (B, V)
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
 
+        # this part is from here:
+        # https://github.com/meta-llama/llama3/blob/main/llama/generation.py
+        responses = []
+        n_p_tkns, n_gen_tkns = 0, 0
+        for bi, tkns in enumerate(tokens.tolist()):
+            # cut to max_gen_len
+            p_len = len(encoded_prompts[bi])
+            tkns: list = tkns[p_len : p_len + max_gen_len]
+            # cut to after eos tok if any
+            try:
+                eos_idx = tkns.index(eos_id)
+                tkns = tkns[:eos_idx]
+            except ValueError:
+                pass
+            responses.append(self.tokenizer.decode(tkns))
+            n_p_tkns += p_len
+            n_gen_tkns += len(tkns)
 
-def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-    if temperature > 0:
-        probs = torch.softmax(logits / temperature, dim=-1)
-        next_token = sample_top_p(probs, top_p)
-    else:
-        next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
-
-    return next_token.reshape(-1)
-
-
-def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    # assert 0 <= p <= 1
-
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    return torch.gather(probs_idx, -1, next_token)
+        return n_p_tkns, n_gen_tkns, responses
 
 
 def main(
@@ -606,7 +413,7 @@ def main(
     prompt_path: str,
     n_prompts: int = 1,
     batch_size: int = 1,
-    max_tokens: int = 128,
+    max_gen_len: int = 128,
 ):
     # assert prompt or (prompt_path and n_prompts and n_prompts > 0)
     # assert n_prompts % batch_size == 0
@@ -622,30 +429,27 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu)
+    model = Mixtral8x7B.build(model_path, gpu)
 
     # warmup
-    generate(
+    model.generate(
         ["hello, how are you?"],
-        tokenizer,
-        model,
-        max_tokens=128,
         max_batch_size=1,
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        max_gen_len=128,
+        temperature=0.0,
+        device=gpu,
     )
 
     torch.cuda.cudart().cudaProfilerStart()
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
-        generate(
+        model.generate(
             prompt_batch,
-            tokenizer,
-            model,
-            max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
-            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            max_gen_len=max_gen_len,
+            temperature=0.0,
+            device=gpu,
         )
 
     torch.cuda.cudart().cudaProfilerStop()
@@ -658,13 +462,13 @@ if __name__ == "__main__":
     PROMPT_PATH = "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json"
     N_PROMPTS = 4
     BATCH_SIZE = 1
-    MAX_TOKENS = 16
+    MAX_GEN_LEN = 16
     main(
         model_path=MODEL_PATH,
         prompt=None,
         prompt_path=PROMPT_PATH,
         n_prompts=N_PROMPTS,
         batch_size=BATCH_SIZE,
-        max_tokens=MAX_TOKENS,
+        max_gen_len=MAX_GEN_LEN,
     )
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 synchronization.py
