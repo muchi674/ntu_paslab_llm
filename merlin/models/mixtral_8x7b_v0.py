@@ -471,8 +471,6 @@ class MoeLayer(nn.Module):
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-        print(topk_ids)
-        exit()
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
         idxs = topk_ids.view(-1).argsort()
