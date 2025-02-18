@@ -481,7 +481,6 @@ class MoeLayer(nn.Module):
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens
-            expert = self.experts[i]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
             expert_out = self.expert.forward(self.li, i, tokens_for_this_expert)
             outputs.append(expert_out)
