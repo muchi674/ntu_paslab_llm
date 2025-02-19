@@ -752,7 +752,7 @@ def generate(
         # te = time.perf_counter()
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
-        records[f'{WORLD_RANK}_d'].append(end.elapsed_time(start))
+        records[f'{WORLD_RANK}_d'].append(start.elapsed_time(end))
 
     print(records)
     # print(torch.cuda.current_stream(model.device))
