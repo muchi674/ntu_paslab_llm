@@ -740,9 +740,9 @@ def generate(
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
-        # torch.cuda.synchronize()
-        # te = time.perf_counter()
         torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        te = time.perf_counter()
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
 
