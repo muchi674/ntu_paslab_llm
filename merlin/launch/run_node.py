@@ -132,9 +132,12 @@ def main():
             + "--capture-range=cudaProfilerApi "
             + "--capture-range-end=stop "
             # eric891224 for detailed profiling, ref: https://forums.developer.nvidia.com/t/nsight-system-profiling-two-cuda-python-i-e-pytorch-processes-using-the-same-gpu-simultaneously/286266
-            + "--cuda-graph-trace=node "
-            + "--gpu-metrics-devices=all "
-            + "--gpuctxsw=true "
+            # + "--cuda-graph-trace=node "
+            # + "--gpu-metrics-devices=all "
+            # + "--gpuctxsw=true "
+            + "--python-backtrace=cuda "
+            + "--cudabacktrace=all "
+
 
         )
         if args.profiling_output:
