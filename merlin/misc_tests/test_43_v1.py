@@ -747,6 +747,7 @@ def generate(
         # records[f'{WORLD_RANK}_d'].append(te - ts)
 
     # print(records)
+    print(torch.cuda.current_device)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
