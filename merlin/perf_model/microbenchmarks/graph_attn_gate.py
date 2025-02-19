@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 import json
-import math
 import os
 
 from torch import nn
@@ -125,10 +124,10 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
         freqs_cis: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
+        storage_idx: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -136,11 +135,11 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[storage_idx])
 
         # assumes bsz matches that of cache
-        cache[0, self.li, :, start_pos : start_pos + seqlen] = xk
-        cache[1, self.li, :, start_pos : start_pos + seqlen] = xv
+        cache[0, self.li].index_copy(dim=-3, index=storage_idx, source=xk)
+        cache[1, self.li].index_copy(dim=-3, index=storage_idx, source=xv)
         keys = cache[0, self.li]
         values = cache[1, self.li]
 
@@ -151,9 +150,12 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
         values = values.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
+
+        # (bs, n_heads, seqlen, max_seq_len)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
-        scores = scores + mask  # (bs, n_heads, seqlen, max_seq_len)
+        scores = scores + mask[storage_idx]  # TODO: might need fixing
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
         output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
@@ -212,12 +214,12 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
         freqs_cis: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
+        storage_idx: torch.Tensor,
     ) -> torch.Tensor:
-        r = self.attention(self.attention_norm(x), start_pos, freqs_cis, cache, mask)
+        r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
         h = x + r
         r = self.feed_forward(self.ffn_norm(h))
         out = h + r
@@ -227,7 +229,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
+        self.args: ModelArgs = args
         self.freqs_cis: torch.Tensor = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -235,6 +237,8 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleDict(
             {str(li): TransformerBlock(args, li) for li in range(args.n_layers)}
         )
+        self.prefill_graphed_callables: list = []
+        self.decode_graphed_callables: list = []
 
     @property
     def dtype(self) -> torch.dtype:
@@ -244,23 +248,59 @@ class Transformer(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def draw_graphs(self, batch_size: int, prefill_len: int, max_seq_len: int):
-        pass
+    def draw_graphs(
+        self,
+        batch_size: int,
+        prefill_len: int,
+        cache: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        prefill_x = torch.ones(
+            (batch_size, prefill_len, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        decode_x = torch.ones(
+            (batch_size, 1, self.args.dim), dtype=self.dtype, device=self.device
+        )
+        prefill_storage_x = torch.arange(
+            0, prefill_len, dtype=torch.long, device=self.device
+        )
+        decode_storage_x = torch.arange(
+            prefill_len, prefill_len + 1, dtype=torch.long, device=self.device
+        )
+        prefill_graphed_callables, decode_graphed_callables = [], []
+        for li in range(self.args.n_layers):
+            prefill_graphed_callables.append(
+                torch.cuda.make_graphed_callables(
+                    self.layers[str(li)].forward,
+                    (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
+                    num_warmup_iters=128,
+                )
+            )
+            decode_graphed_callables.append(
+                torch.cuda.make_graphed_callables(
+                    self.layers[str(li)].forward,
+                    (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
+                    num_warmup_iters=128,
+                )
+            )
+        self.prefill_graphed_callables = prefill_graphed_callables
+        self.decode_graphed_callables = decode_graphed_callables
 
     def forward(
         self,
         tokens: torch.Tensor,
-        start_pos: int,
         cache: torch.Tensor,
         mask: torch.Tensor,
+        storage_idx: torch.Tensor,
     ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         for li in range(self.args.n_layers):
             dist.barrier()
-            h = self.layers[str(li)](h, start_pos, freqs_cis, cache, mask)
+            h = self.layers[str(li)](h, self.freqs_cis, cache, mask, storage_idx)
         return self.output(self.norm(h)).float()
 
 
@@ -369,8 +409,11 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
+            storage_idx = torch.arange(
+                prev_pos, cur_pos, dtype=torch.long, device=device
+            )
             logits = model.forward(
-                tokens[:, prev_pos:cur_pos], prev_pos, cache, mask[prev_pos:cur_pos]
+                tokens[:, prev_pos:cur_pos], cache, mask, storage_idx
             )
 
             if temperature > 0:
