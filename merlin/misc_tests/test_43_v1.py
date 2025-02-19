@@ -378,8 +378,8 @@ class Attention(nn.Module):
             # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
         # self.comp_start.record()
-        # torch.cuda.synchronize()
-        # ts = time.perf_counter()
+        torch.cuda.synchronize()
+        ts = time.perf_counter()
 
         seqlen_sum, _ = x.shape
 
@@ -423,9 +423,9 @@ class Attention(nn.Module):
         output = self.wo(output)
     
         # self.comp_end.record()
-        # torch.cuda.synchronize()
-        # te = time.perf_counter()
-        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
+        torch.cuda.synchronize()
+        te = time.perf_counter()
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
         return output
 
 
@@ -717,7 +717,7 @@ def generate(
 
     torch.cuda.nvtx.range_push("decode")
 
-    records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+    # records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
     # decode
     generated_tensors = []
@@ -733,20 +733,20 @@ def generate(
 
         generated_tensors.append(next_token[:, None])
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         torch.cuda.nvtx.range_push("1 token")
-        ts = time.perf_counter()
+        # ts = time.perf_counter()
 
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
-        torch.cuda.synchronize()
-        te = time.perf_counter()
+        # torch.cuda.synchronize()
+        # te = time.perf_counter()
         torch.cuda.nvtx.range_pop()
 
-        records[f'{WORLD_RANK}_d'].append(te - ts)
+        # records[f'{WORLD_RANK}_d'].append(te - ts)
 
-    print(records)
+    # print(records)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0

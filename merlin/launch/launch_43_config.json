@@ -19,7 +19,7 @@
             "model_path": "~/llm_team/merlin_mixtral_weights/v1-3-5",
             "node_id": 0,
             "profile": true,
-            "profiling_output": "n43-v1.35-single-layer-nsys-timer"
+            "profiling_output": "n43-v1.35-single-layer-nsys-atttimer"
         }
     }
 }
