@@ -136,8 +136,6 @@ def main():
             # + "--gpu-metrics-devices=all "
             # + "--gpuctxsw=true "
 
-            + "--trace=osrt "
-
             # + "--python-backtrace=cuda "
             # + "--cudabacktrace=all "
 
