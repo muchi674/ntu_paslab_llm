@@ -4,7 +4,7 @@
     "master_port": "9091",
     "username": "kai",
     "shared_exec_args": {
-        "prompt_path": "/home/kai/ntu_paslab_llm/mixtral/prompts/long.json",
+        "prompt_path": "/home/kai/ntu_paslab_llm/mixtral/prompts/short.json",
         "n_prompts": 16,
         "batch_size": 4,
         "max_tokens": 128,
