@@ -721,8 +721,8 @@ def generate(
     torch.cuda.nvtx.range_push("decode")
 
     records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-    # start = torch.Event(device=model.device, enable_timing=True)
-    # end = torch.Event(device=model.device, enable_timing=True)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
 
     # decode
     generated_tensors = []
@@ -740,22 +740,22 @@ def generate(
 
         # torch.cuda.synchronize()
         torch.cuda.nvtx.range_push("1 token")
-        # start.record()
+        start.record(torch.cuda.current_stream(model.device))
         # ts = time.perf_counter()
 
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
         torch.cuda.nvtx.range_pop()
-        # end.record()
+        end.record(torch.cuda.current_stream(model.device))
         # torch.cuda.synchronize(model.device)
         # te = time.perf_counter()
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
-        # records[f'{WORLD_RANK}_d'].append(start.elapsed_time(end))
+        records[f'{WORLD_RANK}_d'].append(end.elapsed_time(start))
 
-    # print(records)
-    print(torch.cuda.current_stream(model.device))
+    print(records)
+    # print(torch.cuda.current_stream(model.device))
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
