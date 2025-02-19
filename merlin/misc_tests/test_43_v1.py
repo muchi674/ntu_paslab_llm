@@ -378,7 +378,7 @@ class Attention(nn.Module):
             # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
         # self.comp_start.record()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(x.device)
         ts = time.perf_counter()
 
         seqlen_sum, _ = x.shape
@@ -423,7 +423,7 @@ class Attention(nn.Module):
         output = self.wo(output)
     
         # self.comp_end.record()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(x.device)
         te = time.perf_counter()
         self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
         return output
@@ -741,7 +741,7 @@ def generate(
         assert last_token_prelogits.shape == (B, V)
 
         torch.cuda.nvtx.range_pop()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(model.device)
         te = time.perf_counter()
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
