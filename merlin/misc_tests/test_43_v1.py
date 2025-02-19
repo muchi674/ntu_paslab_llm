@@ -755,7 +755,7 @@ def generate(
         # records[f'{WORLD_RANK}_d'].append(start.elapsed_time(end))
 
     # print(records)
-    print(torch.cuda.current_stream())
+    print(torch.cuda.current_stream(model.device))
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
