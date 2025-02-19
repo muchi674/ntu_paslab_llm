@@ -437,7 +437,7 @@ class MoeLayer(nn.Module):
         results = torch.zeros_like(inputs)
         
         selected_experts = selected_experts.to("cpu")
-        with nvtx.annotate("moe_infer", color="purple")
+        with nvtx.annotate("moe_infer", color="purple"):
             y = moe_infer_slow(selected_experts, inputs.device, weights)
         return y
         
