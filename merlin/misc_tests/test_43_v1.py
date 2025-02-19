@@ -724,11 +724,6 @@ def generate(
     is_finished = torch.tensor([False for _ in range(B)])
 
     for _ in range(max_tokens):
-
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_push("1 token")
-        ts = time.perf_counter()
-
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
         is_finished = is_finished | (next_token == eos_id).cpu()
 
@@ -737,6 +732,11 @@ def generate(
             break
 
         generated_tensors.append(next_token[:, None])
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("1 token")
+        ts = time.perf_counter()
+
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
