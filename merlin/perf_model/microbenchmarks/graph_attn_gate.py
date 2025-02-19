@@ -106,9 +106,10 @@ class ModelArgs:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, li: int):
         super().__init__()
         self.args = args
+        self.li = li
 
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
@@ -137,24 +138,21 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        cache[0, :bsz, start_pos : start_pos + seqlen] = xk
-        cache[1, :bsz, start_pos : start_pos + seqlen] = xv
-        keys = cache[0, :bsz, : start_pos + seqlen]
-        values = cache[1, :bsz, : start_pos + seqlen]
+        # assumes bsz matches that of cache
+        cache[0, self.li, :, start_pos : start_pos + seqlen] = xk
+        cache[1, self.li, :, start_pos : start_pos + seqlen] = xv
+        keys = cache[0, self.li]
+        values = cache[1, self.li]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.repeats
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
-        values = repeat_kv(
-            values, self.repeats
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
+        keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
-        scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
+        scores = scores + mask  # (bs, n_heads, seqlen, max_seq_len)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -201,9 +199,9 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, li: int):
         super().__init__()
-        self.attention = Attention(args)
+        self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
@@ -235,7 +233,7 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
-            {str(li): TransformerBlock(args=args) for li in range(args.n_layers)}
+            {str(li): TransformerBlock(args, li) for li in range(args.n_layers)}
         )
 
     @property
@@ -246,24 +244,23 @@ class Transformer(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def forward(self, tokens: torch.Tensor, start_pos: int, cache: list[torch.Tensor]):
+    def draw_graphs(self, batch_size: int, prefill_len: int, max_seq_len: int):
+        pass
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+        cache: torch.Tensor,
+        mask: torch.Tensor,
+    ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-        mask = torch.triu(mask, diagonal=1)
-        # When performing key-value caching, we compute the attention scores
-        # only for the new sequence. Thus, the matrix of scores is of size
-        # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-        # j > cache_len + i, since row i corresponds to token cache_len + i.
-        mask = torch.hstack(
-            [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-        ).type_as(h)
-
         for li in range(self.args.n_layers):
             dist.barrier()
-            h = self.layers[str(li)](h, start_pos, freqs_cis, cache[li], mask)
+            h = self.layers[str(li)](h, start_pos, freqs_cis, cache, mask)
         return self.output(self.norm(h)).float()
 
 
@@ -314,20 +311,25 @@ class Mixtral8x7B:
     def get_cache(
         self, max_batch_size: int, max_seq_len: int, device: torch.device
     ) -> list[torch.Tensor]:
-        return [
-            torch.empty(
-                (
-                    2,  # key and value
-                    max_batch_size,
-                    max_seq_len,
-                    self.model.args.n_kv_heads,
-                    self.model.args.head_dim,
-                ),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            for _ in range(self.model.args.n_layers)
-        ]
+        return torch.empty(
+            (
+                2,  # key and value
+                self.model.args.n_layers,
+                max_batch_size,
+                max_seq_len,
+                self.model.args.n_kv_heads,
+                self.model.args.head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+    def get_mask(self, max_seq_len: int, dtype: torch.dtype, device: torch.device):
+        mask = torch.full(
+            (max_seq_len, max_seq_len), float("-inf"), dtype=dtype, device=device
+        )
+        mask = torch.triu(mask, diagonal=1)
+        return mask
 
     @torch.inference_mode()
     def generate(
@@ -348,6 +350,7 @@ class Mixtral8x7B:
 
         model = self.model.eval()
         cache = self.get_cache(max_batch_size, max_seq_len, device)
+        mask = self.get_mask(max_seq_len, model.dtype, device)
 
         pad_id = max(tkn for p in encoded_prompts for tkn in p) + 1
         tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
@@ -366,7 +369,9 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, cache)
+            logits = model.forward(
+                tokens[:, prev_pos:cur_pos], prev_pos, cache, mask[prev_pos:cur_pos]
+            )
 
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
