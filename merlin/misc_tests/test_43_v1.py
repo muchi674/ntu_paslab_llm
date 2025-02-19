@@ -38,6 +38,15 @@ LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
+def profile_range(range_name=""):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            torch.cuda.nvtx.range_push(range_name)
+            result = func(*args, **kwargs)
+            torch.cuda.nvtx.range_pop()
+            return result
+        return wrapper
+    return decorator
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -713,15 +722,21 @@ def generate(
     is_finished = torch.tensor([False for _ in range(B)])
 
     for _ in range(max_tokens):
+
+        torch.cuda.nvtx.range_push("1 token")
+
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
         is_finished = is_finished | (next_token == eos_id).cpu()
 
         if is_finished.all():
+            torch.cuda.nvtx.range_pop()
             break
 
         generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
+        
+        torch.cuda.nvtx.range_pop()
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
