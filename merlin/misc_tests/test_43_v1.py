@@ -740,15 +740,15 @@ def generate(
 
         # torch.cuda.synchronize()
         torch.cuda.nvtx.range_push("1 token")
-        start.record()
+        start.record(torch.cuda.current_stream(model.device))
         # ts = time.perf_counter()
 
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
         torch.cuda.nvtx.range_pop()
-        end.record()
-        # torch.cuda.synchronize(model.device)
+        end.record(torch.cuda.current_stream(model.device))
+        torch.cuda.synchronize(model.device)
         # te = time.perf_counter()
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
