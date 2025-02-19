@@ -135,8 +135,11 @@ def main():
             # + "--cuda-graph-trace=node "
             # + "--gpu-metrics-devices=all "
             # + "--gpuctxsw=true "
-            + "--python-backtrace=cuda "
-            + "--cudabacktrace=all "
+
+            # + "--python-backtrace=cuda "
+            # + "--cudabacktrace=all "
+            + "--python-sampling=true "
+            
 
 
         )
