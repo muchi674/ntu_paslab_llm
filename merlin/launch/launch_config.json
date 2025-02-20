@@ -2,12 +2,12 @@
     "world_size": 2,
     "master_addr": "10.10.10.1",
     "master_port": "9091",
-    "username": "kai",
+    "username": "muchichen",
     "shared_exec_args": {
-        "prompt_path": "/home/kai/ntu_paslab_llm/mixtral/prompts/short.json",
-        "n_prompts": 16,
-        "batch_size": 4,
-        "max_tokens": 128,
+        "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
+        "n_prompts": 8,
+        "batch_size": 1,
+        "max_tokens": 1,
         "hide_resp": true
     },
     "nodes": {
@@ -19,7 +19,7 @@
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v0",
             "node_id": 0,
             "profile": true,
-            "profiling_output": "v0_orig_moe_infer_test"
+            "profiling_output": "n51-v0-bs1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
