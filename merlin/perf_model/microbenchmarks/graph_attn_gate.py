@@ -270,21 +270,22 @@ class Transformer(nn.Module):
             prefill_len, prefill_len + 1, dtype=torch.long, device=self.device
         )
         prefill_graphed_callables, decode_graphed_callables = [], []
-        for li in range(self.args.n_layers):
-            prefill_graphed_callables.append(
-                torch.cuda.make_graphed_callables(
-                    self.layers[str(li)].forward,
-                    (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
-                    num_warmup_iters=128,
+        with torch.cuda.device(device=self.device):
+            for li in range(self.args.n_layers):
+                prefill_graphed_callables.append(
+                    torch.cuda.make_graphed_callables(
+                        self.layers[str(li)].forward,
+                        (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
+                        num_warmup_iters=128,
+                    )
                 )
-            )
-            decode_graphed_callables.append(
-                torch.cuda.make_graphed_callables(
-                    self.layers[str(li)].forward,
-                    (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
-                    num_warmup_iters=128,
+                decode_graphed_callables.append(
+                    torch.cuda.make_graphed_callables(
+                        self.layers[str(li)].forward,
+                        (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
+                        num_warmup_iters=128,
+                    )
                 )
-            )
         self.prefill_graphed_callables = prefill_graphed_callables
         self.decode_graphed_callables = decode_graphed_callables
 
@@ -300,7 +301,11 @@ class Transformer(nn.Module):
 
         for li in range(self.args.n_layers):
             dist.barrier()
-            h = self.layers[str(li)](h, self.freqs_cis, cache, mask, storage_idx)
+            if seqlen > 1:
+                layer = self.prefill_graphed_callables[li]
+            else:
+                layer = self.decode_graphed_callables[li]
+            h = layer(h, self.freqs_cis, cache, mask, storage_idx)
         return self.output(self.norm(h)).float()
 
 
@@ -337,8 +342,8 @@ class Mixtral8x7B:
         model: Transformer,
         tokenizer: MistralTokenizer,
     ):
-        self.model = model
-        self.tokenizer = tokenizer
+        self.model: Transformer = model
+        self.tokenizer: MistralTokenizer = tokenizer
 
     def encode_prompts(self, prompts: list[str]) -> list[list[int]]:
         return [
@@ -380,6 +385,7 @@ class Mixtral8x7B:
         max_gen_len: int,
         temperature: float,
         device: torch.device,
+        profile: bool = False,
     ) -> Tuple[List[str], int, float, int, float]:
 
         encoded_prompts = self.encode_prompts(prompts)
@@ -391,6 +397,10 @@ class Mixtral8x7B:
         model = self.model.eval()
         cache = self.get_cache(max_batch_size, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
+        model.draw_graphs(max_batch_size, min_p_len, cache, mask)
+
+        if profile:
+            torch.cuda.cudart().cudaProfilerStart()
 
         pad_id = max(tkn for p in encoded_prompts for tkn in p) + 1
         tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
@@ -452,6 +462,9 @@ class Mixtral8x7B:
             n_p_tkns += p_len
             n_gen_tkns += len(tkns)
 
+        if profile:
+            torch.cuda.cudart().cudaProfilerStop()
+
         return n_p_tkns, n_gen_tkns, responses
 
 
@@ -488,7 +501,6 @@ def main(
         device=gpu,
     )
 
-    torch.cuda.cudart().cudaProfilerStart()
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
@@ -498,9 +510,9 @@ def main(
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
+            profile=True
         )
 
-    torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
     dist.destroy_process_group()
 
