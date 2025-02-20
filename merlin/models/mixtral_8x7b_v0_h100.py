@@ -1,7 +1,3 @@
-#!/home/joe/miniconda3/envs/mixtral/bin/python
-
-# [POC]: tensor + expert parallel MoE
-# [known issues]: OOM with large batch sizes (64, 128)
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -11,7 +7,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Optional
 from typing import List, Optional, Tuple
 
 import torch
@@ -393,9 +388,7 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
 
-    def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
@@ -403,7 +396,9 @@ class Experts:
 
 
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+    def __init__(
+        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts
+    ):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
@@ -428,10 +423,7 @@ class MoeLayer(nn.Module):
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
-                continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
         dist.all_reduce(results, op=dist.ReduceOp.SUM)
         return results
 
@@ -460,7 +452,7 @@ class TransformerBlock(nn.Module):
             args=args,
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
-            experts=experts,
+            experts=experts
         )
 
     def forward(
@@ -483,7 +475,9 @@ class Transformer(nn.Module):
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(args=args, li=li, experts=experts)
+                str(li): TransformerBlock(
+                    args=args, li=li, experts=experts
+                )
                 for li in range(args.n_layers)
             }
         )
@@ -536,7 +530,7 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -545,7 +539,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
+            model_path / f"experts-{WORLD_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
@@ -667,7 +661,6 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
 def main(
     model_path: str,
-    node_id: int,
     prompt: str,
     prompt_path: str,
     n_prompts: int = 1,
@@ -690,14 +683,14 @@ def main(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), node_id, gpu)
+    model = Transformer.load(Path(model_path), gpu)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        max_tokens=16,
+        max_tokens=128,
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
@@ -770,7 +763,6 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
-    parser.add_argument("--node-id", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -779,10 +771,8 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
-    torch.manual_seed(0)
     main(
         args.model_path,
-        args.node_id,  # for loading weights partition with more granular control
         args.prompt,
         args.prompt_path,
         args.n_prompts,

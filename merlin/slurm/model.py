@@ -22,17 +22,19 @@ from xformers.ops.fmha.attn_bias import (  # type: ignore
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
 
-# Environment variables set by slurm and torchrun
-NODE_ID = int(os.environ["SLURM_PROCID"])
+# Environment variables set by torch.distributed.launch
+SLURM_PROCID = int(os.environ["SLURM_PROCID"])
+GROUP_RANK = int(os.environ["GROUP_RANK"])
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
 
 def main():
-    print(f"NODE_ID: {NODE_ID}\n"
-          f"LOCAL_RANK: {LOCAL_RANK}\n"
-          f"WORLD_SIZE: {WORLD_SIZE}\n"
+    print(f"SLURM_PROCID: {SLURM_PROCID}; "
+          f"GROUP_RANK: {GROUP_RANK}; "
+          f"LOCAL_RANK: {LOCAL_RANK}; "
+          f"WORLD_SIZE: {WORLD_SIZE}; "
           f"WORLD_RANK: {WORLD_RANK}\n", flush=True)
     gpu = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
