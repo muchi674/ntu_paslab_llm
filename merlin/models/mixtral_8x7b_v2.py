@@ -429,32 +429,19 @@ class MoeLayer(nn.Module):
 
         selected_experts = selected_experts.to("cpu")
         eis, bis, nes = [], [], []
-        # for ei in range(self.num_experts):
-        #     batch_idx, nth_expert = torch.where(selected_experts == ei)
-        #     if torch.numel(batch_idx) > 0:
-        #         eis.append(ei)
-        #         bis.append(batch_idx.to(device=inputs.device))
-        #         nes.append(nth_expert.to(device=inputs.device))
-
         for ei in range(self.num_experts):
             batch_idx, nth_expert = torch.where(selected_experts == ei)
             if torch.numel(batch_idx) > 0:
                 eis.append(ei)
-                bis.append(batch_idx)
-                nes.append(nth_expert)
-        concat_bis = torch.cat(bis, dim=0).to(device=inputs.device)
-        bis = torch.split(concat_bis, [len(t) for t in bis])
-
-        concat_nes = torch.cat(bis, dim=0).to(device=inputs.device)
-        nes = torch.split(concat_nes, [len(t) for t in nes])
-        # bis = bis.to(device=device)
-        # nes = nes.to(device=device)
-
+                bis.append(batch_idx.to(device=inputs.device))
+                nes.append(nth_expert.to(device=inputs.device))
+                
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+            
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 
