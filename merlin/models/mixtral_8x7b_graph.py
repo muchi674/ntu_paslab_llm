@@ -153,7 +153,7 @@ class Attention(nn.Module):
 
         # (bs, n_heads, seqlen, max_seq_len)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
-        scores = scores + mask[storage_idx]  # TODO: might need fixing
+        scores = scores + mask[storage_idx]
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
         output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
@@ -510,7 +510,7 @@ def main(
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
-            profile=True
+            profile=True,
         )
 
     dist.barrier()
