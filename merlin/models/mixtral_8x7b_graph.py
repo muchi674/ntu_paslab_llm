@@ -161,29 +161,65 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
+class Experts:
+
+    def __init__(self, ws: dict):
+        self.ws: dict[str, torch.Tensor] = ws
+
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
+        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+
+
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, gate: nn.Module):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
+        self.li = li
         self.gate = gate
+        self.experts = experts
+
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=-1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
+        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
 
-        # selected_experts = selected_experts.to("cpu")
-        # eis, bis, nes = [], [], []
-        # for ei in range(self.num_experts):
-        #     batch_idx, nth_expert = torch.where(selected_experts == ei)
-        #     if torch.numel(batch_idx) > 0:
-        #         eis.append(ei)
-        #         bis.append(batch_idx.to(device=inputs.device))
-        #         nes.append(nth_expert.to(device=inputs.device))
-
-        return results
+        return y
 
 
 class RMSNorm(torch.nn.Module):
@@ -201,14 +237,16 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
         self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
             args=args,
+            li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
+            experts=experts,
         )
 
     def forward(
