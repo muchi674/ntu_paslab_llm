@@ -593,7 +593,7 @@ def main(
             temperature=0.0,
             device=gpu,
             draw_new_graph=True,
-            profile=True,
+            profile=end == n_prompts,
         )
 
         if WORLD_RANK == 0:

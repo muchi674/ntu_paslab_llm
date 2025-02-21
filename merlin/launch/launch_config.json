@@ -5,9 +5,9 @@
     "username": "muchichen",
     "shared_exec_args": {
         "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 32,
-        "batch_size": 2,
-        "max_tokens": 128,
+        "n_prompts": 4,
+        "batch_size": 1,
+        "max_tokens": 16,
         "hide_resp": false
     },
     "nodes": {
@@ -18,8 +18,8 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v0",
             "node_id": 0,
-            "profile": false,
-            "profiling_output": "n51-v2-bs1"
+            "profile": true,
+            "profiling_output": "n51-graphed-bs1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
