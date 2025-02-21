@@ -6,7 +6,7 @@
     "shared_exec_args": {
         "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
         "n_prompts": 32,
-        "batch_size": 2,
+        "batch_size": 1,
         "max_tokens": 128,
         "hide_resp": false
     },

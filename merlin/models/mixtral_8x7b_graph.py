@@ -578,9 +578,10 @@ def main(
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
+        bsz = len(prompt_batch)
         responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
             prompt_batch,
-            max_batch_size=len(prompt_batch),
+            max_batch_size=bsz,
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
@@ -591,8 +592,9 @@ def main(
         if WORLD_RANK == 0:
             prefill_tp = n_p_tkns / prefill_time
             decode_tp = n_gen_tkns / decode_time
-            prefill_tps.append(prefill_tp)
-            decode_tps.append(decode_tp)
+            if n_gen_tkns / bsz > max_gen_len * 0.9:
+                prefill_tps.append(prefill_tp)
+                decode_tps.append(decode_tp)
 
             print("=" * 20)
             print("PERFORMANCE BREAKDOWN\n")
@@ -610,7 +612,7 @@ def main(
             if not hide_resp:
                 print("=" * 20)
                 print("INS-N-OUTS")
-                print(f"AVG seqlen: {(n_p_tkns / len(prompt_batch)):2f}")
+                print(f"AVG seqlen: {(n_p_tkns / bsz):2f}")
                 for p, resp in zip(prompt_batch, responses):
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
