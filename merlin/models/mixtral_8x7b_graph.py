@@ -184,7 +184,7 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-    def gate(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def router(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -262,7 +262,7 @@ class TransformerBlock(nn.Module):
         r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
         h = x + r  # (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_idx, topk_weight = self.feed_forward.gate(r)
+        topk_idx, topk_weight = self.feed_forward.router(r)
         return h, r, topk_idx, topk_weight
 
     def forward(
