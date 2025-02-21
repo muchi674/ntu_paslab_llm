@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-import argparse
 import json
 import os
 import time
@@ -163,26 +162,26 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
-class Experts:
+# class Experts:
 
-    def __init__(self, ws: dict):
-        self.ws: dict[str, torch.Tensor] = ws
+#     def __init__(self, ws: dict):
+#         self.ws: dict[str, torch.Tensor] = ws
 
-    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+#     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+#         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+#         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+#         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
+#         return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
 
 
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
-        self.experts = experts
+        # self.experts = experts
 
     def router(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
@@ -191,35 +190,35 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         return topk_idx, topk_weight
 
-    def experts_infer(self, x, topk_ids, topk_weight):
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
-        idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-        outputs = []
-        start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-            end_idx = start_idx + num_tokens
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
-            outputs.append(expert_out)
-            start_idx = end_idx
+    # def experts_infer(self, x, topk_ids, topk_weight):
+    #     # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
+    #     cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+    #     cnts.scatter_(1, topk_ids, 1)
+    #     tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+    #     idxs = topk_ids.view(-1).argsort()
+    #     sorted_tokens = x[idxs // topk_ids.shape[1]]
+    #     outputs = []
+    #     start_idx = 0
+    #     for i, num_tokens in enumerate(tokens_per_expert):
+    #         if num_tokens == 0:
+    #             continue
+    #         end_idx = start_idx + num_tokens
+    #         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+    #         expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
+    #         outputs.append(expert_out)
+    #         start_idx = end_idx
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        final_out = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weight.dtype)
-            .mul_(topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
-        )
-        return final_out
+    #     outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+    #     new_x = torch.empty_like(outs)
+    #     new_x[idxs] = outs
+    #     final_out = (
+    #         new_x.view(*topk_ids.shape, -1)
+    #         .type(topk_weight.dtype)
+    #         .mul_(topk_weight.unsqueeze(dim=-1))
+    #         .sum(dim=1)
+    #         .type(new_x.dtype)
+    #     )
+    #     return final_out
 
 
 class RMSNorm(torch.nn.Module):
@@ -237,7 +236,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int):
         super().__init__()
         self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -246,7 +245,6 @@ class TransformerBlock(nn.Module):
             args=args,
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
-            experts=experts,
         )
         self.prefill_graphed_half = None
         self.decode_graphed_half = None
@@ -260,10 +258,11 @@ class TransformerBlock(nn.Module):
         storage_idx: torch.Tensor,
     ):
         r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
-        h = x + r  # (batch_size, seq_len, model_dim)
-        r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_idx, topk_weight = self.feed_forward.router(r)
-        return h, r, topk_idx, topk_weight
+        return r
+        # h = x + r  # (batch_size, seq_len, model_dim)
+        # r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
+        # topk_idx, topk_weight = self.feed_forward.router(r)
+        # return h, r, topk_idx, topk_weight
 
     def forward(
         self,
@@ -273,21 +272,25 @@ class TransformerBlock(nn.Module):
         mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ) -> torch.Tensor:
-        graphed_half = (
-            self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
-        )
-        # h.shape = (batch_size, seq_len, model_dim)
-        # r.shape = (batch_size * seq_len, model_dim)
-        h, r, topk_idx, topk_weight = graphed_half(
-            x, freqs_cis, cache, mask, storage_idx
-        )
-        r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
-        dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return h + r
+        # graphed_half = (
+        #     self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
+        # )
+        # print(graphed_half(x, freqs_cis, cache, mask, storage_idx))
+        print(x.view(-1, x.shape[-1]))
+        r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
+        print(r.view(-1, r.shape[-1]))
+        # # h.shape = (batch_size, seq_len, model_dim)
+        # # r.shape = (batch_size * seq_len, model_dim)
+        # h, r, topk_idx, topk_weight = graphed_half(
+        #     x, freqs_cis, cache, mask, storage_idx
+        # )
+        # r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
+        # dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        # return h + r
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.args: ModelArgs = args
         self.freqs_cis: torch.Tensor = None
@@ -295,10 +298,7 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
-            {
-                str(li): TransformerBlock(args, li, experts)
-                for li in range(args.n_layers)
-            }
+            {str(li): TransformerBlock(args, li) for li in range(args.n_layers)}
         )
 
     @property
@@ -356,7 +356,9 @@ class Transformer(nn.Module):
             h = self.layers[str(li)].forward(
                 h, self.freqs_cis, cache, mask, storage_idx
             )
-        return self.output(self.norm(h)).float()
+            break
+        return
+        # return self.output(self.norm(h)).float()
 
 
 class Mixtral8x7B:
@@ -373,15 +375,15 @@ class Mixtral8x7B:
             weights_only=True,
             mmap=True,
         )
-        experts = torch.load(
-            model_path / f"experts-{WORLD_RANK}.pt",
-            map_location=device,
-            weights_only=True,
-            mmap=True,
-        )
+        # experts = torch.load(
+        #     model_path / f"experts-{WORLD_RANK}.pt",
+        #     map_location=device,
+        #     weights_only=True,
+        #     mmap=True,
+        # )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts))
+            model = Transformer(args=model_args)
         model.load_state_dict(non_experts, assign=True, strict=True)
         model.freqs_cis = precompute_freqs_cis(
             dim=model_args.head_dim,
@@ -457,9 +459,9 @@ class Mixtral8x7B:
         model = self.model.eval()
         cache = self.get_cache(max_batch_size, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
-        if draw_new_graph:
-            model.draw_graphs(max_batch_size, min_p_len, cache, mask)
-            self.clear_cache(cache)
+        # if draw_new_graph:
+        #     model.draw_graphs(max_batch_size, min_p_len, cache, mask)
+        #     self.clear_cache(cache)
         dist.barrier()
 
         tic = time.time()
@@ -491,6 +493,7 @@ class Mixtral8x7B:
             logits = model.forward(
                 tokens[:, prev_pos:cur_pos], cache, mask, storage_idx
             )
+            return
 
             if cur_pos == min_p_len:
                 prefill_time = time.time() - tic
@@ -571,80 +574,72 @@ def main(
         temperature=0.0,
         device=gpu,
     )
-    print("finished warming up")
+    # print("finished warming up")
 
-    prefill_tps = []
-    decode_tps = []
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
-        prompt_batch = prompts[start:end]
-        responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
-            prompt_batch,
-            max_batch_size=len(prompt_batch),
-            max_gen_len=max_gen_len,
-            temperature=0.0,
-            device=gpu,
-            draw_new_graph=start == 0,
-            profile=True,
-        )
+    # prefill_tps = []
+    # decode_tps = []
+    # start = 0
+    # for end in range(batch_size, n_prompts + 1, batch_size):
+    #     prompt_batch = prompts[start:end]
+    #     responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
+    #         prompt_batch,
+    #         max_batch_size=len(prompt_batch),
+    #         max_gen_len=max_gen_len,
+    #         temperature=0.0,
+    #         device=gpu,
+    #         draw_new_graph=start == 0,
+    #         profile=True,
+    #     )
 
-        if WORLD_RANK == 0:
-            prefill_tp = n_p_tkns / prefill_time
-            decode_tp = n_gen_tkns / decode_time
-            prefill_tps.append(prefill_tp)
-            decode_tps.append(decode_tp)
+    #     if WORLD_RANK == 0:
+    #         prefill_tp = n_p_tkns / prefill_time
+    #         decode_tp = n_gen_tkns / decode_time
+    #         prefill_tps.append(prefill_tp)
+    #         decode_tps.append(decode_tp)
 
-            print("=" * 20)
-            print("PERFORMANCE BREAKDOWN\n")
-            print("PROMPT EVALUATION:")
-            print(f"token count: {n_p_tkns}")
-            print(f"total time in sec(s): {prefill_time:.2f}")
-            print(f"throughput: {prefill_tp:.2f} t/s")
-            print("TOKEN GENERATION:")
-            print(f"token count: {n_gen_tkns}")
-            print(f"total time in sec(s): {decode_time:.2f}")
-            if n_gen_tkns > 0:
-                print(f"throughput: {decode_tp:.2f} t/s")
-            else:
-                responses = ["" for _ in prompt_batch]
-            if not hide_resp:
-                print("=" * 20)
-                print("INS-N-OUTS")
-                print(f"AVG seqlen: {(n_p_tkns / len(prompt_batch)):2f}")
-                for p, resp in zip(prompt_batch, responses):
-                    print(f"PROMPT:\n{p}")
-                    print(f"RESPONSE:\n{resp}\n")
+    #         print("=" * 20)
+    #         print("PERFORMANCE BREAKDOWN\n")
+    #         print("PROMPT EVALUATION:")
+    #         print(f"token count: {n_p_tkns}")
+    #         print(f"total time in sec(s): {prefill_time:.2f}")
+    #         print(f"throughput: {prefill_tp:.2f} t/s")
+    #         print("TOKEN GENERATION:")
+    #         print(f"token count: {n_gen_tkns}")
+    #         print(f"total time in sec(s): {decode_time:.2f}")
+    #         if n_gen_tkns > 0:
+    #             print(f"throughput: {decode_tp:.2f} t/s")
+    #         else:
+    #             responses = ["" for _ in prompt_batch]
+    #         if not hide_resp:
+    #             print("=" * 20)
+    #             print("INS-N-OUTS")
+    #             print(f"AVG seqlen: {(n_p_tkns / len(prompt_batch)):2f}")
+    #             for p, resp in zip(prompt_batch, responses):
+    #                 print(f"PROMPT:\n{p}")
+    #                 print(f"RESPONSE:\n{resp}\n")
 
-    if WORLD_RANK == 0:
-        print("=" * 20)
-        print("RUN STATISTICS")
-        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+    # if WORLD_RANK == 0:
+    #     print("=" * 20)
+    #     print("RUN STATISTICS")
+    #     print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+    #     print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     dist.barrier()
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str)
-    parser.add_argument("--node-id", type=int)  # ignored
-    parser.add_argument("--prompt", type=str)
-    parser.add_argument("--prompt-path", type=str)
-    parser.add_argument("--n-prompts", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--hide-resp", action="store_true")
-    args = parser.parse_args()
-
+    MODEL_PATH = "/mnt/llm_team/merlin_mixtral_weights/v0"
+    PROMPT_PATH = "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json"
+    N_PROMPTS = 4
+    BATCH_SIZE = 1
+    MAX_GEN_LEN = 1
     main(
-        args.model_path,
-        args.prompt,
-        args.prompt_path,
-        args.n_prompts,
-        args.batch_size,
-        args.max_tokens,
-        args.hide_resp,
+        model_path=MODEL_PATH,
+        prompt=None,
+        prompt_path=PROMPT_PATH,
+        n_prompts=N_PROMPTS,
+        batch_size=BATCH_SIZE,
+        max_gen_len=MAX_GEN_LEN,
     )
-
-    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
+    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=1 --master-addr=10.10.10.1 --master-port=9091 debug_graph.py

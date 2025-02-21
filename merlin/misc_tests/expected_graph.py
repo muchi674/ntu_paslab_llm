@@ -346,6 +346,8 @@ class Attention(nn.Module):
         xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        # print(xq[:2])
+        # print(xk[:2])
 
         if cache is None:
             key, val = xk, xv
@@ -390,14 +392,14 @@ class MoeLayer(nn.Module):
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
 
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+        # selected_experts = selected_experts.to("cpu")
+        # eis, bis, nes = [], [], []
+        # for ei in range(self.num_experts):
+        #     batch_idx, nth_expert = torch.where(selected_experts == ei)
+        #     if torch.numel(batch_idx) > 0:
+        #         eis.append(ei)
+        #         bis.append(batch_idx.to(device=inputs.device))
+        #         nes.append(nth_expert.to(device=inputs.device))
 
         return results
 
@@ -430,7 +432,9 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        print(x)
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        print(r)
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -492,6 +496,7 @@ class Transformer(nn.Module):
             dist.barrier()
             cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
+            break
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
@@ -560,6 +565,7 @@ def generate(
 
     dist.barrier()
     torch.cuda.nvtx.range_pop()
+    return
 
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
@@ -630,25 +636,25 @@ def main(
         ["hello, how are you?"],
         tokenizer,
         model,
-        max_tokens=128,
+        max_tokens=1,
         max_batch_size=1,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
-    torch.cuda.cudart().cudaProfilerStart()
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
-        prompt_batch = prompts[start:end]
-        generate(
-            prompt_batch,
-            tokenizer,
-            model,
-            max_tokens=max_tokens,
-            max_batch_size=len(prompt_batch),
-            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-        )
+    # torch.cuda.cudart().cudaProfilerStart()
+    # start = 0
+    # for end in range(batch_size, n_prompts + 1, batch_size):
+    #     prompt_batch = prompts[start:end]
+    #     generate(
+    #         prompt_batch,
+    #         tokenizer,
+    #         model,
+    #         max_tokens=max_tokens,
+    #         max_batch_size=len(prompt_batch),
+    #         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+    #     )
 
-    torch.cuda.cudart().cudaProfilerStop()
+    # torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
     dist.destroy_process_group()
 
