@@ -18,7 +18,7 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_v0.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v0",
             "node_id": 0,
-            "profile": false,
+            "profile": true,
             "profiling_output": "n51-v2-bs1"
         },
         "10.10.10.2": {
