@@ -191,7 +191,7 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         return topk_idx, topk_weight
 
-    def experts(self, x, topk_ids, topk_weight):
+    def experts_infer(self, x, topk_ids, topk_weight):
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
@@ -281,7 +281,7 @@ class TransformerBlock(nn.Module):
         h, r, topk_idx, topk_weight = graphed_half(
             x, freqs_cis, cache, mask, storage_idx
         )
-        r = self.feed_forward.experts(r, topk_idx, topk_weight).view(h.shape)
+        r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
         return h + r
 
