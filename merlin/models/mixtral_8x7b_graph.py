@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from statistics import mean
+import argparse
 import json
 import os
+import time
 
 from torch import nn
 import torch.distributed as dist
@@ -36,7 +38,7 @@ def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = freqs_cis[None, :, None, :]
@@ -182,7 +184,15 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-    def moe_infer(self, x, topk_ids, topk_weight):
+    def gate(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
+        gate_logits = self.gate(x)
+        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        return topk_idx, topk_weight
+
+    def experts(self, x, topk_ids, topk_weight):
+        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
@@ -211,16 +221,6 @@ class MoeLayer(nn.Module):
         )
         return final_out
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        orig_shape = inputs.shape
-        gate_logits = self.gate(inputs)
-        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        dist.all_reduce(y, op=dist.ReduceOp.SUM)
-
-        return y
-
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -248,24 +248,46 @@ class TransformerBlock(nn.Module):
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
         )
+        self.prefill_graphed_half = None
+        self.decode_graphed_half = None
 
-    def forward(
+    def run_graphable_half(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
         storage_idx: torch.Tensor,
-    ) -> torch.Tensor:
+    ):
         r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
-        h = x + r
-        r = self.feed_forward(self.ffn_norm(h))
-        out = h + r
-        return out
+        h = x + r  # (batch_size, seq_len, model_dim)
+        r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
+        topk_idx, topk_weight = self.feed_forward.gate(r)
+        return h, r, topk_idx, topk_weight
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (batch_size, seq_len, model_dim)
+        freqs_cis: torch.Tensor,
+        cache: torch.Tensor,
+        mask: torch.Tensor,
+        storage_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        graphed_half = (
+            self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
+        )
+        # h.shape = (batch_size, seq_len, model_dim)
+        # r.shape = (batch_size * seq_len, model_dim)
+        h, r, topk_idx, topk_weight = graphed_half(
+            x, freqs_cis, cache, mask, storage_idx
+        )
+        r = self.feed_forward.experts(r, topk_idx, topk_weight).view(h.shape)
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return h + r
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args: ModelArgs = args
         self.freqs_cis: torch.Tensor = None
@@ -273,10 +295,11 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
-            {str(li): TransformerBlock(args, li) for li in range(args.n_layers)}
+            {
+                str(li): TransformerBlock(args, li, experts)
+                for li in range(args.n_layers)
+            }
         )
-        self.prefill_graphed_callables: list = []
-        self.decode_graphed_callables: list = []
 
     @property
     def dtype(self) -> torch.dtype:
@@ -307,25 +330,19 @@ class Transformer(nn.Module):
         decode_storage_x = torch.arange(
             prefill_len, prefill_len + 1, dtype=torch.long, device=self.device
         )
-        prefill_graphed_callables, decode_graphed_callables = [], []
         with torch.cuda.device(device=self.device):
             for li in range(self.args.n_layers):
-                prefill_graphed_callables.append(
-                    torch.cuda.make_graphed_callables(
-                        self.layers[str(li)].forward,
-                        (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
-                        num_warmup_iters=128,
-                    )
+                layer = self.layers[str(li)]
+                layer.prefill_graphed_half = torch.cuda.make_graphed_callables(
+                    layer.run_graphable_half,
+                    (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
+                    num_warmup_iters=128,
                 )
-                decode_graphed_callables.append(
-                    torch.cuda.make_graphed_callables(
-                        self.layers[str(li)].forward,
-                        (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
-                        num_warmup_iters=128,
-                    )
+                layer.decode_graphed_half = torch.cuda.make_graphed_callables(
+                    layer.run_graphable_half,
+                    (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
+                    num_warmup_iters=128,
                 )
-        self.prefill_graphed_callables = prefill_graphed_callables
-        self.decode_graphed_callables = decode_graphed_callables
 
     def forward(
         self,
@@ -334,16 +351,11 @@ class Transformer(nn.Module):
         mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-
         for li in range(self.args.n_layers):
-            dist.barrier()
-            if seqlen > 1:
-                layer = self.prefill_graphed_callables[li]
-            else:
-                layer = self.decode_graphed_callables[li]
-            h = layer(h, self.freqs_cis, cache, mask, storage_idx)
+            h = self.layers[str(li)].forward(
+                h, self.freqs_cis, cache, mask, storage_idx
+            )
         return self.output(self.norm(h)).float()
 
 
@@ -361,9 +373,15 @@ class Mixtral8x7B:
             weights_only=True,
             mmap=True,
         )
+        experts = torch.load(
+            model_path / f"experts-{WORLD_RANK}.pt",
+            map_location=device,
+            weights_only=True,
+            mmap=True,
+        )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args)
+            model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
         model.freqs_cis = precompute_freqs_cis(
             dim=model_args.head_dim,
@@ -407,6 +425,9 @@ class Mixtral8x7B:
             device=device,
         )
 
+    def clear_cache(self, cache: torch.Tensor):
+        cache.zero_()
+
     def get_mask(self, max_seq_len: int, dtype: torch.dtype, device: torch.device):
         mask = torch.full(
             (max_seq_len, max_seq_len), float("-inf"), dtype=dtype, device=device
@@ -417,14 +438,15 @@ class Mixtral8x7B:
     @torch.inference_mode()
     def generate(
         self,
-        prompts: List[str],
+        prompts: list[str],
         *,
         max_batch_size: int,
         max_gen_len: int,
         temperature: float,
         device: torch.device,
+        draw_new_graph: bool = True,
         profile: bool = False,
-    ) -> Tuple[List[str], int, float, int, float]:
+    ) -> tuple[list[str], int, float, int, float]:
 
         encoded_prompts = self.encode_prompts(prompts)
         min_p_len = min(len(p) for p in encoded_prompts)
@@ -435,8 +457,14 @@ class Mixtral8x7B:
         model = self.model.eval()
         cache = self.get_cache(max_batch_size, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
-        model.draw_graphs(max_batch_size, min_p_len, cache, mask)
+        if draw_new_graph:
+            model.draw_graphs(max_batch_size, min_p_len, cache, mask)
+            self.clear_cache(cache)
+        dist.barrier()
 
+        tic = time.time()
+        prefill_time: float  # in sec
+        decode_time: float  # in sec
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
 
@@ -464,6 +492,9 @@ class Mixtral8x7B:
                 tokens[:, prev_pos:cur_pos], cache, mask, storage_idx
             )
 
+            if cur_pos == min_p_len:
+                prefill_time = time.time() - tic
+                tic = time.time()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, 0.8)
@@ -500,10 +531,11 @@ class Mixtral8x7B:
             n_p_tkns += p_len
             n_gen_tkns += len(tkns)
 
+        decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
 
-        return n_p_tkns, n_gen_tkns, responses
+        return responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time
 
 
 def main(
@@ -513,6 +545,7 @@ def main(
     n_prompts: int = 1,
     batch_size: int = 1,
     max_gen_len: int = 128,
+    hide_resp: bool = False,
 ):
     # assert prompt or (prompt_path and n_prompts and n_prompts > 0)
     # assert n_prompts % batch_size == 0
@@ -538,11 +571,14 @@ def main(
         temperature=0.0,
         device=gpu,
     )
+    print("finished warming up")
 
+    prefill_tps = []
+    decode_tps = []
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
-        model.generate(
+        responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
             prompt_batch,
             max_batch_size=len(prompt_batch),
             max_gen_len=max_gen_len,
@@ -551,22 +587,63 @@ def main(
             profile=True,
         )
 
+        if WORLD_RANK == 0:
+            prefill_tp = n_p_tkns / prefill_time
+            decode_tp = n_gen_tkns / decode_time
+            prefill_tps.append(prefill_tp)
+            decode_tps.append(decode_tp)
+
+            print("=" * 20)
+            print("PERFORMANCE BREAKDOWN\n")
+            print("PROMPT EVALUATION:")
+            print(f"token count: {n_p_tkns}")
+            print(f"total time in sec(s): {prefill_time:.2f}")
+            print(f"throughput: {prefill_tp:.2f} t/s")
+            print("TOKEN GENERATION:")
+            print(f"token count: {n_gen_tkns}")
+            print(f"total time in sec(s): {decode_time:.2f}")
+            if n_gen_tkns > 0:
+                print(f"throughput: {decode_tp:.2f} t/s")
+            else:
+                responses = ["" for _ in prompt_batch]
+            if not hide_resp:
+                print("=" * 20)
+                print("INS-N-OUTS")
+                print(f"AVG seqlen: {(n_p_tkns / len(prompt_batch)):2f}")
+                for p, resp in zip(prompt_batch, responses):
+                    print(f"PROMPT:\n{p}")
+                    print(f"RESPONSE:\n{resp}\n")
+
+    if WORLD_RANK == 0:
+        print("=" * 20)
+        print("RUN STATISTICS")
+        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
     dist.barrier()
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    MODEL_PATH = "/mnt/llm_team/merlin_mixtral_weights/v0"
-    PROMPT_PATH = "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json"
-    N_PROMPTS = 4
-    BATCH_SIZE = 1
-    MAX_GEN_LEN = 16
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--node-id", type=int)  # ignored
+    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompt-path", type=str)
+    parser.add_argument("--n-prompts", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--hide-resp", action="store_true")
+    args = parser.parse_args()
+
     main(
-        model_path=MODEL_PATH,
-        prompt=None,
-        prompt_path=PROMPT_PATH,
-        n_prompts=N_PROMPTS,
-        batch_size=BATCH_SIZE,
-        max_gen_len=MAX_GEN_LEN,
+        args.model_path,
+        args.prompt,
+        args.prompt_path,
+        args.n_prompts,
+        args.batch_size,
+        args.max_tokens,
+        args.hide_resp,
     )
+
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
