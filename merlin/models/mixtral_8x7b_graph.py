@@ -615,6 +615,8 @@ def main(
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
 
+        start = end
+
     if WORLD_RANK == 0:
         print("=" * 20)
         print("RUN STATISTICS")
