@@ -584,6 +584,7 @@ def main(
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
+            draw_new_graph=False,
             profile=True,
         )
 
