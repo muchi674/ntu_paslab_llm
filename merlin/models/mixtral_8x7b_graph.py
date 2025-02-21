@@ -534,7 +534,6 @@ class Mixtral8x7B:
         decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
-        torch.cuda.empty_cache()
 
         return responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time
 
