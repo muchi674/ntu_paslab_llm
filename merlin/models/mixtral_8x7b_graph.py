@@ -344,6 +344,11 @@ class Transformer(nn.Module):
                     num_warmup_iters=128,
                 )
 
+    def clear_graph(self):
+        for li in range(self.args.n_layers):
+            self.layers[str(li)].prefill_graphed_half = None
+            self.layers[str(li)].decode_graphed_half = None
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -385,7 +390,7 @@ class Mixtral8x7B:
         model.load_state_dict(non_experts, assign=True, strict=True)
         model.freqs_cis = precompute_freqs_cis(
             dim=model_args.head_dim,
-            end=128_000,
+            end=8192,
             theta=model_args.rope_theta,
             device=device,
         )
@@ -534,6 +539,8 @@ class Mixtral8x7B:
         decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
+        self.model.clear_graph()
+        torch.cuda.empty_cache()
 
         return responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time
 
@@ -612,12 +619,13 @@ def main(
             if not hide_resp:
                 print("=" * 20)
                 print("INS-N-OUTS")
-                print(f"AVG seqlen: {(n_p_tkns / bsz):2f}")
+                print(f"AVG seqlen: {(n_p_tkns / bsz):.2f}")
                 for p, resp in zip(prompt_batch, responses):
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
 
         start = end
+        time.sleep(3)
 
     if WORLD_RANK == 0:
         print("=" * 20)
