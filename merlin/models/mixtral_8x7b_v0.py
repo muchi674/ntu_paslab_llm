@@ -417,7 +417,6 @@ class MoeLayer(nn.Module):
         inputs_flat = inputs.view(-1, inputs.shape[-1])
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
         dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
-        exit()
         return y
 
     @torch.no_grad()
