@@ -421,9 +421,6 @@ class MoeLayer(nn.Module):
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
-        print(x.shape)
-        print(topk_ids.shape)
-        print(topk_weight.shape)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
         with nvtx.annotate("test DtoD", color="green"):
