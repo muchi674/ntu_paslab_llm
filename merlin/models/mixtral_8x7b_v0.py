@@ -424,9 +424,10 @@ class MoeLayer(nn.Module):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
-        idxs = topk_ids.view(-1).argsort()
+        idxs = topk_ids.view(-1)
         with nvtx.annotate("test DtoD", color="green"):
-            sorted_tokens = x[idxs // topk_ids.shape[1]]
+            idxs = idxs.argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
