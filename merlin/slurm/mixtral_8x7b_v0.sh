@@ -34,7 +34,7 @@ CMD="nsys profile \
     --rdzv_id $RANDOM \
     --rdzv_backend c10d \
     --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
-    ../models/mixtral_8x7b_v0_h100.py \
+    ../models/mixtral_8x7b_graphed_h100.py \
     --model-path /home/paslab504llm/v0 \
     --prompt-path /home/paslab504llm/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
     --n-prompts 4 \
