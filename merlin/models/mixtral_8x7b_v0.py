@@ -426,7 +426,9 @@ class MoeLayer(nn.Module):
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
         idxs = topk_ids.view(-1)
         with nvtx.annotate("test DtoD", color="green"):
-            idxs = idxs.argsort()
+            # idxs = idxs.argsort()
+            indices = torch.arange(idxs.size(), device=device) 
+            idxs = indices.sort(dim=-1)[1]
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
         start_idx = 0
