@@ -8,7 +8,7 @@
         "n_prompts": 4,
         "batch_size": 2,
         "max_tokens": 128,
-        "hide_resp": true
+        "hide_resp": false
     },
     "nodes": {
         "10.10.10.1": {
