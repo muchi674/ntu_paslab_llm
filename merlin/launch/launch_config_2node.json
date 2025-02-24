@@ -19,7 +19,7 @@
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v0",
             "node_id": 0,
             "profile": true,
-            "profiling_output": "v0_DtoD_check"
+            "profiling_output": "v0_DtoD_check_no_save_val"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
