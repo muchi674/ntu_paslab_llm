@@ -417,11 +417,14 @@ class MoeLayer(nn.Module):
         inputs_flat = inputs.view(-1, inputs.shape[-1])
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
         dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
-        
+        exit()
         return y
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
+        print(x.shape)
+        print(topk_ids.shape)
+        print(topk_weight.shape)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
         with nvtx.annotate("test DtoD", color="green"):
