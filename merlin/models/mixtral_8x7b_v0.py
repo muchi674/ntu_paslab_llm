@@ -427,7 +427,7 @@ class MoeLayer(nn.Module):
         idxs = topk_ids.view(-1)
         with nvtx.annotate("test DtoD", color="green"):
             # idxs = idxs.argsort()
-            indices = torch.arange(idxs.size(), device=device) 
+            indices = torch.arange(idxs.size(), device=x.device) 
             idxs = indices.sort(dim=-1)[1]
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
