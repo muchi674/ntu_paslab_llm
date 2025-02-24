@@ -423,10 +423,10 @@ class MoeLayer(nn.Module):
     def moe_infer(self, x, topk_ids, topk_weight):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
-        with nvtx.annotate("test DtoD", color="green"):
-            tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
         idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        with nvtx.annotate("test DtoD", color="green"):
+            sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
