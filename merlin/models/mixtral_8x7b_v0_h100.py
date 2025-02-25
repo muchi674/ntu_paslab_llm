@@ -1,5 +1,3 @@
-#!/home/joe/miniconda3/envs/mixtral/bin/python
-
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -10,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import List, Optional, Tuple
-import nvtx
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -399,7 +397,7 @@ class Experts:
 
 class MoeLayer(nn.Module):
     def __init__(
-        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
+        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts
     ):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
@@ -407,98 +405,27 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.group = group
 
-    # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-    #     gate_logits = self.gate(inputs)
-    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-    #     results = torch.zeros_like(inputs)
-    #     with nvtx.annotate("moe_infer", color="purple"):
-    #         selected_experts = selected_experts.to("cpu")
-    #         eis, bis, nes = [], [], []
-    #         for ei in range(self.num_experts):
-    #             batch_idx, nth_expert = torch.where(selected_experts == ei)
-    #             if torch.numel(batch_idx) > 0:
-    #                 eis.append(ei)
-    #                 bis.append(batch_idx.to(device=inputs.device))
-    #                 nes.append(nth_expert.to(device=inputs.device))
-
-    #         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-    #             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-    #             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-                
-    #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-    #     return results
-    
-    # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-    #     gate_logits = self.gate(inputs)
-    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-    #     results = torch.zeros_like(inputs)
-        
-    #     selected_experts = selected_experts.to("cpu")
-    #     with nvtx.annotate("moe_infer", color="purple"):
-    #         y = moe_infer_slow(selected_experts, inputs.device, weights)
-    #     return y
-        
-        
-    # @torch.no_grad()
-    # def moe_infer_slow(self, selected_experts, dev, weight):
-    #     eis, bis, nes = [], [], []
-    #     for ei in range(self.num_experts):
-    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
-    #         if torch.numel(batch_idx) > 0:
-    #             eis.append(ei)
-    #             bis.append(batch_idx.to(device=dev))
-    #             nes.append(nth_expert.to(device=dev))
-
-    #     for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-    #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
-    #     return results
-    
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
-        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        inputs_flat = inputs.view(-1, inputs.shape[-1])
-        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
-        
-        return y
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        results = torch.zeros_like(inputs)
 
-    @torch.no_grad()
-    def moe_infer(self, x, topk_ids, topk_weight):
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
-        idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-        outputs = []
-        start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-            end_idx = start_idx + num_tokens
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
-            outputs.append(expert_out)
-            start_idx = end_idx
+        selected_experts = selected_experts.to("cpu")
+        eis, bis, nes = [], [], []
+        for ei in range(self.num_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == ei)
+            if torch.numel(batch_idx) > 0:
+                eis.append(ei)
+                bis.append(batch_idx.to(device=inputs.device))
+                nes.append(nth_expert.to(device=inputs.device))
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        final_out = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weight.dtype)
-            .mul_(topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
-        )
-        return final_out
+        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+        dist.all_reduce(results, op=dist.ReduceOp.SUM)
+        return results
 
 
 class RMSNorm(torch.nn.Module):
@@ -516,7 +443,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -525,8 +452,7 @@ class TransformerBlock(nn.Module):
             args=args,
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
-            experts=experts,
-            group=group,
+            experts=experts
         )
 
     def forward(
@@ -540,7 +466,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, group):
+    def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -550,7 +476,7 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=group
+                    args=args, li=li, experts=experts
                 )
                 for li in range(args.n_layers)
             }
@@ -604,7 +530,7 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, gpu: torch.device, group) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -620,7 +546,7 @@ class Transformer(nn.Module):
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), group=group)
+            model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -631,7 +557,6 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -671,7 +596,7 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
-    dist.barrier(group=group)
+    dist.barrier()
     prefill_time = time.time() - tic
     tic = time.time()
 
@@ -699,7 +624,7 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
-    dist.barrier(group=group)
+    dist.barrier()
     decode_time = time.time() - tic
 
     return (
@@ -757,17 +682,15 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu, group)
+    model = Transformer.load(Path(model_path), gpu)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        group,
-        max_tokens=16,
+        max_tokens=128,
         max_batch_size=1,
         # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
@@ -790,7 +713,6 @@ def main(
             prompt_batch,
             tokenizer,
             model,
-            group,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
@@ -834,14 +756,13 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier(group=group)
+    dist.barrier()
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
-    parser.add_argument("--node-id", type=int) # ignored
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
