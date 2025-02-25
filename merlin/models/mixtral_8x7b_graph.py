@@ -338,11 +338,11 @@ class Transformer(nn.Module):
             args = []
             # must be in the same order as the graphs are replayed
             for li in range(self.args.n_layers):
-                callables.append(self.layers[str(li)])
+                callables.append(self.layers[str(li)].run_graphable_half)
                 args.append((prefill_x, prefill_storage_x))
 
             for li in range(self.args.n_layers):
-                callables.append(self.layers[str(li)])
+                callables.append(self.layers[str(li)].run_graphable_half)
                 args.append((decode_x, decode_storage_x))
 
             graphed_callables = torch.cuda.make_graphed_callables(
@@ -479,9 +479,15 @@ class Mixtral8x7B:
 
         # warmup
         storage_idx = torch.arange(min_p_len, dtype=torch.long, device=device)
-        model.forward(torch.ones((bsz, min_p_len), dtype=torch.long, device=device), storage_idx)
-        storage_idx = torch.arange(min_p_len, min_p_len + 1, dtype=torch.long, device=device)
-        model.forward(torch.ones((bsz, 1), dtype=torch.long, device=device), storage_idx)
+        model.forward(
+            torch.ones((bsz, min_p_len), dtype=torch.long, device=device), storage_idx
+        )
+        storage_idx = torch.arange(
+            min_p_len, min_p_len + 1, dtype=torch.long, device=device
+        )
+        model.forward(
+            torch.ones((bsz, 1), dtype=torch.long, device=device), storage_idx
+        )
         self.clear_cache(cache)
 
         dist.barrier()
