@@ -512,7 +512,7 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            # dist.barrier()
+            dist.barrier()
             storage_idx = torch.arange(
                 prev_pos, cur_pos, dtype=torch.long, device=device
             )
