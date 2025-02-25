@@ -111,6 +111,9 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
         self.li = li
+        self.freqs_cis: torch.Tensor
+        self.cache: torch.Tensor
+        self.mask: torch.Tensor
 
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
@@ -123,12 +126,16 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
+    def set_batch_level_args(
+        self, freqs_cis: torch.Tensor, cache: torch.Tensor, mask: torch.Tensor
+    ):
+        self.freqs_cis = freqs_cis
+        self.cache = cache
+        self.mask = mask
+
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        cache: torch.Tensor,
-        mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
@@ -137,13 +144,13 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[storage_idx])
+        xq, xk = apply_rotary_emb(xq, xk, self.freqs_cis[storage_idx])
 
         # assumes bsz matches that of cache
-        cache[0, self.li].index_copy_(dim=-3, index=storage_idx, source=xk)
-        cache[1, self.li].index_copy_(dim=-3, index=storage_idx, source=xv)
-        keys = cache[0, self.li]
-        values = cache[1, self.li]
+        self.cache[0, self.li].index_copy_(dim=-3, index=storage_idx, source=xk)
+        self.cache[1, self.li].index_copy_(dim=-3, index=storage_idx, source=xv)
+        keys = self.cache[0, self.li]
+        values = self.cache[1, self.li]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
@@ -155,7 +162,7 @@ class Attention(nn.Module):
 
         # (bs, n_heads, seqlen, max_seq_len)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
-        scores = scores + mask[storage_idx]
+        scores = scores + self.mask[storage_idx]
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
         output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
@@ -254,12 +261,9 @@ class TransformerBlock(nn.Module):
     def run_graphable_half(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        cache: torch.Tensor,
-        mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        r = self.attention(self.attention_norm(x), freqs_cis, cache, mask, storage_idx)
+        r = self.attention(self.attention_norm(x), storage_idx)
         h = x + r  # (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
         topk_idx, topk_weight = self.feed_forward.router(r)
@@ -268,9 +272,6 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
-        freqs_cis: torch.Tensor,
-        cache: torch.Tensor,
-        mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ) -> torch.Tensor:
         graphed_half = (
@@ -278,9 +279,7 @@ class TransformerBlock(nn.Module):
         )
         # h.shape = (batch_size, seq_len, model_dim)
         # r.shape = (batch_size * seq_len, model_dim)
-        h, r, topk_idx, topk_weight = graphed_half(
-            x, freqs_cis, cache, mask, storage_idx
-        )
+        h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
         r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
         return h + r
@@ -290,7 +289,6 @@ class Transformer(nn.Module):
     def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args: ModelArgs = args
-        self.freqs_cis: torch.Tensor = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
@@ -309,40 +307,55 @@ class Transformer(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def set_batch_level_args(
+        self, freqs_cis: torch.Tensor, cache: torch.Tensor, mask: torch.Tensor
+    ):
+        for li in range(self.args.n_layers):
+            self.layers[str(li)].attention.set_batch_level_args(freqs_cis, cache, mask)
+
     def draw_graphs(
         self,
         batch_size: int,
         prefill_len: int,
-        cache: torch.Tensor,
-        mask: torch.Tensor,
     ):
         prefill_x = torch.ones(
             (batch_size, prefill_len, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
-        decode_x = torch.ones(
-            (batch_size, 1, self.args.dim), dtype=self.dtype, device=self.device
-        )
         prefill_storage_x = torch.arange(
             0, prefill_len, dtype=torch.long, device=self.device
+        )
+        decode_x = torch.ones(
+            (batch_size, 1, self.args.dim), dtype=self.dtype, device=self.device
         )
         decode_storage_x = torch.arange(
             prefill_len, prefill_len + 1, dtype=torch.long, device=self.device
         )
+
         with torch.cuda.device(device=self.device):
+            callables = []
+            args = []
+            # must be in the same order as the graphs are replayed
             for li in range(self.args.n_layers):
-                layer = self.layers[str(li)]
-                layer.prefill_graphed_half = torch.cuda.make_graphed_callables(
-                    layer.run_graphable_half,
-                    (prefill_x, self.freqs_cis, cache, mask, prefill_storage_x),
-                    num_warmup_iters=128,
-                )
-                layer.decode_graphed_half = torch.cuda.make_graphed_callables(
-                    layer.run_graphable_half,
-                    (decode_x, self.freqs_cis, cache, mask, decode_storage_x),
-                    num_warmup_iters=128,
-                )
+                callables.append(self.layers[str(li)])
+                args.append((prefill_x, prefill_storage_x))
+
+            for li in range(self.args.n_layers):
+                callables.append(self.layers[str(li)])
+                args.append((decode_x, decode_storage_x))
+
+            graphed_callables = torch.cuda.make_graphed_callables(
+                tuple(callables),
+                tuple(args),
+                num_warmup_iters=128,
+            )
+            for gi, graphed in enumerate(graphed_callables):
+                li = gi % self.args.n_layers
+                if gi < self.args.n_layers:
+                    self.layers[str(li)].prefill_graphed_half = graphed
+                else:
+                    self.layers[str(li)].decode_graphed_half = graphed
 
     def clear_graph(self):
         for li in range(self.args.n_layers):
@@ -352,15 +365,11 @@ class Transformer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        cache: torch.Tensor,
-        mask: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         h = self.tok_embeddings(tokens)
         for li in range(self.args.n_layers):
-            h = self.layers[str(li)].forward(
-                h, self.freqs_cis, cache, mask, storage_idx
-            )
+            h = self.layers[str(li)].forward(h, storage_idx)
         return self.output(self.norm(h)).float()
 
 
@@ -388,12 +397,6 @@ class Mixtral8x7B:
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
-        model.freqs_cis = precompute_freqs_cis(
-            dim=model_args.head_dim,
-            end=8192,
-            theta=model_args.rope_theta,
-            device=device,
-        )
         tokenizer = MistralTokenizer.v1()
 
         return Mixtral8x7B(model, tokenizer)
@@ -445,7 +448,6 @@ class Mixtral8x7B:
         self,
         prompts: list[str],
         *,
-        max_batch_size: int,
         max_gen_len: int,
         temperature: float,
         device: torch.device,
@@ -458,28 +460,42 @@ class Mixtral8x7B:
         max_p_len = max(len(p) for p in encoded_prompts)
         max_seq_len = max_p_len + max_gen_len
         bsz = len(encoded_prompts)
+        pad_id = max(tkn for p in encoded_prompts for tkn in p) + 1
+        eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
 
         model = self.model.eval()
-        cache = self.get_cache(max_batch_size, max_seq_len, device)
+        freqs_cis = precompute_freqs_cis(
+            dim=self.model.args.head_dim,
+            end=8192,
+            theta=self.model.args.rope_theta,
+            device=device,
+        )
+        cache = self.get_cache(bsz, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
+        model.set_batch_level_args(freqs_cis, cache, mask)
         if draw_new_graph:
-            model.draw_graphs(max_batch_size, min_p_len, cache, mask)
-            self.clear_cache(cache)
+            model.draw_graphs(bsz, min_p_len)
         dist.barrier()
 
+        # warmup
+        storage_idx = torch.arange(min_p_len, dtype=torch.long, device=device)
+        model.forward(torch.ones((bsz, min_p_len), dtype=torch.long, device=device), storage_idx)
+        storage_idx = torch.arange(min_p_len, min_p_len + 1, dtype=torch.long, device=device)
+        model.forward(torch.ones((bsz, 1), dtype=torch.long, device=device), storage_idx)
+        self.clear_cache(cache)
+
+        dist.barrier()
         tic = time.time()
         prefill_time: float  # in sec
         decode_time: float  # in sec
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
 
-        pad_id = max(tkn for p in encoded_prompts for tkn in p) + 1
         tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(encoded_prompts):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
         prev_pos = 0
-        eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
         eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
@@ -490,12 +506,11 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
+            dist.barrier()
             storage_idx = torch.arange(
                 prev_pos, cur_pos, dtype=torch.long, device=device
             )
-            logits = model.forward(
-                tokens[:, prev_pos:cur_pos], cache, mask, storage_idx
-            )
+            logits = model.forward(tokens[:, prev_pos:cur_pos], storage_idx)
 
             if cur_pos == min_p_len:
                 prefill_time = time.time() - tic
@@ -570,16 +585,6 @@ def main(
     )
     model = Mixtral8x7B.build(model_path, gpu)
 
-    # warmup
-    model.generate(
-        ["hello, how are you?"],
-        max_batch_size=1,
-        max_gen_len=128,
-        temperature=0.0,
-        device=gpu,
-    )
-    print("finished warming up")
-
     prefill_tps = []
     decode_tps = []
     start = 0
@@ -588,7 +593,6 @@ def main(
         bsz = len(prompt_batch)
         responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
             prompt_batch,
-            max_batch_size=bsz,
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
@@ -634,7 +638,7 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     dist.barrier()
-    dist.destroy_process_group()
+    # dist.destroy_process_group()
 
 
 if __name__ == "__main__":
