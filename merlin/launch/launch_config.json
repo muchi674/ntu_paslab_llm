@@ -5,8 +5,8 @@
     "username": "eric891224",
     "shared_exec_args": {
         "prompt_path": "~/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 128,
-        "batch_size": 4,
+        "n_prompts": 256,
+        "batch_size": 8,
         "max_tokens": 128,
         "hide_resp": false
     },
