@@ -202,7 +202,7 @@ class MoeLayer(nn.Module):
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        tokens_per_expert = cnts.sum(dim=0).cpu()
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
