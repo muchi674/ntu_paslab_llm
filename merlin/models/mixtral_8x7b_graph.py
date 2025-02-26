@@ -198,7 +198,9 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         return topk_idx, topk_weight
 
-    def experts_infer(self, x, topk_ids, topk_weight):
+    def experts_infer(
+        self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
+    ):
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts.scatter_(1, topk_ids, 1)
@@ -216,7 +218,7 @@ class MoeLayer(nn.Module):
             outputs.append(expert_out)
             start_idx = end_idx
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        outs = torch.cat(outputs, dim=0)
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
         final_out = (
