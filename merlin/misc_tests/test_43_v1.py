@@ -362,10 +362,10 @@ class Attention(nn.Module):
         self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
         # event-based
-        # self.comp_start = torch.cuda.Event(enable_timing=True)
+        self.comp_start = torch.cuda.Event(enable_timing=True)
         # self.comm_start = torch.cuda.Event(enable_timing=True)
         # self.comm_end = torch.cuda.Event(enable_timing=True)
-        # self.comp_end = torch.cuda.Event(enable_timing=True)
+        self.comp_end = torch.cuda.Event(enable_timing=True)
 
     @profile_range("attention")
     def forward(
@@ -378,9 +378,9 @@ class Attention(nn.Module):
             self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
             # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
-        # self.comp_start.record()
-        torch.cuda.synchronize(x.device)
-        ts = time.perf_counter()
+        self.comp_start.record(torch.cuda.current_stream(x.device))
+        # torch.cuda.synchronize(x.device)
+        # ts = time.perf_counter()
 
         seqlen_sum, _ = x.shape
 
@@ -423,10 +423,11 @@ class Attention(nn.Module):
         # return self.wo(output)  # type: ignore
         output = self.wo(output)
     
-        # self.comp_end.record()
+        self.comp_end.record(torch.cuda.current_stream(x.device))
         torch.cuda.synchronize(x.device)
-        te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
+        # te = time.perf_counter()
+        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
+        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(self.comp_start.elapsed_time(self.comp_end))
         return output
 
 
@@ -860,7 +861,6 @@ def get_atten_timer_stats(model: Transformer):
         comm_d
     )
 
-
 def get_atten_stats(model: Transformer):
     ete = 0
     comp = 0
@@ -882,6 +882,10 @@ def get_atten_stats(model: Transformer):
     print(f"avg end-to-end time: {ete/n_layers} ms")
     print(f"avg computation time: {comp/n_layers} ms")
     print(f"avg communication time: {comm/n_layers} ms")
+
+def get_attention_comp_stats(model: Transformer):
+    for block in model.layers.values():
+        print(block.attention.comp_records)
 
 def main(
     model_path: str,
@@ -1014,6 +1018,7 @@ def main(
     c.cudaGetDeviceFlags(ctypes.byref(i))
     print("cudaDeviceFlag", i)  # prints flag + 8
 
+    get_attention_comp_stats(model=model)
     # get_atten_timer_stats(model=model)
 
 
