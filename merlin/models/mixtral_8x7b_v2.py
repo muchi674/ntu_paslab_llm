@@ -479,12 +479,13 @@ class MoeLayer(nn.Module):
                 eis.append(ei)
                 bis.append(batch_idx.to(device=inputs.device))
                 nes.append(nth_expert.to(device=inputs.device))
-
+                
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+            
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
         return results
 

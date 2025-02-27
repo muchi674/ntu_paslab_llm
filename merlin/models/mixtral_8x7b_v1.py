@@ -432,16 +432,13 @@ class Experts:
 
 
 class MoeLayer(nn.Module):
-    def __init__(
-        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
-    ):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -464,7 +461,7 @@ class MoeLayer(nn.Module):
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
-        dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        dist.all_reduce(results, op=dist.ReduceOp.SUM)
         return results
 
 
@@ -483,7 +480,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -493,7 +490,6 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
-            group=group,
         )
 
         # eric891224
@@ -530,7 +526,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, group):
+    def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -539,9 +535,7 @@ class Transformer(nn.Module):
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=group
-                )
+                str(li): TransformerBlock(args=args, li=li, experts=experts)
                 for li in range(args.n_layers)
             }
         )
@@ -597,7 +591,7 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device, group) -> "Transformer":
+    def load(model_path: Path, node_id: int, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -613,7 +607,7 @@ class Transformer(nn.Module):
         )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), group=group)
+            model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -624,7 +618,6 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
-    group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -672,7 +665,7 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
-    dist.barrier(group=group)
+    # dist.barrier(group=group)
 
     torch.cuda.nvtx.range_pop()
 
@@ -705,7 +698,7 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
-    dist.barrier(group=group)
+    # dist.barrier(group=group)
 
     torch.cuda.nvtx.range_pop()
 
@@ -846,16 +839,14 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), node_id, gpu, group)
+    model = Transformer.load(Path(model_path), node_id, gpu)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        group,
         max_tokens=16,
         max_batch_size=1,
         # temperature=0,
@@ -879,7 +870,6 @@ def main(
             prompt_batch,
             tokenizer,
             model,
-            group,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
             # temperature=0,
@@ -928,7 +918,7 @@ def main(
         # get_atten_stats(model=model)
 
     torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier(group=group)
+    dist.barrier()
     dist.destroy_process_group()
 
     get_atten_timer_stats(model=model)
@@ -946,6 +936,7 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(0)
     main(
         args.model_path,
         args.node_id,  # for loading weights partition with more granular control

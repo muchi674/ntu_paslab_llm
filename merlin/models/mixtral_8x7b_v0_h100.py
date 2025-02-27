@@ -1,4 +1,3 @@
-# [POC]: inter-node pipeline parallelism + intra-node tensor parallelism
 # reference: https://github.com/mistralai/mistral-inference
 import argparse
 import inspect
@@ -8,7 +7,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Optional
 from typing import List, Optional, Tuple
 
 import torch
@@ -27,7 +25,6 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -79,10 +76,6 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
-    first_layer: int = None
-    last_layer: int = None
-    n_assigned_layers: int = None
-    attn_tp: bool = False
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -329,10 +322,9 @@ class BufferCache:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, group):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.group = group
 
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
@@ -342,10 +334,10 @@ class Attention(nn.Module):
 
         self.scale = self.args.head_dim**-0.5
 
-        self.wq = nn.Linear(args.dim, self.n_heads * args.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
-        self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
     def forward(
         self,
@@ -353,7 +345,7 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        seqlen_sum, model_dim = x.shape
+        seqlen_sum, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
@@ -386,17 +378,9 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        output: torch.Tensor = self.wo(output)
-        if self.args.attn_tp:
-            # all_reduce is not used to prevent hangs
-            local_world_out = torch.zeros(
-                (LOCAL_WORLD_SIZE, seqlen_sum, model_dim),
-                dtype=output.dtype,
-                device=output.device,
-            )
-            dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-            return torch.sum(local_world_out, dim=0)
-        return output
+        assert isinstance(output, torch.Tensor)
+
+        return self.wo(output)  # type: ignore
 
 
 class Experts:
@@ -404,9 +388,7 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
 
-    def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
@@ -415,7 +397,7 @@ class Experts:
 
 class MoeLayer(nn.Module):
     def __init__(
-        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
+        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts
     ):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
@@ -423,7 +405,6 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.group = group
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         gate_logits = self.gate(inputs)
@@ -442,11 +423,8 @@ class MoeLayer(nn.Module):
 
         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
-                continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-        if self.group is not None:
-            dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+        dist.all_reduce(results, op=dist.ReduceOp.SUM)
         return results
 
 
@@ -465,17 +443,16 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts):
         super().__init__()
-        self.attention = Attention(args=args, group=group)
+        self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
             args=args,
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
-            experts=experts,
-            group=group,
+            experts=experts
         )
 
     def forward(
@@ -489,29 +466,19 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, comms: list):
+    def __init__(self, args: ModelArgs, experts: Experts):
         super().__init__()
         self.args = args
-        (
-            self.local_group,
-            self.local_leader,
-            self.prev_stage_leader,
-            self.next_stage_leader,
-            self.is_first_stage,
-            self.is_last_stage,
-        ) = comms
         self._precomputed_freqs_cis: torch.Tensor = None
-        if self.is_first_stage:
-            self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        elif self.is_last_stage:
-            self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-            self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(li): TransformerBlock(
-                    args=args, li=li, experts=experts, group=self.local_group
+                    args=args, li=li, experts=experts
                 )
-                for li in range(args.first_layer, args.last_layer + 1)
+                for li in range(args.n_layers)
             }
         )
 
@@ -543,134 +510,43 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        xs: torch.Tensor,
+        input_ids: torch.Tensor,
         seqlens: List[int],
         cache: BufferCache,
     ) -> torch.Tensor:
+        (num_toks,) = input_ids.shape
+        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
+
         input_metadata = cache.get_input_metadata(seqlens)
-        h = xs
-        if self.is_first_stage:
-            h = self.tok_embeddings(h)
-        else:
-            if WORLD_RANK == self.local_leader:
-                for req in dist.batch_isend_irecv(
-                    [dist.P2POp(dist.irecv, h, self.prev_stage_leader)]
-                ):
-                    req.wait()
-            if self.local_group is not None:
-                dist.broadcast(h, self.local_leader, group=self.local_group)
+        h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
-        for li in range(self.args.first_layer, self.args.last_layer + 1):
-            cache_view = cache.get_view(li - self.args.first_layer, input_metadata)
+        for li in range(self.args.n_layers):
+            cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
         cache.update_seqlens(seqlens)
-        ys: torch.Tensor
-        if self.is_last_stage:
-            ys = self.output(self.norm(h))
-        else:
-            if WORLD_RANK == self.local_leader:
-                for req in dist.batch_isend_irecv(
-                    [dist.P2POp(dist.isend, h, self.next_stage_leader)]
-                ):
-                    req.wait()
-            ys = torch.zeros(
-                (xs.shape[0], self.args.vocab_size),
-                dtype=self.dtype,
-                device=self.device,
-            )
-        dist.broadcast(ys, WORLD_SIZE - 1)
-        return ys.to(torch.float32)
+        outs = self.output(self.norm(h))
+        return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
-            model_path / f"non-experts-{node_id}-{LOCAL_RANK}.pt",
+            model_path / "non-experts.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
+            model_path / f"experts-{WORLD_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
         )
 
-        # find PP range
-        is_first_stage = "tok_embeddings.weight" in non_experts
-        is_last_stage = "output.weight" in non_experts
-        lis = [int(k.split(".")[0]) for k in experts]
-        model_args.first_layer = min(lis)
-        model_args.last_layer = max(lis)
-        model_args.n_assigned_layers = (
-            model_args.last_layer - model_args.first_layer + 1
-        )
-
-        # detect parallelization of expert weights (TP or EP)
-        intra_node_parallel = False
-        if (
-            any(
-                f"{model_args.first_layer}.{ei}.w1" not in experts
-                for ei in range(model_args.moe["num_experts"])
-            )
-            or experts[f"{model_args.first_layer}.0.w1"].shape[0]
-            < model_args.hidden_dim
-        ):
-            intra_node_parallel = True
-
-        # adjust for tensor parallel attention
-        if (
-            non_experts[f"layers.{model_args.first_layer}.attention.wq.weight"].shape[0]
-            < model_args.n_heads * model_args.head_dim
-        ):
-            assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
-            assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
-            model_args.n_heads = model_args.n_heads // LOCAL_WORLD_SIZE
-            model_args.n_kv_heads = model_args.n_kv_heads // LOCAL_WORLD_SIZE
-            model_args.attn_tp = True
-
-        comms: list
-        if intra_node_parallel:
-            global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=gpu)
-            local_map = torch.tensor(
-                [node_id, WORLD_RANK], dtype=torch.int64, device=gpu
-            )
-            dist.all_gather_into_tensor(global_map, local_map)
-            first_node = torch.min(global_map[:, 0]).item()
-            last_node = torch.max(global_map[:, 0]).item()
-            local_group, local_leader = None, None
-
-            for ni in range(first_node, last_node + 1):
-                ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
-                node_group = dist.new_group(
-                    ranks_on_node, backend="nccl", use_local_synchronization=True
-                )
-                if node_id == ni:
-                    local_group = node_group
-                    local_leader = min(ranks_on_node)
-
-            prev_node = node_id - 1 if node_id != first_node else last_node
-            next_node = node_id + 1 if node_id != last_node else first_node
-            prev_stage_lead = torch.min(
-                global_map[global_map[:, 0] == prev_node][:, 1]
-            ).item()
-            next_stage_lead = torch.min(
-                global_map[global_map[:, 0] == next_node][:, 1]
-            ).item()
-
-            comms = [local_group, local_leader, prev_stage_lead, next_stage_lead]
-        else:
-            prev_stage_lead = (WORLD_RANK - 1 + WORLD_SIZE) % WORLD_SIZE
-            next_stage_lead = (WORLD_RANK + 1) % WORLD_SIZE
-            comms = [None, WORLD_RANK, prev_stage_lead, next_stage_lead]
-        comms.append(is_first_stage)
-        comms.append(is_last_stage)
-
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts), comms=comms)
+            model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -698,12 +574,11 @@ def generate(
     ]
     B, V = len(encoded_prompts), model.args.vocab_size
     seqlens = [len(x) for x in encoded_prompts]
-    n_p_tkns = sum(seqlens)
 
     # Cache
     cache_window = max(seqlens) + max_tokens
     cache = BufferCache(
-        model.args.n_assigned_layers,
+        model.args.n_layers,
         max_batch_size,
         cache_window,
         model.args.n_kv_heads,
@@ -713,22 +588,19 @@ def generate(
     cache.reset()
 
     # prefill / prompt evaluation stage
-    prefill_xs = (
-        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long)
-        if model.is_first_stage
-        else torch.zeros(
-            (n_p_tkns, model.args.dim), dtype=model.dtype, device=model.device
-        )
+    prelogits = model.forward(
+        torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
+        seqlens=seqlens,
+        cache=cache,
     )
-    prelogits = model.forward(prefill_xs, seqlens=seqlens, cache=cache)
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
+    dist.barrier()
     prefill_time = time.time() - tic
     tic = time.time()
 
     # decode
-    decode_xs = torch.zeros((B, model.args.dim), dtype=model.dtype, device=model.device)
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
@@ -740,11 +612,8 @@ def generate(
             break
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(
-            next_token if model.is_first_stage else decode_xs,
-            seqlens=[1] * B,
-            cache=cache,
-        )
+        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+        assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
@@ -755,12 +624,13 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
+    dist.barrier()
     decode_time = time.time() - tic
 
     return (
         seqlens,
         responses,
-        n_p_tkns,
+        sum(seqlens),
         prefill_time,
         n_gen_tkns,
         decode_time,
@@ -791,7 +661,6 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
 def main(
     model_path: str,
-    node_id: int,
     prompt: str,
     prompt_path: str,
     n_prompts: int = 1,
@@ -813,9 +682,8 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(model_path=Path(model_path), node_id=node_id, gpu=gpu)
+    model = Transformer.load(Path(model_path), gpu)
 
     # warmup
     generate(
@@ -895,7 +763,6 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
-    parser.add_argument("--node-id", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -904,10 +771,8 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
-    torch.manual_seed(0)
     main(
         args.model_path,
-        args.node_id,  # for loading weights partition with more granular control
         args.prompt,
         args.prompt_path,
         args.n_prompts,
