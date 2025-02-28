@@ -646,7 +646,7 @@ def main(
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
     dist.barrier()
-    dist.destroy_process_group()
+    # dist.destroy_process_group()
 
 
 if __name__ == "__main__":
