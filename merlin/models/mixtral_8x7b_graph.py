@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import time
+import termcolor
 
 from torch import nn
 import torch.distributed as dist
@@ -541,10 +542,18 @@ class Mixtral8x7B:
             if all(eos_reached):
                 break
 
+        if min_p_len != max_p_len:
+            warning = termcolor.colored(
+                "-" * 25
+                + "\nprompts have non-unifrom length, performance analysis might be inaccurate\n"
+                + "-" * 25,
+                "red",
+            )
+            print(warning)
+
         # this part is from here:
         # https://github.com/meta-llama/llama3/blob/main/llama/generation.py
         responses = []
-        n_p_tkns, n_gen_tkns = 0, 0
         for bi, tkns in enumerate(tokens.tolist()):
             # cut to max_gen_len
             p_len = len(encoded_prompts[bi])
@@ -556,8 +565,9 @@ class Mixtral8x7B:
             except ValueError:
                 pass
             responses.append(self.tokenizer.decode(tkns))
-            n_p_tkns += p_len
-            n_gen_tkns += len(tkns)
+
+        n_p_tkns = min_p_len * bsz
+        n_gen_tkns = (tkns.shape[1] - min_p_len) * bsz
 
         decode_time = time.time() - tic
         if profile:

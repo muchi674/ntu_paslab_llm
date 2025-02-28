@@ -4,10 +4,10 @@
     "master_port": "9091",
     "username": "muchichen",
     "shared_exec_args": {
-        "prompt_path": "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json",
-        "n_prompts": 64,
+        "prompt_path": "/home/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
+        "n_prompts": 128,
         "batch_size": 16,
-        "max_tokens": 64,
+        "max_tokens": 128,
         "hide_resp": false
     },
     "nodes": {
@@ -26,7 +26,7 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/v0",
             "node_id": 1,
-            "profile": true,
+            "profile": false,
             "profiling_output": "n46-graph-bs16"
         }
     }
