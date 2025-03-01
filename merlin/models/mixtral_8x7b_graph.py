@@ -567,7 +567,7 @@ class Mixtral8x7B:
             responses.append(self.tokenizer.decode(tkns))
 
         n_p_tkns = min_p_len * bsz
-        n_gen_tkns = (max_seq_len - min_p_len) * bsz
+        n_gen_tkns = (cur_pos - min_p_len) * bsz
 
         decode_time = time.time() - tic
         if profile:
