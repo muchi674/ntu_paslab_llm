@@ -47,68 +47,69 @@ def init_processes(max_mb):
     global_map = get_global_map(device)
     inputs = [torch.ones((1,), dtype=torch.bfloat16, device=device)]
     batch_size = 1
-    while 2 * batch_size * 1024 / 1024**2 <= max_mb:
+    seq_len = 128
+    while 2 * batch_size * seq_len * 4096 / 1024**2 <= max_mb:
         inputs.append(
-            torch.ones((batch_size, 1024), dtype=torch.bfloat16, device=device)
+            torch.ones((batch_size, seq_len, 4096), dtype=torch.bfloat16, device=device)
         )
         batch_size *= 2
 
-    # N = 4000
-    # avg_latencies = []  # in ms
-
-    # for ins in inputs:
-    #     # warmup
-    #     for _ in range(2000):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
-
-    #     tic = time.time()
-    #     for _ in range(N):
-    #         dist.all_reduce(ins, op=dist.ReduceOp.MAX)
-    #     avg_latencies.append((time.time() - tic) * 1000 / N)
-
-    # if WORLD_RANK == 0:
-    #     print_and_save_res(
-    #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
-    #     )
-
-    N = 3000
-    warmups = 600
+    N = 4000
     avg_latencies = []  # in ms
-    receiver = 0
-    sender = torch.min(
-        global_map[global_map[:, 0] == 1][:, 1]
-    ).item()  # first rank of the second node
 
     for ins in inputs:
-        if WORLD_RANK == sender or WORLD_RANK == receiver:
-            print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
-            # warmup
-            for _ in range(warmups):
-                if WORLD_RANK == sender:
-                    ops = [dist.P2POp(dist.isend, ins, receiver)]
-                else:
-                    ops = [dist.P2POp(dist.irecv, ins, sender)]
-                for req in dist.batch_isend_irecv(ops):
-                    req.wait()
+        # warmup
+        for _ in range(2000):
+            dist.all_reduce(ins, op=dist.ReduceOp.MAX)
 
-            tic = time.time()
-
-            for _ in range(N):
-                if WORLD_RANK == sender:
-                    ops = [dist.P2POp(dist.isend, ins, receiver)]
-                else:
-                    ops = [dist.P2POp(dist.irecv, ins, sender)]
-                for req in dist.batch_isend_irecv(ops):
-                    req.wait()
-
-            duration = time.time() - tic
-            avg_latencies.append(duration * 1000 / N)
-        dist.barrier()
+        tic = time.time()
+        for _ in range(N):
+            dist.all_reduce(ins, op=dist.ReduceOp.MAX)
+        avg_latencies.append((time.time() - tic) * 1000 / N)
 
     if WORLD_RANK == 0:
         print_and_save_res(
-            "AVG INTER P2P COMM LATENCY", inputs, avg_latencies, "inter_p2p_comm.json"
+            "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
         )
+
+    # N = 3000
+    # warmups = 600
+    # avg_latencies = []  # in ms
+    # receiver = 0
+    # sender = torch.min(
+    #     global_map[global_map[:, 0] == 1][:, 1]
+    # ).item()  # first rank of the second node
+
+    # for ins in inputs:
+    #     if WORLD_RANK == sender or WORLD_RANK == receiver:
+    #         print(f"{WORLD_RANK} working on {torch.numel(ins) * 2}")
+    #         # warmup
+    #         for _ in range(warmups):
+    #             if WORLD_RANK == sender:
+    #                 ops = [dist.P2POp(dist.isend, ins, receiver)]
+    #             else:
+    #                 ops = [dist.P2POp(dist.irecv, ins, sender)]
+    #             for req in dist.batch_isend_irecv(ops):
+    #                 req.wait()
+
+    #         tic = time.time()
+
+    #         for _ in range(N):
+    #             if WORLD_RANK == sender:
+    #                 ops = [dist.P2POp(dist.isend, ins, receiver)]
+    #             else:
+    #                 ops = [dist.P2POp(dist.irecv, ins, sender)]
+    #             for req in dist.batch_isend_irecv(ops):
+    #                 req.wait()
+
+    #         duration = time.time() - tic
+    #         avg_latencies.append(duration * 1000 / N)
+    #     dist.barrier()
+
+    # if WORLD_RANK == 0:
+    #     print_and_save_res(
+    #         "AVG INTER P2P COMM LATENCY", inputs, avg_latencies, "inter_p2p_comm.json"
+    #     )
 
     dist.barrier()
     dist.destroy_process_group()
