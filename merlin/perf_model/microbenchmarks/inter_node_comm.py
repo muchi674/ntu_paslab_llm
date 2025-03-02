@@ -39,20 +39,25 @@ def print_and_save_res(
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-def init_processes(max_mb):
+def init_processes(start_bsz: int, end_bsz: int):
     device = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=device
     )
     global_map = get_global_map(device)
     inputs = [torch.ones((1,), dtype=torch.bfloat16, device=device)]
-    batch_size = 1
-    seq_len = 128
-    while 2 * batch_size * seq_len * 4096 / 1024**2 <= max_mb:
+    # batch_size = 1
+    # seq_len = 128
+    # while 2 * batch_size * seq_len * 4096 / 1024**2 <= max_mb:
+    #     inputs.append(
+    #         torch.ones((batch_size, seq_len, 4096), dtype=torch.bfloat16, device=device)
+    #     )
+    #     batch_size *= 2
+    while start_bsz <= end_bsz:
         inputs.append(
-            torch.ones((batch_size, seq_len, 4096), dtype=torch.bfloat16, device=device)
+            torch.ones((start_bsz, 128, 4096), dtype=torch.bfloat16, device=device)
         )
-        batch_size *= 2
+        start_bsz *= 2
 
     N = 4000
     avg_latencies = []  # in ms
@@ -61,6 +66,9 @@ def init_processes(max_mb):
         # warmup
         for _ in range(2000):
             dist.all_reduce(ins, op=dist.ReduceOp.MAX)
+
+        if LOCAL_RANK == 0:
+            print(f"working on inputs with: {ins.shape}")
 
         tic = time.time()
         for _ in range(N):
@@ -117,7 +125,8 @@ def init_processes(max_mb):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-mb", type=int, default=128)
+    parser.add_argument("--start-bsz", type=int, default=128)
+    parser.add_argument("--end-bsz", type=int, default=128)
     args = parser.parse_args()
-    init_processes(args.max_mb)
-    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 test_inter_node.py
+    init_processes(args.start_bsz, args.end_bsz)
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 inter_node_comm.py
