@@ -1080,7 +1080,7 @@ def main(
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
 
-    timer.all_gather(n_prompts/batch_size, max_tokens, group)
+    timer.all_gather(n_prompts//batch_size, max_tokens, group)
     timer.get_sync_latency()
 
     torch.cuda.cudart().cudaProfilerStop()
