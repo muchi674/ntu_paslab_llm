@@ -6,10 +6,10 @@ import torch
 device = torch.device("cuda:0")
 dtype = torch.bfloat16
 N = 1000
-w1s = [torch.rand((14336, 4096), dtype=dtype, device=device) for _ in range(N)]
-w2s = [torch.rand((4096, 14336), dtype=dtype, device=device) for _ in range(N)]
-w3s = [torch.rand((14336, 4096), dtype=dtype, device=device) for _ in range(N)]
-xs = [torch.ones((16, 4096), dtype=dtype, device=device) for _ in range(N)]
+w1s = [torch.rand((14336, 4096), dtype=dtype, device=device) for _ in range(64)]
+w2s = [torch.rand((4096, 14336), dtype=dtype, device=device) for _ in range(64)]
+w3s = [torch.rand((14336, 4096), dtype=dtype, device=device) for _ in range(64)]
+xs = [torch.ones((16, 4096), dtype=dtype, device=device) for _ in range(1000)]
 
 
 def expert(x: torch.Tensor) -> torch.Tensor:
@@ -50,11 +50,11 @@ with torch.cuda.device(device=device):
 
 # warmup
 for _ in range(1000):
-    graphed_weightless_expert(xs[i], w1s[i], w2s[i], w3s[i])
+    graphed_weightless_expert(xs[i], w1s[i % 64], w2s[i % 64], w3s[i % 64])
 torch.cuda.synchronize(device=device)
 
 tic = time.time()
 for _ in range(1000):
-    graphed_weightless_expert(xs[i], w1s[i], w2s[i], w3s[i])
+    graphed_weightless_expert(xs[i], w1s[i % 64], w2s[i % 64], w3s[i % 64])
 torch.cuda.synchronize(device=device)
 print(f"took {(time.time() - tic) / 1000} sec per op")
