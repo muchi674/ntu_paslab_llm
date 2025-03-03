@@ -413,74 +413,74 @@ class MoeLayer(nn.Module):
         self.expert_start_idx=expert_start_idx
         self.expert_end_idx=expert_end_idx
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
-
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
-
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
-                continue
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-
-        dist.all_reduce(results, op=dist.ReduceOp.SUM)
-        return results
-    
     # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-    #     orig_shape = inputs.shape
     #     gate_logits = self.gate(inputs)
-    #     topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
-    #     topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-    #     inputs_flat = inputs.view(-1, inputs.shape[-1])
-    #     y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-    #     dist.all_reduce(y, op=dist.ReduceOp.SUM)
-    #     return y
-    
-    # @torch.no_grad()
-    # def moe_infer(self, x, topk_ids, topk_weight):
-    #     cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-    #     cnts = cnts.scatter_(1, topk_ids, 1).sum(dim=0)
-    #     tokens_per_expert = (
-    #         cnts[self.expert_start_idx : self.expert_end_idx].cpu().numpy()
-    #     )
+    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+    #     results = torch.zeros_like(inputs)
 
-    #     fidx = cnts[: self.expert_start_idx].sum().item()
-    #     bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
-    #     idxs = topk_ids.view(-1).argsort()
-    #     token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
-    #     sorted_tokens = x[token_idxs]
+    #     selected_experts = selected_experts.to("cpu")
+    #     eis, bis, nes = [], [], []
+    #     for ei in range(self.num_experts):
+    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
+    #         if torch.numel(batch_idx) > 0:
+    #             eis.append(ei)
+    #             bis.append(batch_idx.to(device=inputs.device))
+    #             nes.append(nth_expert.to(device=inputs.device))
 
-    #     outputs = []
-    #     start_idx = 0
-    #     for i, num_tokens in enumerate(tokens_per_expert):
-    #         if num_tokens == 0:
+    #     for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+    #         if ey is None:
     #             continue
-    #         end_idx = start_idx + num_tokens
-    #         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-    #         expert_out = self.experts.forward(self.li, i + self.expert_start_idx, tokens_for_this_expert)
-    #         outputs.append(expert_out)
-    #         start_idx = end_idx
+    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
-    #     if len(outputs):
-    #         outs = torch.cat(outputs, dim=0)
-    #         new_x = torch.zeros_like(x)
-    #         outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
-    #         return new_x.scatter_reduce_(
-    #             0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
-    #         )
-    #     else:
-    #         return torch.zeros_like(x)
+    #     dist.all_reduce(results, op=dist.ReduceOp.SUM)
+    #     return results
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
+        gate_logits = self.gate(inputs)
+        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
+        inputs_flat = inputs.view(-1, inputs.shape[-1])
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
+    
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+        cnts = cnts.scatter_(1, topk_ids, 1).sum(dim=0)
+        tokens_per_expert = (
+            cnts[self.expert_start_idx : self.expert_end_idx].cpu().numpy()
+        )
+
+        fidx = cnts[: self.expert_start_idx].sum().item()
+        bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
+        idxs = topk_ids.view(-1).argsort()
+        token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
+        sorted_tokens = x[token_idxs]
+
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = self.experts.forward(self.li, i + self.expert_start_idx, tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
+
+        if len(outputs):
+            outs = torch.cat(outputs, dim=0)
+            new_x = torch.zeros_like(x)
+            outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
+            return new_x.scatter_reduce_(
+                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+            )
+        else:
+            return torch.zeros_like(x)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
