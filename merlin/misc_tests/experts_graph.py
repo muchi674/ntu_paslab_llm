@@ -32,13 +32,13 @@ with torch.cuda.device(device=device):
 
 # warmup
 for i in range(1000):
-    expert(xs[i])
+    graphed_expert(xs[i])
 torch.cuda.synchronize(device=device)
 
 torch.cuda.nvtx.range_push("change_x")
 tic = time.time()
 for i in range(1000):
-    expert(xs[i])
+    graphed_expert(xs[i])
 torch.cuda.synchronize(device=device)
 print(f"took {(time.time() - tic) / 1000} sec per op")
 torch.cuda.nvtx.range_pop()
