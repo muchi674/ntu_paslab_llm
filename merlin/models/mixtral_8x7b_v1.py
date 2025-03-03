@@ -403,13 +403,15 @@ class Experts:
 
 
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.expert_start_idx=expert_start_idx
+        self.expert_end_idx=expert_end_idx
 
     # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
     #     gate_logits = self.gate(inputs)
@@ -496,7 +498,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -506,6 +508,8 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
+            expert_start_idx=expert_start_idx,
+            expert_end_idx=expert_end_idx,
         )
 
     def forward(
@@ -526,12 +530,14 @@ class Transformer(nn.Module):
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-        self.layers = nn.ModuleDict(
-            {
-                str(li): TransformerBlock(args=args, li=li, experts=experts)
-                for li in range(args.n_layers)
-            }
-        )
+        # self.layers = nn.ModuleDict(
+        #     {
+        #         str(li): TransformerBlock(args=args, li=li, experts=experts)
+        #         for li in range(args.n_layers)
+        #     }
+        # )
+        self.expert_start_idx = 0
+        self.expert_end_idx = 0
 
     @property
     def dtype(self) -> torch.dtype:
@@ -595,7 +601,25 @@ class Transformer(nn.Module):
             weights_only=True,
             mmap=True,
         )
-
+        
+        # expert setup
+        ek = list(expert.key())
+        ep_tag = ek[0][2]
+        if not expert_end_idx:
+            if ep_tag:
+                expert_start_idx = ep_tag
+                expert_end_idx = ep_tag + 5
+            else:
+                expert_start_idx = ep_tag
+                expert_end_idx = ep_tag + 3
+            
+        self.layers = nn.ModuleDict(
+            {
+                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx, expert_end_idx)
+                for li in range(args.n_layers)
+            }
+        )
+        
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
         model.load_state_dict(non_experts, assign=True, strict=True)
