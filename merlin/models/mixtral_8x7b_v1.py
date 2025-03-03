@@ -605,13 +605,13 @@ class Transformer(nn.Module):
         # expert setup
         ek = list(experts.keys())
         ep_tag = ek[0][2]
-        if not expert_end_idx:
+        if not self.expert_end_idx:
             if ep_tag:
-                expert_start_idx = ep_tag
-                expert_end_idx = ep_tag + 5
+                self.expert_start_idx = ep_tag
+                self.expert_end_idx = ep_tag + 5
             else:
-                expert_start_idx = ep_tag
-                expert_end_idx = ep_tag + 3
+                self.expert_start_idx = ep_tag
+                self.expert_end_idx = ep_tag + 3
             
         self.layers = nn.ModuleDict(
             {
