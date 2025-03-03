@@ -42,20 +42,16 @@ def apply_rotary_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[None, :, None, :]
+    freqs_cis = freqs_cis[None, None, :, :]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
+    batch, num_key_value_heads, slen, head_dim = x.shape
+    x = x[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return x.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 def get_json(file_path: Path) -> dict:
@@ -142,14 +138,14 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
         xq, xk = apply_rotary_emb(xq, xk, self.freqs_cis[storage_idx])
 
         # assumes bsz matches that of cache
-        self.cache[0, self.li].index_copy_(dim=-3, index=storage_idx, source=xk)
-        self.cache[1, self.li].index_copy_(dim=-3, index=storage_idx, source=xv)
+        self.cache[0, self.li].index_copy_(dim=-2, index=storage_idx, source=xk)
+        self.cache[1, self.li].index_copy_(dim=-2, index=storage_idx, source=xv)
         keys = self.cache[0, self.li]
         values = self.cache[1, self.li]
 
@@ -157,17 +153,15 @@ class Attention(nn.Module):
         keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
         values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
-        values = values.transpose(1, 2)  # (bs, n_heads, max_seq_len, head_dim)
-
-        # (bs, n_heads, seqlen, max_seq_len)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
-        scores = scores + self.mask[storage_idx]
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-
-        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = F.scaled_dot_product_attention(
+            xq,
+            keys,
+            values,
+            attn_mask=self.mask[storage_idx],
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, self.args.dim)
         return self.wo(output)
 
 
@@ -277,12 +271,13 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
     ) -> torch.Tensor:
-        graphed_half = (
-            self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
-        )
+        # graphed_half = (
+        #     self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
+        # )
         # h.shape = (batch_size, seq_len, model_dim)
         # r.shape = (batch_size * seq_len, model_dim)
-        h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
+        # h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
+        h, r, topk_idx, topk_weight = self.run_graphable_half(x, storage_idx)
         r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
         return h + r
@@ -476,8 +471,8 @@ class Mixtral8x7B:
         cache = self.get_cache(bsz, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
         model.set_batch_level_args(freqs_cis, cache, mask)
-        if draw_new_graph:
-            model.draw_graphs(bsz, min_p_len)
+        # if draw_new_graph:
+        #     model.draw_graphs(bsz, min_p_len)
         dist.barrier()
 
         # warmup
