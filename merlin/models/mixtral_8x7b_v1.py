@@ -603,7 +603,7 @@ class Transformer(nn.Module):
         )
         
         # expert setup
-        ek = list(expert.key())
+        ek = list(experts.key())
         ep_tag = ek[0][2]
         if not expert_end_idx:
             if ep_tag:
