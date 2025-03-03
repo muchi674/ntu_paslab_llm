@@ -604,7 +604,7 @@ class Transformer(nn.Module):
         
         # expert setup
         ek = list(experts.keys())
-        ep_tag = ek[0][2]
+        ep_tag = int(ek[0][2])
         if ep_tag:
             expert_start_idx = ep_tag
             expert_end_idx = ep_tag + 5
