@@ -523,21 +523,21 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts):
+    def __init__(self, args: ModelArgs, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-        # self.layers = nn.ModuleDict(
-        #     {
-        #         str(li): TransformerBlock(args=args, li=li, experts=experts)
-        #         for li in range(args.n_layers)
-        #     }
-        # )
-        self.expert_start_idx = 0
-        self.expert_end_idx = 0
+        self.layers = nn.ModuleDict(
+            {
+                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
+                for li in range(args.n_layers)
+            }
+        )
+        # self.expert_start_idx = 0
+        # self.expert_end_idx = 0
 
     @property
     def dtype(self) -> torch.dtype:
@@ -605,23 +605,15 @@ class Transformer(nn.Module):
         # expert setup
         ek = list(experts.keys())
         ep_tag = ek[0][2]
-        if not self.expert_end_idx:
-            if ep_tag:
-                self.expert_start_idx = ep_tag
-                self.expert_end_idx = ep_tag + 5
-            else:
-                self.expert_start_idx = ep_tag
-                self.expert_end_idx = ep_tag + 3
-            
-        self.layers = nn.ModuleDict(
-            {
-                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
-                for li in range(args.n_layers)
-            }
-        )
+        if ep_tag:
+            expert_start_idx = ep_tag
+            expert_end_idx = ep_tag + 5
+        else:
+            expert_start_idx = ep_tag
+            expert_end_idx = ep_tag + 3
         
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts))
+            model = Transformer(args=model_args, experts=Experts(experts), expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
