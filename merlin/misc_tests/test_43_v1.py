@@ -84,8 +84,8 @@ class EventTimer:
         self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
     def all_gather(self, num_batches, max_tokens, group):
-        self.out_p = torch.zeros(WORLD_SIZE, num_batches, device=self.device)
-        self.out_d = torch.zeros(WORLD_SIZE, max_tokens, device=self.device)
+        self.out_p = torch.zeros((WORLD_SIZE, num_batches), device=self.device)
+        self.out_d = torch.zeros((WORLD_SIZE, max_tokens), device=self.device)
 
         dist.all_gather_into_tensor(self.out_p, torch.tensor(self.records[f"{WORLD_RANK}_p"], device=self.device), group)
         dist.all_gather_into_tensor(self.out_d, torch.tensor(self.records[f"{WORLD_RANK}_d"], device=self.device), group)
