@@ -1069,6 +1069,9 @@ def main(
 
         start = end
 
+    timer.all_gather(n_prompts//batch_size, max_tokens, group)
+    
+
     if WORLD_RANK == 0:
         print("=" * 20)
         print("RUN STATISTICS")
@@ -1079,9 +1082,9 @@ def main(
         # print("=" * 20)
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
+        timer.get_sync_latency()
 
-    timer.all_gather(n_prompts//batch_size, max_tokens, group)
-    timer.get_sync_latency()
+    
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
