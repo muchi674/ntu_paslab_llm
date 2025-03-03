@@ -55,14 +55,14 @@ def init_processes(start_bsz: int, end_bsz: int):
     #     batch_size *= 2
     while start_bsz <= end_bsz:
         inputs.append(
-            torch.ones((start_bsz, 128, 4096), dtype=torch.bfloat16, device=device)
+            torch.ones((start_bsz * 128, 4096), dtype=torch.bfloat16, device=device)
         )
         start_bsz *= 2
 
     N = 4000
     avg_latencies = []  # in ms
 
-    for ins in inputs:
+    for i, ins in enumerate(inputs):
         # warmup
         for _ in range(2000):
             dist.all_reduce(ins, op=dist.ReduceOp.MAX)
@@ -70,15 +70,21 @@ def init_processes(start_bsz: int, end_bsz: int):
         if LOCAL_RANK == 0:
             print(f"working on inputs with: {ins.shape}")
 
+        if i > 0:
+            torch.cuda.cudart().cudaProfilerStart()
+
         tic = time.time()
         for _ in range(N):
             dist.all_reduce(ins, op=dist.ReduceOp.MAX)
         avg_latencies.append((time.time() - tic) * 1000 / N)
 
-    if WORLD_RANK == 0:
-        print_and_save_res(
-            "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
-        )
+        if i > 0:
+            torch.cuda.cudart().cudaProfilerStop()
+
+    # if WORLD_RANK == 0:
+    #     print_and_save_res(
+    #         "INTER COLL COMM LATENCY", inputs, avg_latencies, "inter_coll_comm.json"
+    #     )
 
     # N = 3000
     # warmups = 600
