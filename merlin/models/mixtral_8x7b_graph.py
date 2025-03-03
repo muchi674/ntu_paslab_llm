@@ -172,6 +172,7 @@ class Attention(nn.Module):
             attn_mask=self.mask[storage_idx],
             dropout_p=0.0,
             is_causal=False,
+            # enable_gqa=True
         )
         output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
         return self.wo(output)
