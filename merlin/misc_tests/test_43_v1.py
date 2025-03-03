@@ -38,6 +38,63 @@ LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
+class EventTimer:
+    def __init__(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
+        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+        self.buff = []
+        self.temp = 0
+
+        self.out_p = None
+        self.out_d = None
+
+    def record_start(self, device: torch.device):
+        self.start_event.record(torch.cuda.current_stream(device))
+    
+    def record_end(self, device: torch.device):
+        self.start_event.record(torch.cuda.current_stream(device))
+        torch.cuda.synchronize(device)
+
+    def acc_elapsed_time(self) -> float:
+        '''return accumulated elapsed time'''
+        duration = self.start_event.elapsed_time(self.end_event)
+        self.temp += duration
+
+        return self.temp
+    
+    def record_elapsed_time(self):
+        '''append accumulated elapsed time to buffer'''
+        self.buff.append(self.temp)
+        self.temp = 0
+
+        return self.buff
+    
+    def flush_buffer(self, isPrefill=False):
+        '''append buffer to records'''
+        self.records[f"{WORLD_RANK}_p" if isPrefill else f"{WORLD_RANK}_d"].append(self.buff)
+        self.buff = []
+
+    def reset(self):
+        self.buff = []
+        self.temp = 0
+        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
+
+    def all_gather(self, num_batches, max_tokens, group):
+        self.out_p = torch.zeros(WORLD_SIZE, num_batches)
+        self.out_d = torch.zeros(WORLD_SIZE, max_tokens)
+
+        dist.all_gather_into_tensor(self.out_p, torch.tensor(self.records[f"{WORLD_RANK}_p"]), group)
+        dist.all_gather_into_tensor(self.out_d, torch.tensor(self.records[f"{WORLD_RANK}_d"]), group)
+
+        return self.out_p, self.out_d
+
+    def get_sync_latency(self):
+        print(self.out_p, self.out_d)
+
+timer = EventTimer()
+
 def profile_range(range_name=""):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -379,6 +436,7 @@ class Attention(nn.Module):
             # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
         self.comp_start.record(torch.cuda.current_stream(x.device))
+        timer.record_start(x.device)
         # torch.cuda.synchronize(x.device)
         # ts = time.perf_counter()
 
@@ -425,6 +483,9 @@ class Attention(nn.Module):
     
         self.comp_end.record(torch.cuda.current_stream(x.device))
         torch.cuda.synchronize(x.device)
+        timer.record_end(x.device)
+        timer.acc_elapsed_time()
+        timer.record_elapsed_time()
         # te = time.perf_counter()
         # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
         self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(self.comp_start.elapsed_time(self.comp_end))
@@ -613,6 +674,9 @@ class Transformer(nn.Module):
 
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
+
+        timer.flush_buffer(isPrefill=input_metadata.prefill)
+
         return outs.float()
 
     @staticmethod
@@ -729,7 +793,10 @@ def generate(
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
+    timer.reset()
+
     for _ in range(max_tokens):
+
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
         is_finished = is_finished | (next_token == eos_id).cpu()
 
@@ -754,6 +821,9 @@ def generate(
 
         # records[f'{WORLD_RANK}_d'].append(te - ts)
         records[f'{WORLD_RANK}_d'].append(start.elapsed_time(end))
+
+    timer.all_gather(1, max_tokens, group)
+    timer.get_sync_latency()
 
     print(records)
     # print(torch.cuda.current_stream(model.device))
