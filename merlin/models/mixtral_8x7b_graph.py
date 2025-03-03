@@ -271,13 +271,12 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
     ) -> torch.Tensor:
-        # graphed_half = (
-        #     self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
-        # )
+        graphed_half = (
+            self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
+        )
         # h.shape = (batch_size, seq_len, model_dim)
         # r.shape = (batch_size * seq_len, model_dim)
-        # h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
-        h, r, topk_idx, topk_weight = self.run_graphable_half(x, storage_idx)
+        h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
         r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
         return h + r
@@ -471,8 +470,8 @@ class Mixtral8x7B:
         cache = self.get_cache(bsz, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
         model.set_batch_level_args(freqs_cis, cache, mask)
-        # if draw_new_graph:
-        #     model.draw_graphs(bsz, min_p_len)
+        if draw_new_graph:
+            model.draw_graphs(bsz, min_p_len)
         dist.barrier()
 
         # warmup
