@@ -414,8 +414,6 @@ class MoeLayer(nn.Module):
         self.group = group
         self.comp_time = []
         self.comm_time = []
-        self.comm_start = torch.cuda.Event(enable_timing=True)
-        self.comm_end = torch.cuda.Event(enable_timing=True)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         start = torch.cuda.Event(enable_timing=True)
