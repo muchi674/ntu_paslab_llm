@@ -1,3 +1,5 @@
+import time
+
 from torch import nn
 import torch
 
@@ -33,11 +35,11 @@ for i in range(1000):
     expert(xs[i])
 torch.cuda.synchronize(device=device)
 
-torch.cuda.nvtx.range_push("only_x")
+tic = time.time()
 for i in range(1000):
     expert(xs[i])
 torch.cuda.synchronize(device=device)
-torch.cuda.nvtx.range_pop()
+print(f"took {(time.time() - tic) / 1000} sec per op")
 
 with torch.cuda.device(device=device):
     graphed_weightless_expert = torch.cuda.make_graphed_callables(
@@ -51,8 +53,8 @@ for _ in range(1000):
     graphed_weightless_expert(xs[i], w1s[i], w2s[i], w3s[i])
 torch.cuda.synchronize(device=device)
 
-torch.cuda.nvtx.range_push("x_and_ws")
+tic = time.time()
 for _ in range(1000):
     graphed_weightless_expert(xs[i], w1s[i], w2s[i], w3s[i])
 torch.cuda.synchronize(device=device)
-torch.cuda.nvtx.range_pop()
+print(f"took {(time.time() - tic) / 1000} sec per op")
