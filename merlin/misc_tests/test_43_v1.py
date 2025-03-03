@@ -484,7 +484,7 @@ class Attention(nn.Module):
         output = self.wo(output)
     
         self.comp_end.record(torch.cuda.current_stream(x.device))
-        torch.cuda.synchronize(x.device)
+        # torch.cuda.synchronize(x.device)
         timer.record_end(x.device)
         timer.acc_elapsed_time()
         timer.record_elapsed_time()
