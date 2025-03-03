@@ -50,6 +50,8 @@ class EventTimer:
         self.out_p = None
         self.out_d = None
 
+        self.device = torch.device(f"cuda:{LOCAL_RANK}")
+
     def record_start(self, device: torch.device):
         self.start_event.record(torch.cuda.current_stream(device))
     
@@ -82,11 +84,11 @@ class EventTimer:
         self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
     def all_gather(self, num_batches, max_tokens, group):
-        self.out_p = torch.zeros(WORLD_SIZE, num_batches)
-        self.out_d = torch.zeros(WORLD_SIZE, max_tokens)
+        self.out_p = torch.zeros(WORLD_SIZE, num_batches, device=self.device)
+        self.out_d = torch.zeros(WORLD_SIZE, max_tokens, device=self.device)
 
-        dist.all_gather_into_tensor(self.out_p, torch.tensor(self.records[f"{WORLD_RANK}_p"]), group)
-        dist.all_gather_into_tensor(self.out_d, torch.tensor(self.records[f"{WORLD_RANK}_d"]), group)
+        dist.all_gather_into_tensor(self.out_p, torch.tensor(self.records[f"{WORLD_RANK}_p"], device=self.device), group)
+        dist.all_gather_into_tensor(self.out_d, torch.tensor(self.records[f"{WORLD_RANK}_d"], device=self.device), group)
 
         return self.out_p, self.out_d
 
@@ -793,8 +795,6 @@ def generate(
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
-    timer.reset()
-
     for _ in range(max_tokens):
 
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
@@ -822,8 +822,6 @@ def generate(
         # records[f'{WORLD_RANK}_d'].append(te - ts)
         records[f'{WORLD_RANK}_d'].append(start.elapsed_time(end))
 
-    timer.all_gather(1, max_tokens, group)
-    timer.get_sync_latency()
 
     print(records)
     # print(torch.cuda.current_stream(model.device))
@@ -1012,6 +1010,7 @@ def main(
     # dist.barrier(group=group)
 
     torch.cuda.cudart().cudaProfilerStart()
+    timer.reset()
     prefill_tps = []
     decode_tps = []
     start = 0
@@ -1080,6 +1079,9 @@ def main(
         # print("=" * 20)
         # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
         # get_atten_stats(model=model)
+
+    timer.all_gather(n_prompts/batch_size, max_tokens, group)
+    timer.get_sync_latency()
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=group)
