@@ -428,8 +428,8 @@ class Mixtral8x7B:
                 2,  # key and value
                 self.model.args.n_layers,
                 max_batch_size,
-                max_seq_len,
                 self.model.args.n_kv_heads,
+                max_seq_len,
                 self.model.args.head_dim,
             ),
             dtype=torch.bfloat16,

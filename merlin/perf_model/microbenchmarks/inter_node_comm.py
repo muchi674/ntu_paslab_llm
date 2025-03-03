@@ -128,4 +128,4 @@ if __name__ == "__main__":
     parser.add_argument("--model-dim", type=int)
     args = parser.parse_args()
     init_processes(args.start_bsz, args.end_bsz, args.seq_len, args.model_dim)
-    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 inter_node_comm.py --start-bsz 1 --end-bsz 128 seq-len 128 --model-dim 4096
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 inter_node_comm.py --start-bsz 1 --end-bsz 128 --seq-len 128 --model-dim 4096
