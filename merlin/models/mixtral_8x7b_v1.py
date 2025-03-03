@@ -606,11 +606,11 @@ class Transformer(nn.Module):
         ek = list(experts.keys())
         ep_tag = int(ek[0][2])
         if ep_tag:
-            expert_start_idx = ep_tag
-            expert_end_idx = ep_tag + 5
+            expert_start_idx = int(ep_tag)
+            expert_end_idx = int(ep_tag) + 5
         else:
-            expert_start_idx = ep_tag
-            expert_end_idx = ep_tag + 3
+            expert_start_idx = int(ep_tag)
+            expert_end_idx = int(ep_tag) + 3
         
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts), expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
