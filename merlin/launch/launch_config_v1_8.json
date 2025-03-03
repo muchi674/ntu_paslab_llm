@@ -5,10 +5,10 @@
     "username": "kai",
     "shared_exec_args": {
         "prompt_path": "/home/kai/ntu_paslab_llm/mixtral/prompts/long.json",
-        "n_prompts": 16,
-        "batch_size": 4,
+        "n_prompts": 32,
+        "batch_size": 8,
         "max_tokens": 128,
-        "hide_resp": false
+        "hide_resp": true
     },
     "nodes": {
         "10.10.10.1": {
