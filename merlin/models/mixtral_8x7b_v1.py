@@ -615,7 +615,7 @@ class Transformer(nn.Module):
             
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx, expert_end_idx)
+                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
                 for li in range(args.n_layers)
             }
         )
