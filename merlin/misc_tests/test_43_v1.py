@@ -93,6 +93,39 @@ class EventTimer:
         return self.out_p, self.out_d
 
     def get_sync_latency(self):
+        '''
+            d = [
+                [
+                    [5,10],
+                    [3, 15]
+                ],
+                [
+                    [2, 4],
+                    [6, 8]
+                ]
+            ]
+
+            torch.amax(d, dim=0) // compare d[0] and d[1] element-wisely
+            >>> 
+            [
+                [5, 10],
+                [6, 15]
+            ]
+            torch.amin(d, dim=0)
+            >>>
+            [
+                [2, 4],
+                [3, 8]
+            ]
+        '''
+        max_p = torch.amax(self.out_p, dim=0)
+        min_p = torch.amax(self.out_p, dim=0)
+        self.out_p = max_p - min_p
+
+        max_d = torch.amax(self.out_d, dim=0)
+        min_d = torch.amin(self.out_d, dim=0)
+        self.out_d = max_d - min_d
+
         print(self.out_p, self.out_d)
 
 timer = EventTimer()
