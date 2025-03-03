@@ -54,7 +54,7 @@ class EventTimer:
         self.start_event.record(torch.cuda.current_stream(device))
     
     def record_end(self, device: torch.device):
-        self.start_event.record(torch.cuda.current_stream(device))
+        self.end_event.record(torch.cuda.current_stream(device))
         torch.cuda.synchronize(device)
 
     def acc_elapsed_time(self) -> float:
