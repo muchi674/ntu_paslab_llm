@@ -62,3 +62,24 @@ for _ in range(1000):
 torch.cuda.synchronize(device=device)
 print(f"took {(time.time() - tic) / 1000} sec per op")
 torch.cuda.nvtx.range_pop()
+
+
+def f_with_loop(x: torch.Tensor) -> torch.Tensor:
+    res = torch.zeros_like(x)
+    for i in range(64):
+        res += (nn.functional.silu(x @ w1s[i].T) * (x @ w3s[i].T)) @ w2s[i].T
+    return res
+
+
+with torch.cuda.device(device=device):
+    graphed_f_with_loop = torch.cuda.make_graphed_callables(
+        f_with_loop,
+        (xs[0],),
+        num_warmup_iters=128,
+    )
+
+
+# warmup
+for i in range(1000):
+    graphed_f_with_loop(xs[i])
+torch.cuda.synchronize(device=device)

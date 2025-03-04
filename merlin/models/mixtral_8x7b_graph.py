@@ -130,6 +130,21 @@ class Attention(nn.Module):
         self.cache = cache
         self.mask = mask
 
+    def gqa_matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # assumes something like
+        # a.shape = (bsz, n_heads, seqlen, head_dim)
+        # b.shape = (bsz, n_kv_heads, head_dim, max_seqlen)
+        c = torch.empty(a.shape[:-1] + (b.shape[-1],), dtype=a.dtype, device=a.device)
+        for bi in range(self.n_kv_heads):
+            for a_step in range(self.repeats):
+                ai = bi * self.repeats + a_step
+                torch.matmul(
+                    a[:, ai : ai + 1, :, :],
+                    b[:, bi : bi + 1, :, :],
+                    out=c[:, ai : ai + 1, :, :],
+                )
+        return c
+
     def forward(
         self,
         x: torch.Tensor,
@@ -150,18 +165,26 @@ class Attention(nn.Module):
         values = self.cache[1, self.li]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
-        values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        # keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        # values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
 
-        output = F.scaled_dot_product_attention(
-            xq,
-            keys,
-            values,
-            attn_mask=self.mask[storage_idx],
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, self.args.dim)
+        # output = F.scaled_dot_product_attention(
+        #     xq,
+        #     keys,
+        #     values,
+        #     attn_mask=self.mask[storage_idx],
+        #     dropout_p=0.0,
+        #     is_causal=False,
+        # )
+        # output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, self.args.dim)
+
+        # (bs, n_heads, seqlen, max_seq_len)
+        scores = self.gqa_matmul(xq, keys.transpose(2, 3)) / self.sqrt_head_dim
+        scores = scores + self.mask[storage_idx]
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        output = self.gqa_matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 
