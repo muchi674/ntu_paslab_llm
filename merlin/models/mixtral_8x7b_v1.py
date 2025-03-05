@@ -469,7 +469,7 @@ class MoeLayer(nn.Module):
         cnts = cnts.cpu().numpy()
         for i in (1, cnts.shape[0] - 1):
             cnts[i] += cnts[i - 1]
-        fidx = cnts[numpy.clip(self.expert_start_idx - 1, a_min=0)]
+        fidx = cnts[numpy.clip(self.expert_start_idx - 1, a_min=0, a_max=None)]
         bidx = cnts[self.expert_end_idx - 1]
         
         # # get ep token range
