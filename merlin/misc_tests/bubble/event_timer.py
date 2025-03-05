@@ -100,7 +100,7 @@ class CrossNodeEventTimer:
         """
 
         max_p = torch.amax(self.out_p, dim=0)
-        min_p = torch.amax(self.out_p, dim=0)
+        min_p = torch.amin(self.out_p, dim=0)
         self.out_p = max_p - min_p
 
         max_d = torch.amax(self.out_d, dim=0)
