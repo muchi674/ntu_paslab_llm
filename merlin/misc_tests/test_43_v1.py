@@ -139,6 +139,8 @@ class EventTimer:
         self.out_d = max_d - min_d
 
         print(self.out_p, self.out_d, self.out_d.dtype)
+        print("average sync latency")
+        print(self.out_d.mean(dim=1, keepdim=True))
 
 timer = EventTimer()
 
