@@ -551,8 +551,8 @@ class Transformer(nn.Module):
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
 
-        timer.record_elapsed_time()
-        timer.flush_buffer(isPrefill=input_metadata.prefill)
+        # timer.record_elapsed_time()
+        # timer.flush_buffer(isPrefill=input_metadata.prefill)
 
         return outs.float()
 
@@ -620,6 +620,8 @@ def generate(
         seqlens=seqlens,
         cache=cache,
     )
+    timer.record_elapsed_time()
+    timer.flush_buffer(isPrefill=True)
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
@@ -641,6 +643,9 @@ def generate(
         generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
+
+    timer.record_elapsed_time()
+    timer.flush_buffer(isPrefill=False)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
