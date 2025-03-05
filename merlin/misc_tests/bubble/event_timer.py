@@ -56,8 +56,8 @@ class CrossNodeEventTimer:
         return with shape of (#devices, #batches, #tokens) for decode (out_d)
         '''
         print("prefill",torch.tensor(self.records[f"{self.world_rank}_p"]).shape)
-        print("decode",self.records[f"{self.world_rank}_d"])
-        # print("decode",torch.tensor(self.records[f"{self.world_rank}_d"]).shape)
+        # print("decode",self.records[f"{self.world_rank}_d"])
+        print("decode",torch.tensor(self.records[f"{self.world_rank}_d"]).shape)
 
         self.out_p = torch.zeros((self.world_size, num_batches), device=self.device)
         self.out_d = torch.zeros((self.world_size, num_batches, max_tokens), device=self.device)
