@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import time
+import cupy
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -453,10 +454,17 @@ class MoeLayer(nn.Module):
         tokens_per_expert = (
             cnts[self.expert_start_idx : self.expert_end_idx].cpu().numpy()
         )
-
+        
+        # prefix sum version
+        ps = cupy.cumsum(cnts.cnumpy())
+        if self.expert_start_idx == 0 :
+            fidx = 0
+        else :
+            fidx = ps[self.expert_start_idx - 1]
+        bidx = ps[self.expert_end_idx - 1]
         # get ep token range
-        fidx = cnts[: self.expert_start_idx].sum().item()
-        bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
+        # fidx = cnts[: self.expert_start_idx].sum().item()
+        # bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
         # get token position
         idxs = topk_ids.view(-1).argsort()
         token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
