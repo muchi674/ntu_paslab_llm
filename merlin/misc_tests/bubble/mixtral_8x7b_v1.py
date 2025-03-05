@@ -399,7 +399,7 @@ class Attention(nn.Module):
     
         timer.record_end(x.device)
         timer.acc_elapsed_time()
-        timer.record_elapsed_time()
+        # timer.record_elapsed_time()
 
         return output
 
@@ -551,6 +551,7 @@ class Transformer(nn.Module):
         cache.update_seqlens(seqlens)
         outs = self.output(self.norm(h))
 
+        timer.record_elapsed_time()
         timer.flush_buffer(isPrefill=input_metadata.prefill)
 
         return outs.float()
