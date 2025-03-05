@@ -455,14 +455,24 @@ class MoeLayer(nn.Module):
             cnts[self.expert_start_idx : self.expert_end_idx].cpu().numpy()
         )
         
-        # prefix sum version
-        ps = cupy.cumsum(cnts.cnumpy())
-        if self.expert_start_idx == 0 :
+        # # prefix sum cupy version
+        # ps = cupy.cumsum(cnts.cnumpy())
+        # if self.expert_start_idx == 0:
+        #     fidx = 0
+        # else:
+        #     fidx = ps[self.expert_start_idx - 1]
+        # bidx = ps[self.expert_end_idx - 1]
+        # prefix sum numpy version
+        cnts = cnts.cpu().numpy()
+        for i in (1,cnts.shpae[0]):
+            cnts[i] += cnt[i - 1]
+        if self.expert_start_idx == 0:
             fidx = 0
-        else :
-            fidx = ps[self.expert_start_idx - 1]
-        bidx = ps[self.expert_end_idx - 1]
-        # get ep token range
+        else:
+            fidx = cnts[self.expert_start_idx - 1]
+        bidx = cnts[self.expert_end_idx - 1]
+        
+        # # get ep token range
         # fidx = cnts[: self.expert_start_idx].sum().item()
         # bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
         # get token position
