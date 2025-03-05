@@ -108,11 +108,12 @@ class CrossNodeEventTimer:
         self.out_d = max_d - min_d
 
         # print(self.out_p, self.out_d, self.out_d.dtype)
-        print("out_p",self.out_p)
+        # print("out_p",self.out_p)
         print("=" * 20)
         print("average bubble-caused sync latency (ms) per batch")
+        print("Prefill", self.out_p.item())
         print("Decode", self.out_d.mean(dim=1, keepdim=True).tolist())
         print("=" * 20)
         print(f"average bubble-caused sync latency (ms) for #batches = {self.out_d.shape[0]}")
-        # print("Prefill", self.out_p.mean())
+        print("Prefill", self.out_p.mean().item())
         print("Decode:", self.out_d.mean(dim=1).mean().item())
