@@ -2,11 +2,11 @@
     "world_size": 2,
     "master_addr": "10.10.10.1",
     "master_port": "9091",
-    "username": "muchichen",
+    "username": "kai",
     "shared_exec_args": {
-        "prompt_path": "/home/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
-        "n_prompts": 64,
-        "batch_size": 16,
+        "prompt_path": "/home/kai/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
+        "n_prompts": 128,
+        "batch_size": 32,
         "max_tokens": 128,
         "hide_resp": false
     },
@@ -15,7 +15,7 @@
             "ssh_port": 9051,
             "node_rank": 0,
             "ngpus": 2,
-            "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
+            "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_v0.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/v0",
             "node_id": 0,
             "profile": false,
@@ -25,7 +25,7 @@
             "ssh_port": 9046,
             "node_rank": 1,
             "ngpus": 4,
-            "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
+            "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_v0.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/v0",
             "node_id": 1
         }
