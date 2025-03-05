@@ -84,6 +84,11 @@ class EventTimer:
         self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
 
     def all_gather(self, num_batches, max_tokens, group):
+        '''
+        gather from all devices to obtain duration of prefill(all tokens) and decode(token-wise) computation\n
+        return with shape of (#devices, #batches) for prefill (out_p)\n
+        return with shape of (#devices, #batches, #tokens) for decode (out_d)
+        '''
         self.out_p = torch.zeros((WORLD_SIZE, num_batches), device=self.device)
         self.out_d = torch.zeros((WORLD_SIZE, num_batches, max_tokens), device=self.device)
 
@@ -93,31 +98,38 @@ class EventTimer:
         return self.out_p, self.out_d
 
     def get_sync_latency(self):
-        '''
-            d = [
-                [
-                    [5,10],
-                    [3, 15]
-                ],
-                [
-                    [2, 4],
-                    [6, 8]
-                ]
-            ]
+        """
+        Example usage of torch.amax and torch.amin for element-wise comparison.
 
-            torch.amax(d, dim=0) // compare d[0] and d[1] element-wisely
-            >>> 
-            [
-                [5, 10],
-                [6, 15]
-            ]
-            torch.amin(d, dim=0)
-            >>>
-            [
-                [2, 4],
-                [3, 8]
-            ]
-        '''
+        Example:
+            >>> import torch
+            >>> d = [
+            ...     [
+            ...         [5, 10],
+            ...         [3, 15]
+            ...     ],
+            ...     [
+            ...         [2, 4],
+            ...         [6, 8]
+            ...     ]
+            ... ]
+            >>> tensor_d = torch.tensor(d)
+
+        Compute element-wise max along dim=0
+            >>> torch.amax(tensor_d, dim=0)
+            tensor([
+                [5, 10],  # Max of [5,2] and [10,4]
+                [6, 15]   # Max of [3,6] and [15,8]
+            ])
+
+        Compute element-wise min along dim=0
+            >>> torch.amin(tensor_d, dim=0)
+            tensor([
+                [2, 4],  # Min of [5,2] and [10,4]
+                [3, 8]   # Min of [3,6] and [15,8]
+            ])
+        """
+
         max_p = torch.amax(self.out_p, dim=0)
         min_p = torch.amax(self.out_p, dim=0)
         self.out_p = max_p - min_p
@@ -126,7 +138,7 @@ class EventTimer:
         min_d = torch.amin(self.out_d, dim=0)
         self.out_d = max_d - min_d
 
-        print(self.out_p, self.out_d)
+        print(self.out_p, self.out_d, self.out_d.dtype)
 
 timer = EventTimer()
 
