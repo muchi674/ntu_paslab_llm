@@ -463,7 +463,7 @@ class MoeLayer(nn.Module):
         # bidx = ps[self.expert_end_idx - 1]
         # prefix sum numpy version
         cnts = cnts.cpu().numpy()
-        for i in (1,cnts.shpae[0]):
+        for i in (1,cnts.shape[0]):
             cnts[i] += cnt[i - 1]
         if self.expert_start_idx == 0:
             fidx = 0
