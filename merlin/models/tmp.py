@@ -1,13 +1,20 @@
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple
+#!/home/joe/miniconda3/envs/mixtral/bin/python
+
+# reference: https://github.com/mistralai/mistral-inference
+import argparse
+import inspect
 import json
 import os
-
-from torch import nn
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
+from typing import List, Optional, Tuple
+import nvtx
+import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch
+from torch import nn
 
 from xformers.ops.fmha import memory_efficient_attention  # type: ignore
 from xformers.ops.fmha.attn_bias import (  # type: ignore
@@ -73,6 +80,11 @@ class ModelArgs:
     moe: dict
 
     @classmethod
+    def from_dict(cls, params: dict):
+        cls_params = inspect.signature(cls).parameters
+        return cls(**{k: v for k, v in params.items() if k in cls_params})
+
+    @classmethod
     def from_hf_config(cls, params: dict):
         return cls(
             dim=params["hidden_size"],
@@ -122,7 +134,7 @@ class CacheInputMetadata:
 def interleave_list(
     l1: List[torch.Tensor], l2: List[torch.Tensor]
 ) -> List[torch.Tensor]:
-    # assert len(l1) == len(l2)
+    assert len(l1) == len(l2)
     return [v for pair in zip(l1, l2) for v in pair]
 
 
@@ -156,8 +168,8 @@ class CacheView:
         """
         This is a naive implementation and not optimized for speed.
         """
-        # assert xk.ndim == xv.ndim == 3  # (B * T, H, D)
-        # assert xk.shape == xv.shape
+        assert xk.ndim == xv.ndim == 3  # (B * T, H, D)
+        assert xk.shape == xv.shape
 
         if all([s == 0 for s in self.metadata.seqlens]):
             # No cache to interleave
@@ -166,9 +178,9 @@ class CacheView:
         # Make it a list of [(T, H, D)]
         xk: Tuple[torch.Tensor] = torch.split(xk, self.metadata.seqlens)  # type: ignore
         xv: Tuple[torch.Tensor] = torch.split(xv, self.metadata.seqlens)  # type: ignore
-        # assert len(xk) == len(
-        #     self.kv_seqlens
-        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
+        assert len(xk) == len(
+            self.kv_seqlens
+        ), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
 
         # Retrieve cache
         cache_k = [
@@ -232,7 +244,7 @@ class BufferCache:
         self.kv_seqlens: Optional[torch.Tensor] = None
 
     def get_view(self, layer_id: int, metadata: CacheInputMetadata) -> CacheView:
-        # assert self.kv_seqlens is not None
+        assert self.kv_seqlens is not None
         return CacheView(
             self.cache_k[layer_id], self.cache_v[layer_id], metadata, self.kv_seqlens
         )
@@ -256,7 +268,7 @@ class BufferCache:
         return self
 
     def update_seqlens(self, seqlens: List[int]) -> None:
-        # assert self.kv_seqlens is not None
+        assert self.kv_seqlens is not None
         self.kv_seqlens += torch.tensor(seqlens, device=self.device, dtype=torch.long)
 
     def get_input_metadata(self, seqlens: List[int]) -> CacheInputMetadata:
@@ -266,13 +278,13 @@ class BufferCache:
         if self.kv_seqlens is None:
             self.init_kvseqlens(len(seqlens))
 
-        # assert isinstance(self.kv_seqlens, torch.Tensor)
-        # assert len(seqlens) == len(
-        #     self.kv_seqlens
-        # ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
+        assert isinstance(self.kv_seqlens, torch.Tensor)
+        assert len(seqlens) == len(
+            self.kv_seqlens
+        ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
         seqpos = self.kv_seqlens.tolist()
 
-        # assert len(seqlens) > 0, seqlens
+        assert len(seqlens) > 0, seqlens
         cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long)
 
         positions = torch.cat(
@@ -287,24 +299,20 @@ class BufferCache:
 
         during_prefill = seqpos[0] == 0
         if during_prefill:
-            # assert all([pos == 0 for pos in seqpos]), seqpos
+            assert all([pos == 0 for pos in seqpos]), seqpos
             mask = (
-                BlockDiagonalCausalMask.from_seqlens(
-                    seqlens, device=self.device
-                ).make_local_attention(self.max_seq_len)
-                # .to(self.device)
+                BlockDiagonalCausalMask.from_seqlens(seqlens)
+                .make_local_attention(self.max_seq_len)
+                .to(self.device)
             )
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=self.max_seq_len,
-                kv_seqlen=(
-                    self.kv_seqlens + cached_elements
-                )  # vectorized_elementwise_kernel
-                .clamp(max=self.max_seq_len)  # vectorized_elementwise_kernel
+                kv_seqlen=(self.kv_seqlens + cached_elements)
+                .clamp(max=self.max_seq_len)
                 .tolist(),
-                device=self.device,
-            )  # .to(self.device)
+            ).to(self.device)
 
         return CacheInputMetadata(
             positions=positions,
@@ -372,34 +380,125 @@ class Attention(nn.Module):
         )
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
-        # assert isinstance(output, torch.Tensor)
+        assert isinstance(output, torch.Tensor)
 
         return self.wo(output)  # type: ignore
 
 
+class Experts:
+
+    def __init__(self, ws: dict):
+        self.ws: dict[str, torch.Tensor] = ws
+
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
+        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+
+
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, gate: nn.Module):
+    def __init__(
+        self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, group
+    ):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
+        self.li = li
         self.gate = gate
+        self.experts = experts
+        self.group = group
 
+    # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    #     gate_logits = self.gate(inputs)
+    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+    #     results = torch.zeros_like(inputs)
+    #     with nvtx.annotate("moe_infer", color="purple"):
+    #         selected_experts = selected_experts.to("cpu")
+    #         eis, bis, nes = [], [], []
+    #         for ei in range(self.num_experts):
+    #             batch_idx, nth_expert = torch.where(selected_experts == ei)
+    #             if torch.numel(batch_idx) > 0:
+    #                 eis.append(ei)
+    #                 bis.append(batch_idx.to(device=inputs.device))
+    #                 nes.append(nth_expert.to(device=inputs.device))
+
+    #         for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+    #             ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+    #             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+                
+    #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+    #     return results
+    
+    # def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    #     gate_logits = self.gate(inputs)
+    #     weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+    #     weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+    #     results = torch.zeros_like(inputs)
+        
+    #     selected_experts = selected_experts.to("cpu")
+    #     with nvtx.annotate("moe_infer", color="purple"):
+    #         y = moe_infer_slow(selected_experts, inputs.device, weights)
+    #     return y
+        
+        
+    # @torch.no_grad()
+    # def moe_infer_slow(self, selected_experts, dev, weight):
+    #     eis, bis, nes = [], [], []
+    #     for ei in range(self.num_experts):
+    #         batch_idx, nth_expert = torch.where(selected_experts == ei)
+    #         if torch.numel(batch_idx) > 0:
+    #             eis.append(ei)
+    #             bis.append(batch_idx.to(device=dev))
+    #             nes.append(nth_expert.to(device=dev))
+
+    #     for ei, batch_idx, nth_expert in zip(eis, bis, nes):
+    #         ey = self.experts.forward(self.li, ei, inputs[batch_idx])
+    #         results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+    #     dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+    #     return results
+    
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
+        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
+        inputs_flat = inputs.view(-1, inputs.shape[-1])
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
+        
+        return y
 
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
 
-        return results
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
 
 
 class RMSNorm(torch.nn.Module):
@@ -417,14 +516,17 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, group):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
             args=args,
+            li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
+            experts=experts,
+            group=group,
         )
 
     def forward(
@@ -438,7 +540,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, experts: Experts, group):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -446,7 +548,12 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
-            {str(li): TransformerBlock(args=args) for li in range(args.n_layers)}
+            {
+                str(li): TransformerBlock(
+                    args=args, li=li, experts=experts, group=group
+                )
+                for li in range(args.n_layers)
+            }
         )
 
     @property
@@ -482,14 +589,13 @@ class Transformer(nn.Module):
         cache: BufferCache,
     ) -> torch.Tensor:
         (num_toks,) = input_ids.shape
-        # assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
+        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
         input_metadata = cache.get_input_metadata(seqlens)
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for li in range(self.args.n_layers):
-            dist.barrier()
             cache_view = cache.get_view(li, input_metadata)
             h = self.layers[str(li)](h, freqs_cis, cache_view)
 
@@ -498,7 +604,7 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, gpu: torch.device) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device, group) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -506,9 +612,15 @@ class Transformer(nn.Module):
             weights_only=True,
             mmap=True,
         )
+        experts = torch.load(
+            model_path / f"experts-{WORLD_RANK}.pt",
+            map_location=gpu,
+            weights_only=True,
+            mmap=True,
+        )
 
         with torch.device("meta"):
-            model = Transformer(args=model_args)
+            model = Transformer(args=model_args, experts=Experts(experts), group=group)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
@@ -519,6 +631,7 @@ def generate(
     prompts: List[str],
     tokenizer: MistralTokenizer,
     model: Transformer,
+    group,
     *,
     max_tokens: int,
     max_batch_size: int = 64,
@@ -526,6 +639,7 @@ def generate(
     eos_id: Optional[int] = None,
 ) -> Tuple[List[str], int, float, int, float]:
     model = model.eval()
+    tic = time.time()
 
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
@@ -548,23 +662,21 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
-    dist.barrier()
-    torch.cuda.nvtx.range_push("prefill")
-
     # prefill / prompt evaluation stage
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
         seqlens=seqlens,
         cache=cache,
     )
-
-    dist.barrier()
-    torch.cuda.nvtx.range_pop()
-
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
+    dist.barrier(group=group)
+    prefill_time = time.time() - tic
+    tic = time.time()
+
     # decode
+    generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
 
     for _ in range(max_tokens):
@@ -574,8 +686,30 @@ def generate(
         if is_finished.all():
             break
 
+        generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
-        # assert last_token_prelogits.shape == (B, V)
+        assert last_token_prelogits.shape == (B, V)
+
+    generated_tokens: List[List[int]]
+    n_gen_tkns = 0
+    if generated_tensors:
+        generated_tokens = torch.cat(generated_tensors, 1).tolist()
+        n_gen_tkns = sum(len(y) - 1 for y in generated_tokens)
+    else:
+        generated_tokens = []
+    responses = [tokenizer.decode(y) for y in generated_tokens]
+
+    dist.barrier(group=group)
+    decode_time = time.time() - tic
+
+    return (
+        seqlens,
+        responses,
+        sum(seqlens),
+        prefill_time,
+        n_gen_tkns,
+        decode_time,
+    )
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -589,7 +723,7 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tens
 
 
 def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    # assert 0 <= p <= 1
+    assert 0 <= p <= 1
 
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
@@ -607,9 +741,10 @@ def main(
     n_prompts: int = 1,
     batch_size: int = 1,
     max_tokens: int = 128,
+    hide_resp: bool = False,
 ):
-    # assert prompt or (prompt_path and n_prompts and n_prompts > 0)
-    # assert n_prompts % batch_size == 0
+    assert prompt or (prompt_path and n_prompts and n_prompts > 0)
+    assert n_prompts % batch_size == 0
     prompts: list[str] = None
     if prompt:
         prompts = [prompt]
@@ -622,49 +757,105 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
+    group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), gpu)
+    model = Transformer.load(Path(model_path), gpu, group)
 
     # warmup
     generate(
         ["hello, how are you?"],
         tokenizer,
         model,
-        max_tokens=128,
+        group,
+        max_tokens=16,
         max_batch_size=1,
+        # temperature=0,
         eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
     )
 
     torch.cuda.cudart().cudaProfilerStart()
+    prefill_tps = []
+    decode_tps = []
     start = 0
     for end in range(batch_size, n_prompts + 1, batch_size):
         prompt_batch = prompts[start:end]
-        generate(
+        (
+            seqlens,
+            responses,
+            n_p_tkns,
+            prefill_time,
+            n_gen_tkns,
+            decode_time,
+        ) = generate(
             prompt_batch,
             tokenizer,
             model,
+            group,
             max_tokens=max_tokens,
             max_batch_size=len(prompt_batch),
+            # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
         )
 
+        if WORLD_RANK == 0:
+            prefill_tp = n_p_tkns / prefill_time
+            decode_tp = n_gen_tkns / decode_time
+            prefill_tps.append(prefill_tp)
+            decode_tps.append(decode_tp)
+
+            print("=" * 20)
+            print("PERFORMANCE BREAKDOWN\n")
+            print("PROMPT EVALUATION:")
+            print(f"token count: {n_p_tkns}")
+            print(f"total time in sec(s): {prefill_time:.2f}")
+            print(f"throughput: {prefill_tp:.2f} t/s")
+            print("TOKEN GENERATION:")
+            print(f"token count: {n_gen_tkns}")
+            print(f"total time in sec(s): {decode_time:.2f}")
+            if n_gen_tkns > 0:
+                print(f"throughput: {decode_tp:.2f} t/s")
+            else:
+                responses = ["" for _ in prompt_batch]
+            if not hide_resp:
+                print("=" * 20)
+                print("INS-N-OUTS")
+                print(f"AVG seqlen: {mean(seqlens)}")
+                print(f"seqlens: {seqlens}\n")
+                for p, resp in zip(prompt_batch, responses):
+                    print(f"PROMPT:\n{p}")
+                    print(f"RESPONSE:\n{resp}\n")
+
+        start = end
+
+    if WORLD_RANK == 0:
+        print("=" * 20)
+        print("RUN STATISTICS")
+        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
     torch.cuda.cudart().cudaProfilerStop()
-    dist.barrier()
+    dist.barrier(group=group)
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    MODEL_PATH = "/mnt/llm_team/merlin_mixtral_weights/v0"
-    PROMPT_PATH = "/home/muchichen/ntu_paslab_llm/mixtral/prompts/diverse_short.json"
-    N_PROMPTS = 4
-    BATCH_SIZE = 1
-    MAX_TOKENS = 16
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--node-id", type=int) # ignored
+    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompt-path", type=str)
+    parser.add_argument("--n-prompts", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--hide-resp", action="store_true")
+    args = parser.parse_args()
+
     main(
-        model_path=MODEL_PATH,
-        prompt=None,
-        prompt_path=PROMPT_PATH,
-        n_prompts=N_PROMPTS,
-        batch_size=BATCH_SIZE,
-        max_tokens=MAX_TOKENS,
+        args.model_path,
+        args.prompt,
+        args.prompt_path,
+        args.n_prompts,
+        args.batch_size,
+        args.max_tokens,
+        args.hide_resp,
     )
-    # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 synchronization.py
