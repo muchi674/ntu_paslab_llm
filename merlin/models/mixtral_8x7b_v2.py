@@ -345,29 +345,12 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * args.head_dim, args.dim, bias=False)
 
-        # eric891224
-        # timer-based
-        self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # event-based
-        # self.comp_start = torch.cuda.Event(enable_timing=True)
-        # self.comm_start = torch.cuda.Event(enable_timing=True)
-        # self.comm_end = torch.cuda.Event(enable_timing=True)
-        # self.comp_end = torch.cuda.Event(enable_timing=True)
-
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        if cache.prefill:
-            self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-            self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # self.comp_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
-
         seqlen_sum, model_dim = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -408,35 +391,8 @@ class Attention(nn.Module):
             dtype=output.dtype,
             device=output.device,
         )
-
-        # exp. compare v1 v2
-        # dist.barrier(group=self.group)
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        temp_comp = te - ts
-        # self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
-
-        # self.comm_start.record()
-
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
-
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
-        # self.comm_records[f'{WORLD_RANK}'] = ts - te
-        self.comm_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(ts - te)
-
-        # self.comm_end.record()
-        # return torch.sum(local_world_out, dim=0)
-        local_world_out = torch.sum(local_world_out, dim=0)
-
-        # self.comp_end.record()
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        temp_comp += te - ts
-        # self.comp_records[f'{WORLD_RANK}'] += te - ts
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(temp_comp)
-
-        return local_world_out
+        return torch.sum(local_world_out, dim=0)
 
 
 class Experts:
@@ -520,40 +476,10 @@ class TransformerBlock(nn.Module):
             group=moe_group,
         )
 
-        # eric891224
-        self.li = li
-        # timer-based
-        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # event-based
-        # self.atten_start = torch.cuda.Event(enable_timing=True)
-        # self.atten_end = torch.cuda.Event(enable_timing=True)
-
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        if cache.prefill:
-            self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-
-        # self.atten_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
-
-        # torch.cuda.nvtx.range_push("atten")
-
-        x = self.attention_norm(x)
-        torch.cuda.nvtx.range_push("atten")
-        r = self.attention.forward(x, freqs_cis, cache)
-        
-        # r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
-
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
-        te = time.perf_counter()
-        self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
-
-        # self.atten_end.record()
-        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
-        
+        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -773,161 +699,6 @@ def get_node_group(node_id, gpu, global_group):
     ranks_on_node = global_map[global_map[:, 0] == node_id][:, 1]
     return dist.new_group(ranks_on_node.tolist(), use_local_synchronization=True)
 
-def print_stats(
-    bete_p = "N/A",
-    bete_d = "N/A",
-    ete_p = "N/A",
-    ete_d = "N/A",
-    comp_p = "N/A",
-    comp_d = "N/A",
-    comm_p = "N/A",
-    comm_d = "N/A",
-    description = f'Rank {WORLD_RANK}'
-):
-    result = (
-    f"{description}\n"
-    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
-    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
-    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
-    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms\n"
-    )
-    
-    print(result)
-
-def get_atten_timer_stats(model: Transformer):
-    bete_p = 0
-    bete_d = 0
-    ete_p = 0
-    ete_d = 0
-    comp_p = 0
-    comp_d = 0
-    comm_p = 0
-    comm_d = 0
-
-    f_s2ms = 1000
-
-    key_p = f'{WORLD_RANK}_p'
-    key_d = f'{WORLD_RANK}_d'
-
-    for block in model.layers.values():
-        bete_p += mean(block.records[key_p]) * f_s2ms
-        ete_p += (mean(block.attention.comp_records[key_p]) + mean(block.attention.comm_records[key_p])) * f_s2ms
-        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
-        comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
-
-        bete_d += mean(block.records[key_d]) * f_s2ms
-        ete_d += (mean(block.attention.comp_records[key_d]) + mean(block.attention.comm_records[key_d])) * f_s2ms
-        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
-        comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
-    
-    print_stats(
-        bete_p,
-        bete_d,
-        ete_p,
-        ete_d,
-        comp_p,
-        comp_d,
-        comm_p,
-        comm_d,
-    )
-
-def get_node_atten_timer_stats(model: Transformer, group):
-    bete_p = 0
-    bete_d = 0
-    ete_p = 0
-    ete_d = 0
-    comp_p = 0
-    comp_d = 0
-    comm_p = 0
-    comm_d = 0
-
-    f_s2ms = 1000
-    n_layers = 32
-
-    # print(LOCAL_WORLD_SIZE)
-    for block in model.layers.values():
-        # print(len(block.records.keys()), (block.records.keys()))
-        for key, val in block.records.items():
-            if '_p' in key:
-                bete_p += mean(val) * f_s2ms
-            elif '_d' in key:
-                bete_d += mean(val) * f_s2ms
-        for key, val in block.attention.comp_records.items():
-            if '_p' in key:
-                comp_p += mean(val) * f_s2ms
-            elif '_d' in key:
-                comp_d += mean(val) * f_s2ms
-        for key, val in block.attention.comm_records.items():
-            if '_p' in key:
-                comm_p += mean(val) * f_s2ms
-            elif '_d' in key:
-                comm_d += mean(val) * f_s2ms
-
-    ete_p, ete_d = comp_p + comm_p, comp_d + comm_d
-
-    g_bete_p = g_bete_d = g_ete_p = g_ete_d = g_comp_p = g_comp_d = g_comm_p = g_comm_d = [None for _ in range(LOCAL_WORLD_SIZE)]
-
-    # dist.all_gather_object(g_bete_p, [bete_p], group)
-    # dist.all_gather_object(g_bete_d, [bete_p], group)
-    # dist.all_gather_object(g_ete_p, [ete_p], group)
-    # dist.all_gather_object(g_ete_d, [ete_d], group)
-    # dist.all_gather_object(g_comp_p, [comp_p], group)
-    # dist.all_gather_object(g_comp_d, [comp_d], group)
-    # dist.all_gather_object(g_comm_p, [comm_p], group)
-    # dist.all_gather_object(g_comm_d, [comm_d], group)
-
-
-
-    # print_stats(
-    #     bete_p,
-    #     bete_d,
-    #     ete_p,
-    #     ete_d,
-    #     comp_p,
-    #     comp_d,
-    #     comm_p,
-    #     comm_d,
-    #     'Nodes Average'
-    # )
-
-    if LOCAL_RANK == 0:
-        print(type(bete_p))
-        # print_stats(
-        #     g_bete_p,
-        #     g_bete_d,
-        #     g_ete_p,
-        #     g_ete_d,
-        #     g_comp_p,
-        #     g_comp_d,
-        #     g_comm_p,
-        #     g_comm_d,
-        #     'Nodes Average'
-        # )
-
-
-def get_atten_stats(model: Transformer):
-    bete = 0
-    ete = 0
-    comp = 0
-    comm = 0
-    n_layers = 0
-
-    for block in model.layers.values():
-        bete += block.atten_start.elapsed_time(block.atten_end)
-        ete += block.attention.comp_start.elapsed_time(block.attention.comp_end)
-        comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
-        comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
-        comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
-        n_layers += 1
-
-
-    print(f"total end-to-end (transformer block level) time: {bete} ms")
-    print(f"total end-to-end time: {ete} ms")
-    print(f"total computation time: {comp} ms")
-    print(f"total communication time: {comm} ms")
-    print(f"avg end-to-end time: {ete/n_layers} ms")
-    print(f"avg computation time: {comp/n_layers} ms")
-    print(f"avg communication time: {comm/n_layers} ms")
 
 def main(
     model_path: str,
@@ -1037,21 +808,6 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
-
-        # eric891224
-        print("=" * 20)
-        # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
-        # get_atten_stats(model=model)
-
-    dist.barrier(group=node_group)
-    # get stats of each rank
-    get_atten_timer_stats(model=model)
-    # dist.barrier(group=node_group)
-    # # get avg stats of this node
-    # if LOCAL_RANK == 0:
-    # get_node_atten_timer_stats(model=model, group=node_group)
-
-        
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)

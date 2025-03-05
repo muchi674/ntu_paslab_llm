@@ -344,30 +344,12 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
 
-        # eric891224
-        # timer-based
-        self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # event-based
-        # self.comp_start = torch.cuda.Event(enable_timing=True)
-        # self.comm_start = torch.cuda.Event(enable_timing=True)
-        # self.comm_end = torch.cuda.Event(enable_timing=True)
-        # self.comp_end = torch.cuda.Event(enable_timing=True)
-
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        if cache.prefill:
-            self.comp_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-            # self.comm_records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-
-        # self.comp_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
-
         seqlen_sum, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -403,18 +385,7 @@ class Attention(nn.Module):
 
         assert isinstance(output, torch.Tensor)
 
-        # exp. compare v1 v2
-        # dist.barrier()
-
-        # return self.wo(output)  # type: ignore
-        output = self.wo(output)
-    
-        # self.comp_end.record()
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        self.comp_records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
-        return output
-
+        return self.wo(output)  # type: ignore
 
 
 class Experts:
@@ -492,33 +463,10 @@ class TransformerBlock(nn.Module):
             experts=experts,
         )
 
-        # eric891224
-        self.li = li
-        # timer-based
-        self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-        # event-based
-        # self.atten_start = torch.cuda.Event(enable_timing=True)
-        # self.atten_end = torch.cuda.Event(enable_timing=True)
-
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        if cache.prefill:
-            self.records = {f"{WORLD_RANK}_p": [], f"{WORLD_RANK}_d": []}
-
-        # self.atten_start.record()
-        torch.cuda.synchronize()
-        ts = time.perf_counter()
-
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
-
-        torch.cuda.synchronize()
-        te = time.perf_counter()
-        self.records[f'{WORLD_RANK}_{"p" if cache.prefill else "d"}'].append(te - ts)
-
-        # self.atten_end.record()
-        # print(f'Elapsed Time atten{self.li}: {self.atten_end.elapsed_time(self.atten_start)} ms')
-
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
@@ -575,10 +523,7 @@ class Transformer(nn.Module):
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
-        torch.cuda.nvtx.range_push("cache get_input_metadata")
         input_metadata = cache.get_input_metadata(seqlens)
-        torch.cuda.nvtx.range_pop()
-
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
@@ -627,8 +572,6 @@ def generate(
     model = model.eval()
     tic = time.time()
 
-    torch.cuda.nvtx.range_push("tokenization")
-
     encoded_prompts: List[List[int]] = [
         tokenizer.encode_chat_completion(
             ChatCompletionRequest(messages=[UserMessage(content=p)])
@@ -637,9 +580,6 @@ def generate(
     ]
     B, V = len(encoded_prompts), model.args.vocab_size
     seqlens = [len(x) for x in encoded_prompts]
-
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("create kv cache")
 
     # Cache
     cache_window = max(seqlens) + max_tokens
@@ -653,9 +593,6 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("prefill")
-
     # prefill / prompt evaluation stage
     prelogits = model.forward(
         torch.tensor(sum(encoded_prompts, []), device=model.device, dtype=torch.long),
@@ -665,14 +602,9 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
-    # dist.barrier(group=group)
-
-    torch.cuda.nvtx.range_pop()
-
+    dist.barrier()
     prefill_time = time.time() - tic
     tic = time.time()
-
-    torch.cuda.nvtx.range_push("decode")
 
     # decode
     generated_tensors = []
@@ -698,10 +630,7 @@ def generate(
         generated_tokens = []
     responses = [tokenizer.decode(y) for y in generated_tokens]
 
-    # dist.barrier(group=group)
-
-    torch.cuda.nvtx.range_pop()
-
+    dist.barrier()
     decode_time = time.time() - tic
 
     return (
@@ -735,85 +664,6 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.multinomial(probs_sort, num_samples=1)
     return torch.gather(probs_idx, -1, next_token)
 
-def print_stats(
-    bete_p = "N/A",
-    bete_d = "N/A",
-    ete_p = "N/A",
-    ete_d = "N/A",
-    comp_p = "N/A",
-    comp_d = "N/A",
-    comm_p = "N/A",
-    comm_d = "N/A"
-):
-    result = (
-    f"Rank {WORLD_RANK}\n"
-    + f"total end-to-end (transformer block level) time:\n\tprefill: {bete_p} ms\t decode: {bete_d} ms\n"
-    + f"total end-to-end time:\n\tprefill: {ete_p} ms\t decode: {ete_d} ms\n"
-    + f"total computation time:\n\tprefill: {comp_p} ms\t decode: {comp_d} ms\n"
-    + f"total communication time:\n\tprefill: {comm_p} ms\t decode: {comm_d} ms\n"
-    )
-    
-    print(result)
-
-def get_atten_timer_stats(model: Transformer):
-    bete_p = 0
-    bete_d = 0
-    ete_p = 0
-    ete_d = 0
-    comp_p = 0
-    comp_d = 0
-    comm_p = 0
-    comm_d = 0
-
-    f_s2ms = 1000
-
-    key_p = f'{WORLD_RANK}_p'
-    key_d = f'{WORLD_RANK}_d'
-
-    for block in model.layers.values():
-        bete_p += mean(block.records[key_p]) * f_s2ms
-        ete_p += (mean(block.attention.comp_records[key_p])) * f_s2ms
-        comp_p += mean(block.attention.comp_records[key_p]) * f_s2ms
-        # comm_p += mean(block.attention.comm_records[key_p]) * f_s2ms
-
-        bete_d += mean(block.records[key_d]) * f_s2ms
-        ete_d += (mean(block.attention.comp_records[key_d])) * f_s2ms
-        comp_d += mean(block.attention.comp_records[key_d]) * f_s2ms
-        # comm_d += mean(block.attention.comm_records[key_d]) * f_s2ms
-    
-    print_stats(
-        bete_p,
-        bete_d,
-        ete_p,
-        ete_d,
-        comp_p,
-        comp_d,
-        comm_p,
-        comm_d
-    )
-
-
-def get_atten_stats(model: Transformer):
-    ete = 0
-    comp = 0
-    comm = 0
-    n_layers = 0
-
-    for block in model.layers.values():
-        # ete += block.atten_start.elapsed_time(block.atten_end)
-        ete += block.atten_start.elapsed_time(block.atten_end)
-        comp += block.attention.comp_start.elapsed_time(block.attention.comp_end)
-        # comp += block.attention.comp_start.elapsed_time(block.attention.comm_start)
-        # comm += block.attention.comm_start.elapsed_time(block.attention.comm_end)
-        # comp += block.attention.comm_end.elapsed_time(block.attention.comp_end)
-        n_layers += 1
-
-    print(f"total end-to-end (transformer block level) time: {ete} ms")
-    print(f"total computation time: {comp} ms")
-    print(f"total communication time: {comm} ms")
-    print(f"avg end-to-end time: {ete/n_layers} ms")
-    print(f"avg computation time: {comp/n_layers} ms")
-    print(f"avg communication time: {comm/n_layers} ms")
 
 def main(
     model_path: str,
@@ -912,16 +762,9 @@ def main(
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
 
-        # eric891224
-        # print("=" * 20)
-        # print(f"RUN STATISTICS - ATTENTION MODULE - node {node_id}")
-        # get_atten_stats(model=model)
-
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
     dist.destroy_process_group()
-
-    get_atten_timer_stats(model=model)
 
 
 if __name__ == "__main__":
