@@ -138,10 +138,10 @@ class EventTimer:
         min_d = torch.amin(self.out_d, dim=0)
         self.out_d = max_d - min_d
 
-        print(self.out_p, self.out_d, self.out_d.dtype)
-        print("average sync latency per batch")
+        # print(self.out_p, self.out_d, self.out_d.dtype)
+        print("average bubble-caused sync latency (ms) per batch")
         print(self.out_d.mean(dim=1, keepdim=True))
-        print(f"average sync latency for #batches = {self.out_d.shape[0]}")
+        print(f"average bubble-caused sync latency (ms) for #batches = {self.out_d.shape[0]}")
         print(self.out_d.mean(dim=1).mean())
 
 timer = EventTimer()
