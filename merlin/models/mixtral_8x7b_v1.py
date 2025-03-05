@@ -8,7 +8,6 @@ import inspect
 import json
 import os
 import time
-import cupy
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
