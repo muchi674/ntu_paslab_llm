@@ -444,8 +444,7 @@ class MoeLayer(nn.Module):
         gate_logits = self.gate(inputs)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        with nvtx.annotate("infer range", color="red"):
-            y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
         return y
     
@@ -466,41 +465,45 @@ class MoeLayer(nn.Module):
         # bidx = ps[self.expert_end_idx - 1]
         
         # prefix sum numpy version
-        cnts = cnts.cpu().numpy()
-        for i in (1, cnts.shape[0] - 1):
-            cnts[i] += cnts[i - 1]
-        fidx = cnts[numpy.clip(self.expert_start_idx - 1, a_min=0, a_max=None)]
-        bidx = cnts[self.expert_end_idx - 1]
         
-        # # get ep token range
-        # fidx = cnts[: self.expert_start_idx].sum().item()
-        # bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
-        # get token position
-        idxs = topk_ids.view(-1).argsort()
-        token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
-        sorted_tokens = x[token_idxs]
+        with nvtx.annotate("preprocess", color="green"):
+            cnts = cnts.cpu().numpy()
+            for i in (1, cnts.shape[0] - 1):
+                cnts[i] += cnts[i - 1]
+            fidx = cnts[numpy.clip(self.expert_start_idx - 1, a_min=0, a_max=None)]
+            bidx = cnts[self.expert_end_idx - 1]
+            
+            # # get ep token range
+            # fidx = cnts[: self.expert_start_idx].sum().item()
+            # bidx = fidx + cnts[self.expert_start_idx : self.expert_end_idx].sum().item()
+            # get token position
+            idxs = topk_ids.view(-1).argsort()
+            token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
+            sorted_tokens = x[token_idxs]
 
         outputs = []
         start_idx = 0
         # only do deployed expert -> no redundent
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0: 
-                continue
-            end_idx = start_idx + num_tokens
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = self.experts.forward(self.li, i + self.expert_start_idx, tokens_for_this_expert)
-            outputs.append(expert_out)
-            start_idx = end_idx
+        with nvtx.annotate("infer range", color="blue"):
+            for i, num_tokens in enumerate(tokens_per_expert):
+                if num_tokens == 0: 
+                    continue
+                end_idx = start_idx + num_tokens
+                tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+                expert_out = self.experts.forward(self.li, i + self.expert_start_idx, tokens_for_this_expert)
+                outputs.append(expert_out)
+                start_idx = end_idx
 
-        if len(outputs):
-            outs = torch.cat(outputs, dim=0)
-            new_x = torch.zeros_like(x)
-            outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
-            return new_x.scatter_reduce_(
-                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
-            )
-        else:
-            return torch.zeros_like(x)
+        with nvtx.annotate("cal", color="purple"):
+            if len(outputs):
+                outs = torch.cat(outputs, dim=0)
+                new_x = torch.zeros_like(x)
+                outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
+                return new_x.scatter_reduce_(
+                    0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+                )
+            else:
+                return torch.zeros_like(x)
   
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
