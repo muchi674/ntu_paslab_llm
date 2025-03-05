@@ -8,6 +8,8 @@ import inspect
 import json
 import os
 import time
+import nvtx
+import numpy
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -403,39 +405,70 @@ class Experts:
 
 
 class MoeLayer(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, gate: nn.Module, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.expert_start_idx=expert_start_idx
+        self.expert_end_idx=expert_end_idx
 
+    
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        orig_shape = inputs.shape
         gate_logits = self.gate(inputs)
-        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
+        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
+        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
+    
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+        cnts = cnts.scatter_(1, topk_ids, 1).sum(dim=0)
+        cnts = cnts.cpu().numpy()
+        tokens_per_expert = (
+            cnts[self.expert_start_idx : self.expert_end_idx]
+        )
+        # for fidx
+        cnts = numpy.insert(cnts, 0, 0)
+        
+        # prefix sum numpy version
+        for i in (1, cnts.shape[0] - 1):
+            cnts[i] += cnts[i - 1]
+        fidx = cnts[self.expert_start_idx]
+        bidx = cnts[self.expert_end_idx]
+        
+        # get token position
+        idxs = topk_ids.view(-1).argsort()
+        token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
+        sorted_tokens = x[token_idxs]
 
-        selected_experts = selected_experts.to("cpu")
-        eis, bis, nes = [], [], []
-        for ei in range(self.num_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == ei)
-            if torch.numel(batch_idx) > 0:
-                eis.append(ei)
-                bis.append(batch_idx.to(device=inputs.device))
-                nes.append(nth_expert.to(device=inputs.device))
-
-        for ei, batch_idx, nth_expert in zip(eis, bis, nes):
-            ey = self.experts.forward(self.li, ei, inputs[batch_idx])
-            if ey is None:
+        outputs = []
+        start_idx = 0
+        # only do deployed expert -> no redundent
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0: 
                 continue
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+            end_idx = start_idx + num_tokens
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = self.experts.forward(self.li, i + self.expert_start_idx, tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
 
-        dist.all_reduce(results, op=dist.ReduceOp.SUM)
-        return results
-
-
+        if len(outputs):
+            outs = torch.cat(outputs, dim=0)
+            new_x = torch.zeros_like(x)
+            outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
+            return new_x.scatter_reduce_(
+                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+            )
+        else:
+            return torch.zeros_like(x)
+  
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -451,7 +484,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.attention = Attention(args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -461,6 +494,8 @@ class TransformerBlock(nn.Module):
             li=li,
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
+            expert_start_idx=expert_start_idx,
+            expert_end_idx=expert_end_idx,
         )
 
     def forward(
@@ -474,7 +509,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts):
+    def __init__(self, args: ModelArgs, experts: Experts, expert_start_idx: int, expert_end_idx: int):
         super().__init__()
         self.args = args
         self._precomputed_freqs_cis: torch.Tensor = None
@@ -483,10 +518,12 @@ class Transformer(nn.Module):
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(args=args, li=li, experts=experts)
+                str(li): TransformerBlock(args=args, li=li, experts=experts, expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
                 for li in range(args.n_layers)
             }
         )
+        # self.expert_start_idx = 0
+        # self.expert_end_idx = 0
 
     @property
     def dtype(self) -> torch.dtype:
@@ -550,9 +587,18 @@ class Transformer(nn.Module):
             weights_only=True,
             mmap=True,
         )
-
+        
+        # expert setup
+        ep_tag = int(list(experts.keys())[0][2])
+        if ep_tag:
+            expert_start_idx = ep_tag
+            expert_end_idx = ep_tag + 5
+        else:
+            expert_start_idx = ep_tag
+            expert_end_idx = ep_tag + 3
+        
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts))
+            model = Transformer(args=model_args, experts=Experts(experts), expert_start_idx=expert_start_idx, expert_end_idx=expert_end_idx)
         model.load_state_dict(non_experts, assign=True, strict=True)
 
         return model
