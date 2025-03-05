@@ -645,7 +645,8 @@ def generate(
         assert last_token_prelogits.shape == (B, V)
 
         timer.record_elapsed_time()
-        timer.flush_buffer(isPrefill=False)
+        
+    timer.flush_buffer(isPrefill=False)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
