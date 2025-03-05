@@ -30,8 +30,8 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-from .event_timer import CrossNodeEventTimer
-from .profiler_utils import profile_range
+from event_timer import CrossNodeEventTimer
+from profiler_utils import profile_range
 
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
