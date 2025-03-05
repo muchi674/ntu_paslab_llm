@@ -452,10 +452,12 @@ class MoeLayer(nn.Module):
     def moe_infer(self, x, topk_ids, topk_weight):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
         cnts = cnts.scatter_(1, topk_ids, 1).sum(dim=0)
+        cnts = cnts.cpu().numpy()
         tokens_per_expert = (
-            cnts[self.expert_start_idx : self.expert_end_idx].cpu().numpy()
+            cnts[self.expert_start_idx : self.expert_end_idx]
         )
-        
+        # for fidx
+        cnts = numpy.insert(cnts, 0, 0)
         # # prefix sum cupy version
         # ps = cupy.cumsum(cnts.cnumpy())
         # if self.expert_start_idx == 0:
@@ -467,11 +469,10 @@ class MoeLayer(nn.Module):
         # prefix sum numpy version
         
         with nvtx.annotate("preprocess", color="green"):
-            cnts = cnts.cpu().numpy()
             for i in (1, cnts.shape[0] - 1):
                 cnts[i] += cnts[i - 1]
-            fidx = cnts[numpy.clip(self.expert_start_idx - 1, a_min=0, a_max=None)]
-            bidx = cnts[self.expert_end_idx - 1]
+            fidx = cnts[self.expert_start_idx]
+            bidx = cnts[self.expert_end_idx]
             
             # # get ep token range
             # fidx = cnts[: self.expert_start_idx].sum().item()
