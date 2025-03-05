@@ -443,7 +443,7 @@ class MoeLayer(nn.Module):
         gate_logits = self.gate(inputs)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        with nvtx.annotation("infer range", color="red"):
+        with nvtx.annotate("infer range", color="red"):
             y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
         return y
