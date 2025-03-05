@@ -139,8 +139,10 @@ class EventTimer:
         self.out_d = max_d - min_d
 
         print(self.out_p, self.out_d, self.out_d.dtype)
-        print("average sync latency")
+        print("average sync latency per batch")
         print(self.out_d.mean(dim=1, keepdim=True))
+        print(f"average sync latency for #batches = {self.out_d.shape[0]}")
+        print(self.out_d.mean(dim=1).mean())
 
 timer = EventTimer()
 
