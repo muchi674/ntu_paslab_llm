@@ -644,8 +644,8 @@ def generate(
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
 
-    timer.record_elapsed_time()
-    timer.flush_buffer(isPrefill=False)
+        timer.record_elapsed_time()
+        timer.flush_buffer(isPrefill=False)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
