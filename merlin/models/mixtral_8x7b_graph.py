@@ -16,9 +16,11 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
-LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+GROUP_RANK = int(os.environ["GROUP_RANK"])
 WORLD_RANK = int(os.environ["RANK"])
 
 DEFAULT_SEED = 7
@@ -373,23 +375,57 @@ class Transformer(nn.Module):
 class Mixtral8x7B:
 
     @staticmethod
-    def build(model_path: str, device: torch.device) -> "Mixtral8x7B":
-        torch.manual_seed(DEFAULT_SEED)
-
+    def build(model_path: str, node_id: int, device: torch.device) -> "Mixtral8x7B":
         model_path = Path(model_path)
+        non_experts_filename = "non-experts.pt"
+        if not (model_path / non_experts_filename).is_file():
+            non_experts_filename = f"non-experts-{node_id}-{LOCAL_RANK}.pt"
+        experts_filename = f"experts-{WORLD_RANK}.pt"
+        if not (model_path / experts_filename).is_file():
+            experts_filename = f"experts-{node_id}-{LOCAL_RANK}.pt"
+
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
-            model_path / "non-experts.pt",
+            model_path / non_experts_filename,
             map_location=device,
             weights_only=True,
             mmap=True,
         )
         experts = torch.load(
-            model_path / f"experts-{WORLD_RANK}.pt",
+            model_path / experts_filename,
             map_location=device,
             weights_only=True,
             mmap=True,
         )
+
+        intra_node_parallel = False
+        # adjust for tensor parallel attention
+        # WARNING: assumes that attention is intra-node parallel
+        if non_experts_filename != "non-experts.pt":
+            assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
+            assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
+            model_args.n_heads //= LOCAL_WORLD_SIZE
+            model_args.n_kv_heads //= LOCAL_WORLD_SIZE
+            model_args.attn_tp = True
+            intra_node_parallel = True
+
+        # TODO: add logic for PP intra-node experts' parallelism
+
+        if intra_node_parallel:
+            global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
+            local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=device)
+            dist.all_gather_into_tensor(global_map, local_map)
+            first_node = torch.min(global_map[:, 0]).item()
+            last_node = torch.max(global_map[:, 0]).item()
+            local_group = None
+
+            for ni in range(first_node, last_node + 1):
+                ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
+                node_group = dist.new_group(
+                    ranks_on_node, backend="nccl", use_local_synchronization=True
+                )
+                if node_id == ni:
+                    local_group = node_group
 
         with torch.device("meta"):
             model = Transformer(args=model_args, experts=Experts(experts))
@@ -574,6 +610,7 @@ class Mixtral8x7B:
 
 def main(
     model_path: str,
+    node_id: int,
     prompt: str,
     prompt_path: str,
     n_prompts: int = 1,
@@ -656,7 +693,7 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
-    parser.add_argument("--node-id", type=int)  # ignored
+    parser.add_argument("--node-id", type=int)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-path", type=str)
     parser.add_argument("--n-prompts", type=int, default=1)
@@ -665,8 +702,10 @@ if __name__ == "__main__":
     parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
+    torch.manual_seed(DEFAULT_SEED)
     main(
         args.model_path,
+        args.node_id or GROUP_RANK,
         args.prompt,
         args.prompt_path,
         args.n_prompts,
