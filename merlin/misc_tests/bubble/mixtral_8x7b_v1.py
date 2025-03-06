@@ -450,9 +450,9 @@ class MoeLayer(nn.Module):
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
 
         timer.record_end()
-        timer.acc_elapsed_time()
-
         dist.all_reduce(results, op=dist.ReduceOp.SUM)
+
+        timer.acc_elapsed_time()
         return results
 
 
