@@ -18,10 +18,12 @@ class CrossNodeEventTimer:
 
         self.device = torch.device(f"cuda:{local_rank}")
 
-    def record_start(self, device: torch.device):
+    def record_start(self, device: torch.device = None):
+        device = self.device if device == None else device
         self.start_event.record(torch.cuda.current_stream(device))
     
-    def record_end(self, device: torch.device):
+    def record_end(self, device: torch.device = None):
+        device = self.device if device == None else device
         self.end_event.record(torch.cuda.current_stream(device))
         torch.cuda.synchronize(device)
 

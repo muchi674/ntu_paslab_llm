@@ -397,8 +397,8 @@ class Attention(nn.Module):
         # return self.wo(output)  # type: ignore
         output = self.wo(output)
     
-        timer.record_end(x.device)
-        timer.acc_elapsed_time()
+        # timer.record_end(x.device)
+        # timer.acc_elapsed_time()
         # timer.record_elapsed_time()
 
         return output
@@ -448,6 +448,9 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
+
+        timer.record_end()
+        timer.acc_elapsed_time()
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM)
         return results
