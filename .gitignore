@@ -1,3 +1,4 @@
 *.nsys-rep
 MMLU*
 **/figs/*
+__pycache__
