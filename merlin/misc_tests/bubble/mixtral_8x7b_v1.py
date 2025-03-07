@@ -452,7 +452,7 @@ class MoeLayer(nn.Module):
         timer.record_end()
         dist.all_reduce(results, op=dist.ReduceOp.SUM)
 
-        timer.acc_elapsed_time(need_synchronize=False)
+        timer.acc_elapsed_time()
         return results
 
 

@@ -402,7 +402,7 @@ class Attention(nn.Module):
 
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
 
-        timer.acc_elapsed_time(need_synchronize=False)
+        timer.acc_elapsed_time()
         timer.record_start(x.device)
 
         return torch.sum(local_world_out, dim=0)
@@ -459,7 +459,7 @@ class MoeLayer(nn.Module):
 
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
 
-        timer.acc_elapsed_time(need_synchronize=False)
+        timer.acc_elapsed_time()
         return results
 
 
