@@ -451,7 +451,7 @@ class Mixtral8x7B:
                     local_group = node_group
 
         with torch.device("meta"):
-            model = Transformer(model_args, experts, local_group)
+            model = Transformer(model_args, Experts(experts), local_group)
         model.load_state_dict(non_experts, assign=True, strict=True)
         tokenizer = MistralTokenizer.v1()
 
