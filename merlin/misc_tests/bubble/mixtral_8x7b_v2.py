@@ -287,37 +287,38 @@ class BufferCache:
         assert len(seqlens) == len(
             self.kv_seqlens
         ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
-        seqpos = self.kv_seqlens.tolist()
+        seqpos = self.kv_seqlens.tolist() # DtoH
 
         assert len(seqlens) > 0, seqlens
-        cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long)
+        cached_elements = torch.tensor(seqlens, device=self.device, dtype=torch.long) # HtoD
 
         positions = torch.cat(
             [torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]
-        ).to(device=self.device, dtype=torch.long)
+        ).to(device=self.device, dtype=torch.long) # HtoD
         batch_idx = torch.tensor(
             sum([[i] * seqlen for i, seqlen in enumerate(seqlens)], []),
             device=self.device,
             dtype=torch.long,
-        )
-        cache_positions = positions + batch_idx * self.max_seq_len
+        ) # HtoD
+        cache_positions = positions + batch_idx * self.max_seq_len # vectorized_elementwise_kernel * 2
 
         during_prefill = seqpos[0] == 0
         if during_prefill:
             assert all([pos == 0 for pos in seqpos]), seqpos
             mask = (
-                BlockDiagonalCausalMask.from_seqlens(seqlens)
+                BlockDiagonalCausalMask.from_seqlens(seqlens, device=self.device)
                 .make_local_attention(self.max_seq_len)
-                .to(self.device)
+                # .to(self.device)
             )
         else:
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=self.max_seq_len,
-                kv_seqlen=(self.kv_seqlens + cached_elements)
-                .clamp(max=self.max_seq_len)
+                kv_seqlen=(self.kv_seqlens + cached_elements) # vectorized_elementwise_kernel
+                .clamp(max=self.max_seq_len) # vectorized_elementwise_kernel
                 .tolist(),
-            ).to(self.device)
+                device=self.device
+            )#.to(self.device)
 
         return CacheInputMetadata(
             positions=positions,
