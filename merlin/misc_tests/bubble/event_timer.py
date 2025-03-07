@@ -27,9 +27,11 @@ class CrossNodeEventTimer:
         self.end_event.record(torch.cuda.current_stream(device))
         # torch.cuda.synchronize(device)
 
-    def acc_elapsed_time(self) -> float:
+    def acc_elapsed_time(self, need_synchronize=True) -> float:
         '''return accumulated elapsed time'''
-        torch.cuda.synchronize(self.device)
+        if need_synchronize: 
+            torch.cuda.synchronize(self.device)
+            
         duration = self.start_event.elapsed_time(self.end_event)
         self.temp += duration
 

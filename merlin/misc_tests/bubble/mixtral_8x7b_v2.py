@@ -27,12 +27,16 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+from event_timer import CrossNodeEventTimer
+from profiler_utils import profile_range
+
 LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
+timer = CrossNodeEventTimer(local_rank=LOCAL_RANK, world_size=WORLD_SIZE, world_rank=WORLD_RANK)
 
 def precompute_freqs_cis(dim: int, end: int, theta: float) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -351,6 +355,8 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
+        timer.record_start(x.device)
+
         seqlen_sum, model_dim = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -391,7 +397,14 @@ class Attention(nn.Module):
             dtype=output.dtype,
             device=output.device,
         )
+
+        timer.record_end(x.device)
+
         dist.all_gather_into_tensor(local_world_out, output, group=self.group)
+
+        timer.acc_elapsed_time(need_synchronize=False)
+        timer.record_start(x.device)
+
         return torch.sum(local_world_out, dim=0)
 
 
@@ -441,8 +454,12 @@ class MoeLayer(nn.Module):
             if ey is None:
                 continue
             results[batch_idx] += weights[batch_idx, nth_expert, None] * ey
-            
+
+        timer.record_end()
+
         dist.all_reduce(results, op=dist.ReduceOp.SUM, group=self.group)
+
+        timer.acc_elapsed_time(need_synchronize=False)
         return results
 
 
@@ -629,6 +646,9 @@ def generate(
     last_positions = torch.tensor(seqlens, device=prelogits.device).cumsum(dim=0) - 1
     last_token_prelogits = prelogits.index_select(0, last_positions)
 
+    timer.record_elapsed_time()
+    timer.flush_buffer(isPrefill=True)
+
     dist.barrier(group=global_group)
     prefill_time = time.time() - tic
     tic = time.time()
@@ -647,6 +667,10 @@ def generate(
         generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
+
+        timer.record_elapsed_time()
+        
+    timer.flush_buffer(isPrefill=False)
 
     generated_tokens: List[List[int]]
     n_gen_tkns = 0
@@ -750,6 +774,7 @@ def main(
     )
 
     torch.cuda.cudart().cudaProfilerStart()
+    timer.reset()
     prefill_tps = []
     decode_tps = []
     start = 0
@@ -803,11 +828,15 @@ def main(
 
         start = end
 
+    timer.all_gather(n_prompts//batch_size, max_tokens, None)
+
     if WORLD_RANK == 0:
         print("=" * 20)
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+
+        timer.get_sync_latency()
 
     torch.cuda.cudart().cudaProfilerStop()
     dist.barrier(group=global_group)
