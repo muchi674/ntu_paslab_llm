@@ -8,7 +8,6 @@ import inspect
 import json
 import os
 import time
-import nvtx
 import numpy
 from dataclasses import dataclass
 from pathlib import Path

@@ -16,8 +16,8 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-LOCAL_WORLD_SIZE = torch.cuda.device_count()
 # Environment variables set by torch.distributed.launch
+LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 GROUP_RANK = int(os.environ["GROUP_RANK"])
@@ -85,6 +85,7 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
+    attn_tp: bool = False
 
     @classmethod
     def from_hf_config(cls, params: dict):
@@ -188,7 +189,7 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-    def router(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def gate_infer(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -243,8 +244,9 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts):
+    def __init__(self, args: ModelArgs, li: int, experts: Experts, local_group):
         super().__init__()
+        self.local_group = local_group
         self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -257,16 +259,29 @@ class TransformerBlock(nn.Module):
         self.prefill_graphed_half = None
         self.decode_graphed_half = None
 
+    def get_routings(self, x: torch.Tensor, r: torch.Tensor):
+        h = x + r  # (batch_size, seq_len, model_dim)
+        r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
+        topk_idx, topk_weight = self.feed_forward.gate_infer(r)
+        return h, r, topk_idx, topk_weight
+
     def run_graphable_half(
         self,
         x: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         r = self.attention(self.attention_norm(x), storage_idx)
-        h = x + r  # (batch_size, seq_len, model_dim)
-        r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_idx, topk_weight = self.feed_forward.router(r)
-        return h, r, topk_idx, topk_weight
+        return self.get_routings(x, r)
+
+    def run_graphable_parallel_half(
+        self,
+        x: torch.Tensor,
+        storage_idx: torch.Tensor,
+    ):
+        r = self.attention(self.attention_norm(x), storage_idx)
+        # WARNING: assumes attention is intra-node TP
+        dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
+        return self.get_routings(x, r)
 
     def forward(
         self,
@@ -285,7 +300,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts):
+    def __init__(self, args: ModelArgs, experts: Experts, local_group):
         super().__init__()
         self.args: ModelArgs = args
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
@@ -293,7 +308,7 @@ class Transformer(nn.Module):
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
-                str(li): TransformerBlock(args, li, experts)
+                str(li): TransformerBlock(args, li, experts, local_group)
                 for li in range(args.n_layers)
             }
         )
@@ -337,17 +352,25 @@ class Transformer(nn.Module):
             args = []
             # must be in the same order as the graphs are replayed
             for li in range(self.args.n_layers):
-                callables.append(self.layers[str(li)].run_graphable_half)
+                callables.append(
+                    self.layers[str(li)].run_graphable_parallel_half
+                    if self.args.attn_tp
+                    else self.layers[str(li)].run_graphable_half
+                )
                 args.append((prefill_x, prefill_storage_x))
 
             for li in range(self.args.n_layers):
-                callables.append(self.layers[str(li)].run_graphable_half)
+                callables.append(
+                    self.layers[str(li)].run_graphable_parallel_half
+                    if self.args.attn_tp
+                    else self.layers[str(li)].run_graphable_half
+                )
                 args.append((decode_x, decode_storage_x))
 
             graphed_callables = torch.cuda.make_graphed_callables(
                 tuple(callables),
                 tuple(args),
-                num_warmup_iters=128,
+                num_warmup_iters=16,
             )
             for gi, graphed in enumerate(graphed_callables):
                 li = gi % self.args.n_layers
@@ -411,24 +434,24 @@ class Mixtral8x7B:
 
         # TODO: add logic for PP intra-node experts' parallelism
 
+        local_group = None
         if intra_node_parallel:
             global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
-            local_map = torch.tensor([node_id, WORLD_RANK], dtype=torch.int64, device=device)
+            local_map = torch.tensor(
+                [node_id, WORLD_RANK], dtype=torch.int64, device=device
+            )
             dist.all_gather_into_tensor(global_map, local_map)
             first_node = torch.min(global_map[:, 0]).item()
             last_node = torch.max(global_map[:, 0]).item()
-            local_group = None
 
             for ni in range(first_node, last_node + 1):
                 ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
-                node_group = dist.new_group(
-                    ranks_on_node, backend="nccl", use_local_synchronization=True
-                )
+                node_group = dist.new_group(ranks_on_node, backend="nccl")
                 if node_id == ni:
                     local_group = node_group
 
         with torch.device("meta"):
-            model = Transformer(args=model_args, experts=Experts(experts))
+            model = Transformer(model_args, experts, local_group)
         model.load_state_dict(non_experts, assign=True, strict=True)
         tokenizer = MistralTokenizer.v1()
 
@@ -511,15 +534,13 @@ class Mixtral8x7B:
         dist.barrier()
 
         # warmup
-        storage_idx = torch.arange(min_p_len, dtype=torch.long, device=device)
         model.forward(
-            torch.ones((bsz, min_p_len), dtype=torch.long, device=device), storage_idx
-        )
-        storage_idx = torch.arange(
-            min_p_len, min_p_len + 1, dtype=torch.long, device=device
+            torch.ones((bsz, min_p_len), dtype=torch.long, device=device),
+            torch.arange(min_p_len, dtype=torch.long, device=device),
         )
         model.forward(
-            torch.ones((bsz, 1), dtype=torch.long, device=device), storage_idx
+            torch.ones((bsz, 1), dtype=torch.long, device=device),
+            torch.arange(min_p_len, min_p_len + 1, dtype=torch.long, device=device),
         )
         self.clear_cache(cache)
 
@@ -632,7 +653,7 @@ def main(
     dist.init_process_group(
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
-    model = Mixtral8x7B.build(model_path, gpu)
+    model = Mixtral8x7B.build(model_path, node_id, gpu)
 
     prefill_tps = []
     decode_tps = []
