@@ -1,0 +1,13 @@
+{
+    "experts_tp_size": 6,
+    "nodes": [
+        {
+            "node_id": 0,
+            "attn_tp_size": 2
+        },
+        {
+            "node_id": 1,
+            "attn_tp_size": 4
+        }
+    ]
+}
