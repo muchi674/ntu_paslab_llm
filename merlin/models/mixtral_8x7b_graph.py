@@ -164,7 +164,7 @@ class Attention(nn.Module):
             dropout_p=0.0,
             is_causal=False,
         )
-        output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, self.args.dim)
+        output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
         return self.wo(output)
 
 
@@ -424,7 +424,11 @@ class Mixtral8x7B:
         intra_node_parallel = False
         # adjust for tensor parallel attention
         # WARNING: assumes that attention is intra-node parallel
-        if non_experts_filename != "non-experts.pt":
+        # TODO: adjust for pipeline parallelism
+        if (
+            non_experts[f"layers.0.attention.wq.weight"].shape[0]
+            < model_args.n_heads * model_args.head_dim
+        ):
             assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
             assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
             model_args.n_heads //= LOCAL_WORLD_SIZE
