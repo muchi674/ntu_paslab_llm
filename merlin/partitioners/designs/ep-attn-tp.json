@@ -1,5 +1,5 @@
 {
-    "design": [
+    "nodes": [
         {
             "node_id": 0,
             "n_experts": 2,

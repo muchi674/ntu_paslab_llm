@@ -1,5 +1,5 @@
 {
-    "experts_tp_size": 6,
+    "glob_experts_tp_size": 6,
     "nodes": [
         {
             "node_id": 0,

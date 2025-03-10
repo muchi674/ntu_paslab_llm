@@ -28,6 +28,20 @@ class Partitioner:
         )
 
     def get_configs(self) -> tuple[dict, dict]:
+
+        def get_devices(parallel_size: int, node_id: int):
+            if parallel_size is None:
+                return []
+
+            devices = []
+            for di in range(parallel_size):
+                if node_id is None:
+                    name = str(di)
+                else:
+                    name = f"{node_id}-{di}"
+                devices.append(name)
+            return devices
+
         with open(self.model_path / "config.json", "r") as model_config_file:
             model_config = json.load(model_config_file)
         with open(self.design_path, "r") as design_file:
@@ -37,9 +51,18 @@ class Partitioner:
         attn_tp_map = {}
         non_expert_pp_map = {}
         next_layer, next_expert = 0, 0
+        glob_experts_tp_size = design.get("glob_experts_tp_size", None)
 
-        for d in design["design"]:
-            node_id, n_layers, n_experts, pp_size, ep_size, tp_size = [
+        for d in design.get("nodes", [{}]):
+            (
+                node_id,
+                n_layers,
+                n_experts,
+                pp_size,
+                ep_size,
+                experts_tp_size,
+                attn_tp_size,
+            ) = [
                 d.get(k)
                 for k in [
                     "node_id",
@@ -47,31 +70,26 @@ class Partitioner:
                     "n_experts",
                     "pp_size",
                     "ep_size",
-                    "tp_size",
+                    "experts_tp_size",
+                    "attn_tp_size",
                 ]
             ]
 
-            if len(design["design"]) > 1:
-                assert node_id is not None
-            assert n_layers is None or n_layers > 0
-            assert n_experts is None or n_experts > 0
-
-            # ceil division
+            devices = get_devices(
+                glob_experts_tp_size or experts_tp_size or ep_size or pp_size,
+                None if glob_experts_tp_size else node_id,
+            )
+            attn_devices = get_devices(attn_tp_size, node_id)
             pp_bin_size = ceildiv(
                 n_layers or model_config["num_hidden_layers"], pp_size or 1
             )
             ep_bin_size = ceildiv(
                 n_experts or model_config["num_local_experts"], ep_size or 1
             )
-            ffn_step = ceildiv(model_config["intermediate_size"], tp_size or 1)
-            partitions = []
-            for pi in range(pp_size or ep_size or tp_size):
-                if node_id is None:
-                    name = str(pi)
-                else:
-                    name = f"{node_id}-{pi}"
-                partitions.append(name)
-
+            ffn_step = ceildiv(
+                model_config["intermediate_size"],
+                glob_experts_tp_size or experts_tp_size or 1,
+            )
             for li in range(
                 next_layer,
                 (
@@ -80,9 +98,9 @@ class Partitioner:
                     else model_config["num_hidden_layers"]
                 ),
             ):
-                pis = partitions
+                dis = devices
                 if pp_size is not None:
-                    pis = [partitions[(li - next_layer) // pp_bin_size]]
+                    dis = [devices[(li - next_layer) // pp_bin_size]]
                 for ei in range(
                     next_expert,
                     (
@@ -92,16 +110,15 @@ class Partitioner:
                     ),
                 ):
                     if ep_size is not None:
-                        pis = [partitions[(ei - next_expert) // ep_bin_size]]
-                    expert_map[f"{li}-{ei}"] = (ffn_step, pis)
+                        dis = [devices[(ei - next_expert) // ep_bin_size]]
+                    expert_map[f"{li}-{ei}"] = (ffn_step, dis)
 
-                if design.get("split_attn_weights", False):
-                    attn_tp_map.setdefault(str(li), []).append(partitions)
-
+                if attn_devices:
+                    attn_tp_map.setdefault(str(li), []).append(attn_devices)
                 if pp_size:
-                    non_expert_pp_map[str(li)] = pis
+                    non_expert_pp_map[str(li)] = dis
                 elif n_layers:
-                    non_expert_pp_map[str(li)] = partitions
+                    non_expert_pp_map[str(li)] = devices
 
             next_layer += n_layers or 0
             next_expert += n_experts or 0
@@ -129,14 +146,14 @@ class Partitioner:
             for wi, w in enumerate([w1, w2, w3]):
 
                 for ei, expert_slice in enumerate(torch.split(w, interm_dim)):
-                    step, pks = self.expert_map[f"{li}-{ei}"]
+                    step, devices = self.expert_map[f"{li}-{ei}"]
 
-                    for pk, tp_slice in zip(pks, torch.split(expert_slice, step)):
+                    for di, tp_slice in zip(devices, torch.split(expert_slice, step)):
                         sk = f"{li}.{ei}.w{wi + 1}"
-                        partitions.setdefault(pk, {})[sk] = tp_slice.clone()
+                        partitions.setdefault(di, {})[sk] = tp_slice.clone()
 
-        for pk, partition in partitions.items():
-            torch.save(partition, self.output_path / f"experts-{pk}.pt")
+        for di, partition in partitions.items():
+            torch.save(partition, self.output_path / f"experts-{di}.pt")
 
         return ws
 
@@ -173,8 +190,8 @@ class Partitioner:
             ]
 
             if self.attn_tp_map:
-                for pks in self.attn_tp_map[str(li)]:
-                    tp_size = len(pks)
+                for devices in self.attn_tp_map[str(li)]:
+                    tp_size = len(devices)
                     assert n_attn_heads % tp_size == 0
                     assert n_kv_heads % tp_size == 0
                     qo_step = n_attn_heads * head_dim // tp_size
@@ -183,41 +200,40 @@ class Partitioner:
 
                     for wi, step, w in zip(attn_linear_wis, steps, [wq, wk, wv, wo.T]):
 
-                        for pk, w_slice in zip(pks, torch.split(w, step)):
-                            partitions.setdefault(pk, {})[
+                        for di, w_slice in zip(devices, torch.split(w, step)):
+                            partitions.setdefault(di, {})[
                                 f"layers.{li}.attention.{wi}.weight"
                             ] = (w_slice.clone() if wi != "wo" else w_slice.T.clone())
             else:
-                for pk in self.non_expert_pp_map[str(li)]:
+                for di in self.non_expert_pp_map[str(li)]:
                     for wi, w in zip(attn_linear_wis, [wq, wk, wv, wo]):
-                        partitions.setdefault(pk, {})[
+                        partitions.setdefault(di, {})[
                             f"layers.{li}.attention.{wi}.weight"
                         ] = w
 
-            # 2D array
-            non_attn_dest = self.non_expert_pp_map.get(str(li)) or []
+            non_attn_dest = self.non_expert_pp_map.get(str(li), [])
             if not non_attn_dest:
-                for pks in self.attn_tp_map[str(li)]:
-                    non_attn_dest.extend(pks)
+                for devices in self.attn_tp_map[str(li)]:
+                    non_attn_dest.extend(devices)
 
-            for pk in non_attn_dest:
-                partitions[pk][f"layers.{li}.attention_norm.weight"] = attn_norm
-                partitions[pk][f"layers.{li}.ffn_norm.weight"] = ffn_norm
-                partitions[pk][f"layers.{li}.feed_forward.gate.weight"] = gate
+            for di in non_attn_dest:
+                partitions[di][f"layers.{li}.attention_norm.weight"] = attn_norm
+                partitions[di][f"layers.{li}.ffn_norm.weight"] = ffn_norm
+                partitions[di][f"layers.{li}.feed_forward.gate.weight"] = gate
 
             if li == 0:
                 w_embed = ws.pop("tok_embeddings.weight")
-                for pk in non_attn_dest:
-                    partitions[pk]["tok_embeddings.weight"] = w_embed
+                for di in non_attn_dest:
+                    partitions[di]["tok_embeddings.weight"] = w_embed
             elif li == n_model_layers - 1:
                 w_norm = ws.pop("norm.weight")
                 w_output = ws.pop("output.weight")
-                for pk in non_attn_dest:
-                    partitions[pk]["norm.weight"] = w_norm
-                    partitions[pk]["output.weight"] = w_output
+                for di in non_attn_dest:
+                    partitions[di]["norm.weight"] = w_norm
+                    partitions[di]["output.weight"] = w_output
 
-        for pk, partition in partitions.items():
-            torch.save(partition, self.output_path / f"non-experts-{pk}.pt")
+        for di, partition in partitions.items():
+            torch.save(partition, self.output_path / f"non-experts-{di}.pt")
 
     def start(self) -> None:
         ws = self.partition_expert_weights(self.load_weights())
