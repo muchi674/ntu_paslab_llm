@@ -332,6 +332,7 @@ class Transformer(nn.Module):
         batch_size: int,
         prefill_len: int,
     ):
+        torch.cuda.synchronize(device=self.device)
         prefill_x = torch.ones(
             (batch_size, prefill_len, self.args.dim),
             dtype=self.dtype,
