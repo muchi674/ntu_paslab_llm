@@ -367,8 +367,6 @@ class Transformer(nn.Module):
                 )
                 args.append((decode_x, decode_storage_x))
 
-            torch.cuda.synchronize(device=self.device)
-            dist.barrier()
             graphed_callables = torch.cuda.make_graphed_callables(
                 tuple(callables),
                 tuple(args),
