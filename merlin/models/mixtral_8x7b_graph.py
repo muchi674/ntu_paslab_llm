@@ -200,10 +200,11 @@ class MoeLayer(nn.Module):
         self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
     ):
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu()
-        idxs = topk_ids.view(-1).argsort()
+        idxs = topk_ids.view(-1)
+        _, idxs = idxs.sort(dim=-1)
         sorted_tokens = x[idxs // topk_ids.shape[1]]
         outputs = []
         start_idx = 0
