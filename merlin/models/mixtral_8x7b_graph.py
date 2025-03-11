@@ -257,16 +257,20 @@ class TransformerBlock(nn.Module):
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
         )
-        self.prefill_graphed_half = None
-        self.decode_graphed_half = None
+        self.prefill_graph = None
+        self.decode_graph = None
 
-    def get_routings(self, x: torch.Tensor, r: torch.Tensor):
-        h = x + r  # (batch_size, seq_len, model_dim)
+    # NOTATION for code below
+    # h: residual connection
+    # r: normal flow
+
+    def get_routings(self, h: torch.Tensor, r: torch.Tensor):
+        h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
         topk_idx, topk_weight = self.feed_forward.gate_infer(r)
         return h, r, topk_idx, topk_weight
 
-    def run_graphable_half(
+    def first_graphable(
         self,
         x: torch.Tensor,
         storage_idx: torch.Tensor,
@@ -274,7 +278,16 @@ class TransformerBlock(nn.Module):
         r = self.attention(self.attention_norm(x), storage_idx)
         return self.get_routings(x, r)
 
-    def run_graphable_parallel_half(
+    def subseq_graphable(
+        self,
+        h: torch.Tensor,
+        r: torch.Tensor,
+        storage_idx: torch.Tensor,
+    ):
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return self.first_graphable(h + r, storage_idx)  # MoE res-conn
+
+    def first_parallel_graphable(
         self,
         x: torch.Tensor,
         storage_idx: torch.Tensor,
@@ -284,20 +297,28 @@ class TransformerBlock(nn.Module):
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
         return self.get_routings(x, r)
 
+    def subseq_parallel_graphable(
+        self,
+        h: torch.Tensor,
+        r: torch.Tensor,
+        storage_idx: torch.Tensor,
+    ):
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return self.first_parallel_graphable(h + r, storage_idx)  # MoE res-conn
+
     def forward(
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        graphed_half = (
-            self.prefill_graphed_half if x.shape[1] > 1 else self.decode_graphed_half
-        )
+        h: torch.Tensor = None,  # res-conn from previous layer
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        graph = self.prefill_graph if x.shape[1] > 1 else self.decode_graph
+        args = (x, storage_idx) if h is None else (h, x, storage_idx)
         # h.shape = (batch_size, seq_len, model_dim)
         # r.shape = (batch_size * seq_len, model_dim)
-        h, r, topk_idx, topk_weight = graphed_half(x, storage_idx)
+        h, r, topk_idx, topk_weight = graph(*args)
         r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
-        dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return h + r
+        return h, r
 
 
 class Transformer(nn.Module):
@@ -328,46 +349,39 @@ class Transformer(nn.Module):
         for li in range(self.args.n_layers):
             self.layers[str(li)].attention.set_batch_level_args(freqs_cis, cache, mask)
 
-    def draw_graphs(
-        self,
-        batch_size: int,
-        prefill_len: int,
-    ):
-        prefill_x = torch.ones(
-            (batch_size, prefill_len, self.args.dim),
+    def get_callables(self, bsz: int, seqlen: int, callables: list, args: list):
+        x = torch.ones(
+            (bsz, seqlen, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
-        prefill_storage_x = torch.arange(
-            0, prefill_len, dtype=torch.long, device=self.device
+        h = torch.ones(
+            (bsz, seqlen, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
         )
-        decode_x = torch.ones(
-            (batch_size, 1, self.args.dim), dtype=self.dtype, device=self.device
-        )
-        decode_storage_x = torch.arange(
-            prefill_len, prefill_len + 1, dtype=torch.long, device=self.device
-        )
+        storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
 
+        if self.args.attn_tp:
+            callables.append(self.layers["0"].first_parallel_graphable)
+            args.append((x, storage_idx))
+        else:
+            callables.append(self.layers["0"].first_graphable)
+            args.append((x, storage_idx))
+        for li in range(1, self.args.n_layers):
+            if self.args.attn_tp:
+                callables.append(self.layers[str(li)].subseq_parallel_graphable)
+                args.append((h, x, storage_idx))
+            else:
+                callables.append(self.layers[str(li)].subseq_graphable)
+                args.append((h, x, storage_idx))
+
+    def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
             callables = []
             args = []
-            # must be in the same order as the graphs are replayed
-            for li in range(self.args.n_layers):
-                callables.append(
-                    self.layers[str(li)].run_graphable_parallel_half
-                    if self.args.attn_tp
-                    else self.layers[str(li)].run_graphable_half
-                )
-                args.append((prefill_x, prefill_storage_x))
-
-            for li in range(self.args.n_layers):
-                callables.append(
-                    self.layers[str(li)].run_graphable_parallel_half
-                    if self.args.attn_tp
-                    else self.layers[str(li)].run_graphable_half
-                )
-                args.append((decode_x, decode_storage_x))
-
+            self.get_callables(batch_size, prefill_len, callables, args)
+            self.get_callables(batch_size, 1, callables, args)
             graphed_callables = torch.cuda.make_graphed_callables(
                 tuple(callables),
                 tuple(args),
@@ -376,24 +390,25 @@ class Transformer(nn.Module):
             for gi, graphed in enumerate(graphed_callables):
                 li = gi % self.args.n_layers
                 if gi < self.args.n_layers:
-                    self.layers[str(li)].prefill_graphed_half = graphed
+                    self.layers[str(li)].prefill_graph = graphed
                 else:
-                    self.layers[str(li)].decode_graphed_half = graphed
+                    self.layers[str(li)].decode_graph = graphed
 
     def clear_graph(self):
         for li in range(self.args.n_layers):
-            self.layers[str(li)].prefill_graphed_half = None
-            self.layers[str(li)].decode_graphed_half = None
+            self.layers[str(li)].prefill_graph = None
+            self.layers[str(li)].decode_graph = None
 
     def forward(
         self,
         tokens: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        h = self.tok_embeddings(tokens)
-        for li in range(self.args.n_layers):
-            h = self.layers[str(li)].forward(h, storage_idx)
-        return self.output(self.norm(h)).float()
+        h, r = self.layers["0"].forward(self.tok_embeddings(tokens), storage_idx)
+        for li in range(1, self.args.n_layers):
+            h, r = self.layers[str(li)].forward(r, storage_idx, h=h)
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)  # after last layer's experts
+        return self.output(self.norm(h + r)).float()
 
 
 class Mixtral8x7B:
