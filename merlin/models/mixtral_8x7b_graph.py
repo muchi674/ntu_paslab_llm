@@ -189,23 +189,24 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-    def gate_infer(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def prep_ins(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
-        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        return topk_idx, topk_weight
-
-    def experts_infer(
-        self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
-    ):
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0).cpu()
         idxs = topk_ids.view(-1)
         _, idxs = idxs.sort(dim=-1)
         sorted_tokens = x[idxs // topk_ids.shape[1]]
+        return topk_weight, topk_ids, cnts, idxs, sorted_tokens
+
+    def experts_infer(
+        self, cnts: torch.Tensor, sorted_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        tokens_per_expert = cnts.sum(dim=0).cpu()
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
@@ -216,18 +217,24 @@ class MoeLayer(nn.Module):
             expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
             outputs.append(expert_out)
             start_idx = end_idx
+        return torch.cat(outputs, dim=0)
 
-        outs = torch.cat(outputs, dim=0)
+    def agg_outs(
+        self,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
+    ) -> torch.Tensor:
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
-        final_out = (
+        return (
             new_x.view(*topk_ids.shape, -1)
             .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
             .sum(dim=1)
             .type(new_x.dtype)
         )
-        return final_out
 
 
 class RMSNorm(torch.nn.Module):
@@ -259,6 +266,9 @@ class TransformerBlock(nn.Module):
         )
         self.prefill_graph = None
         self.decode_graph = None
+        if li == args.n_layers - 1:
+            self.prefill_last_agg = None
+            self.decode_last_agg = None
 
     # NOTATION for code below
     # h: residual connection
@@ -267,8 +277,20 @@ class TransformerBlock(nn.Module):
     def get_routings(self, h: torch.Tensor, r: torch.Tensor):
         h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_idx, topk_weight = self.feed_forward.gate_infer(r)
-        return h, r, topk_idx, topk_weight
+        topk_weight, topk_ids, cnts, idxs, sorted_tokens = self.feed_forward.prep_ins(r)
+        return h, topk_weight, topk_ids, cnts, idxs, sorted_tokens
+
+    def moe_allreduce(
+        self,
+        h: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
+    ):
+        r = self.feed_forward.agg_outs(topk_weight, topk_ids, idxs, outs).view(h.shape)
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return h + r  # MoE res-conn
 
     def first_graphable(
         self,
@@ -281,11 +303,15 @@ class TransformerBlock(nn.Module):
     def subseq_graphable(
         self,
         h: torch.Tensor,
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.first_graphable(h + r, storage_idx)  # MoE res-conn
+        return self.first_graphable(
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
+        )
 
     def first_parallel_graphable(
         self,
@@ -300,25 +326,35 @@ class TransformerBlock(nn.Module):
     def subseq_parallel_graphable(
         self,
         h: torch.Tensor,
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.first_parallel_graphable(h + r, storage_idx)  # MoE res-conn
+        return self.first_parallel_graphable(
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
+        )
 
     def forward(
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
         h: torch.Tensor = None,  # res-conn from previous layer
+        topk_weight: torch.Tensor = None,
+        topk_ids: torch.Tensor = None,
+        idxs: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         graph = self.prefill_graph if x.shape[1] > 1 else self.decode_graph
-        args = (x, storage_idx) if h is None else (h, x, storage_idx)
+        args = (
+            (x, storage_idx)
+            if h is None
+            else (h, topk_weight, topk_ids, idxs, x, storage_idx)
+        )
         # h.shape = (batch_size, seq_len, model_dim)
-        # r.shape = (batch_size * seq_len, model_dim)
-        h, r, topk_idx, topk_weight = graph(*args)
-        r = self.feed_forward.experts_infer(r, topk_idx, topk_weight).view(h.shape)
-        return h, r
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(*args)
+        outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
+        return h, topk_weight, topk_ids, idxs, outs
 
 
 class Transformer(nn.Module):
@@ -334,6 +370,7 @@ class Transformer(nn.Module):
                 for li in range(args.n_layers)
             }
         )
+        self.lli = str(args.n_layers - 1)  # for convenience
 
     @property
     def dtype(self) -> torch.dtype:
@@ -355,12 +392,32 @@ class Transformer(nn.Module):
             dtype=self.dtype,
             device=self.device,
         )
+        storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
         h = torch.ones(
             (bsz, seqlen, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
-        storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
+        topk_weight = torch.ones(
+            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_ids = torch.ones(
+            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        idxs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"]),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        outs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"], self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         if self.args.attn_tp:
             callables.append(self.layers["0"].first_parallel_graphable)
@@ -371,10 +428,12 @@ class Transformer(nn.Module):
         for li in range(1, self.args.n_layers):
             if self.args.attn_tp:
                 callables.append(self.layers[str(li)].subseq_parallel_graphable)
-                args.append((h, x, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
             else:
                 callables.append(self.layers[str(li)].subseq_graphable)
-                args.append((h, x, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
+        callables.append(self.layers[self.lli].moe_allreduce)
+        args.append((h, topk_weight, topk_ids, idxs, outs))
 
     def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
@@ -387,28 +446,38 @@ class Transformer(nn.Module):
                 tuple(args),
                 num_warmup_iters=16,
             )
-            for gi, graphed in enumerate(graphed_callables):
-                li = gi % self.args.n_layers
-                if gi < self.args.n_layers:
-                    self.layers[str(li)].prefill_graph = graphed
-                else:
-                    self.layers[str(li)].decode_graph = graphed
+            i = 0
+            while i < self.args.n_layers:
+                self.layers[str(i)].prefill_graph = graphed_callables[i]
+                i += 1
+            self.layers[self.lli].prefill_last_agg = graphed_callables[i]
+            i += 1  # i = 33
+            j = 0
+            while j < self.args.n_layers:
+                self.layers[str(j)].decode_graph = graphed_callables[i + j]
+                j += 1
+            self.layers[self.lli].decode_last_agg = graphed_callables[i + j]
 
     def clear_graph(self):
         for li in range(self.args.n_layers):
             self.layers[str(li)].prefill_graph = None
             self.layers[str(li)].decode_graph = None
+        self.layers[self.lli].prefill_last_agg = None
+        self.layers[self.lli].decode_last_agg = None
 
     def forward(
         self,
         tokens: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        h, r = self.layers["0"].forward(self.tok_embeddings(tokens), storage_idx)
+        args = self.layers["0"].forward(self.tok_embeddings(tokens), storage_idx)
         for li in range(1, self.args.n_layers):
-            h, r = self.layers[str(li)].forward(r, storage_idx, h=h)
-        dist.all_reduce(r, op=dist.ReduceOp.SUM)  # after last layer's experts
-        return self.output(self.norm(h + r)).float()
+            args = self.layers[str(li)].forward(*args, storage_idx)
+        if tokens.shape[1] > 1:
+            y = self.layers[self.lli].prefill_last_agg(*args)
+        else:
+            y = self.layers[self.lli].decode_last_agg(*args)
+        return self.output(self.norm(y)).float()
 
 
 class Mixtral8x7B:
