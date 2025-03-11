@@ -338,12 +338,12 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
+        h: torch.Tensor,  # res-conn from previous layer
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
-        h: torch.Tensor = None,  # res-conn from previous layer
-        topk_weight: torch.Tensor = None,
-        topk_ids: torch.Tensor = None,
-        idxs: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         graph = self.prefill_graph if x.shape[1] > 1 else self.decode_graph
         args = (
@@ -470,7 +470,9 @@ class Transformer(nn.Module):
         tokens: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
-        args = self.layers["0"].forward(self.tok_embeddings(tokens), storage_idx)
+        args = self.layers["0"].forward(
+            None, None, None, None, self.tok_embeddings(tokens), storage_idx
+        )
         for li in range(1, self.args.n_layers):
             args = self.layers[str(li)].forward(*args, storage_idx)
         if tokens.shape[1] > 1:
