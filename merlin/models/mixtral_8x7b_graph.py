@@ -212,7 +212,7 @@ class MoeLayer(nn.Module):
         self.pinned_cnts.copy_(cnts)
         outputs = []
         start_idx = 0
-        for i, num_tokens in enumerate(self.pinned_cnts):
+        for i, num_tokens in enumerate(self.pinned_cnts.numpy()):
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens

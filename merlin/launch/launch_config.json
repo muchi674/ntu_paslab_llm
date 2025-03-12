@@ -5,9 +5,9 @@
     "username": "muchichen",
     "shared_exec_args": {
         "prompt_path": "/home/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
-        "n_prompts": 16,
+        "n_prompts": 4,
         "batch_size": 1,
-        "max_tokens": 128,
+        "max_tokens": 32,
         "hide_resp": false
     },
     "nodes": {
@@ -18,8 +18,8 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/experts-attn-tp",
             "node_id": 0,
-            "profile": false,
-            "profiling_output": "n51-EA-TP-bs16"
+            "profile": true,
+            "profiling_output": "n51-EA-TP-bs1"
         },
         "10.10.10.2": {
             "ssh_port": 9046,
@@ -28,7 +28,7 @@
             "script": "~/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/experts-attn-tp",
             "node_id": 1,
-            "profile": true,
+            "profile": false,
             "profiling_output": "n46-EA-TP-bs16"
         }
     }
