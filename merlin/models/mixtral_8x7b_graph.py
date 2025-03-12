@@ -194,7 +194,7 @@ class MoeLayer(nn.Module):
 
     def prep_ins(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -204,13 +204,7 @@ class MoeLayer(nn.Module):
         idxs = topk_ids.view(-1)
         _, idxs = idxs.sort(dim=-1)
         sorted_tokens = x[idxs // topk_ids.shape[1]]
-        idxs = idxs.view(-1, self.num_experts_per_tok)
-        return (
-            topk_weight,  # cannot be stacked due to differing dtype
-            torch.stack((topk_ids, idxs)),
-            cnts.sum(dim=0),
-            sorted_tokens,
-        )
+        return topk_weight, topk_ids, cnts.sum(dim=0), idxs, sorted_tokens
 
     def experts_infer(
         self, cnts: torch.Tensor, sorted_tokens: torch.Tensor
@@ -263,7 +257,6 @@ class RMSNorm(torch.nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, li: int, experts: Experts, local_group):
         super().__init__()
-        self.topk_p1: int = args.moe["num_experts_per_tok"] + 1
         self.local_group = local_group
         self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -290,25 +283,20 @@ class TransformerBlock(nn.Module):
     def get_routings(self, h: torch.Tensor, r: torch.Tensor):
         h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_weight, stacked_idxs, cnts, sorted_tokens = self.feed_forward.prep_ins(r)
-        return h, topk_weight, stacked_idxs, cnts, sorted_tokens
+        topk_weight, topk_ids, cnts, idxs, sorted_tokens = self.feed_forward.prep_ins(r)
+        return h, topk_weight, topk_ids, cnts, idxs, sorted_tokens
 
     def moe_allreduce(
         self,
+        h: torch.Tensor,
         topk_weight: torch.Tensor,
-        stacked_idxs: torch.Tensor,
-        cat_outs: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
     ):
-        bsz, cat_dim, model_dim = cat_outs.shape
-        seqlen = cat_dim // self.topk_p1
-        r = self.feed_forward.agg_outs(
-            topk_weight,
-            stacked_idxs[0],
-            stacked_idxs[1].view(-1),
-            cat_outs[:, seqlen:, :].view(-1, model_dim),
-        ).view((bsz, seqlen, model_dim))
+        r = self.feed_forward.agg_outs(topk_weight, topk_ids, idxs, outs).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return cat_outs[:, :seqlen, :] + r  # MoE res-conn
+        return h + r  # MoE res-conn
 
     def first_graphable(
         self,
@@ -321,14 +309,16 @@ class TransformerBlock(nn.Module):
 
     def subseq_graphable(
         self,
+        h: torch.Tensor,
         topk_weight: torch.Tensor,
-        stacked_idxs: torch.Tensor,
-        cat_outs: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         # NOTE: only applicable to [2, n_layers]
         return self.first_graphable(
-            self.moe_allreduce(topk_weight, stacked_idxs, cat_outs), storage_idx
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
         )
 
     def first_parallel_graphable(
@@ -344,14 +334,16 @@ class TransformerBlock(nn.Module):
 
     def subseq_parallel_graphable(
         self,
+        h: torch.Tensor,
         topk_weight: torch.Tensor,
-        stacked_idxs: torch.Tensor,
-        cat_outs: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         # NOTE: only applicable to [2, n_layers]
         return self.first_parallel_graphable(
-            self.moe_allreduce(topk_weight, stacked_idxs, cat_outs), storage_idx
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
         )
 
     def first_forward(
@@ -359,43 +351,46 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         storage_idx: torch.Tensor,
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, topk_weight, stacked_idxs, cnts, sorted_tokens = graph(x, storage_idx)
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(x, storage_idx)
         outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
-        outs = outs.view(h.shape[0], -1, h.shape[-1])
-        return topk_weight, stacked_idxs, torch.cat((h, outs), dim=1)
+        return h, topk_weight, topk_ids, idxs, outs
 
     def middle_forward(
         self,
+        h: torch.Tensor,  # res-conn from previous layer
         topk_weight: torch.Tensor,
-        stacked_idxs: torch.Tensor,
-        cat_outs: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
         storage_idx: torch.Tensor,
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
+        # code below aggregates with previous layer's results then return this layer's
         # h.shape = (batch_size, seq_len, model_dim)
-        h, topk_weight, stacked_idxs, cnts, sorted_tokens = graph(
-            topk_weight, stacked_idxs, cat_outs, storage_idx
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(
+            h, topk_weight, topk_ids, idxs, outs, storage_idx
         )
         outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
-        outs = outs.view(h.shape[0], -1, h.shape[-1])
-        return topk_weight, stacked_idxs, torch.cat((h, outs), dim=1)
+        return h, topk_weight, topk_ids, idxs, outs
 
     def last_forward(
         self,
+        h: torch.Tensor,  # res-conn from previous layer
         topk_weight: torch.Tensor,
-        stacked_idxs: torch.Tensor,
-        cat_outs: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
         storage_idx: torch.Tensor,
         during_prefill: bool,
     ) -> torch.Tensor:
         args = self.middle_forward(
-            topk_weight, stacked_idxs, cat_outs, storage_idx, during_prefill
+            h, topk_weight, topk_ids, idxs, outs, storage_idx, during_prefill
         )
         return (
             self.prefill_last_agg(*args)
@@ -440,18 +435,28 @@ class Transformer(nn.Module):
             device=self.device,
         )
         storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
+        h = torch.ones(
+            (bsz, seqlen, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
         topk_weight = torch.ones(
             (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
             dtype=self.dtype,
             device=self.device,
         )
-        stacked_idxs = torch.ones(
-            (2, bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+        topk_ids = torch.ones(
+            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
             dtype=torch.int64,
             device=self.device,
         )
-        cat_outs = torch.ones(
-            (bsz, seqlen * (1 + self.args.moe["num_experts_per_tok"]), self.args.dim),
+        idxs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"]),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        outs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"], self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
@@ -465,12 +470,12 @@ class Transformer(nn.Module):
         for li in range(1, self.args.n_layers):
             if self.args.attn_tp:
                 callables.append(self.layers[str(li)].subseq_parallel_graphable)
-                args.append((topk_weight, stacked_idxs, cat_outs, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
             else:
                 callables.append(self.layers[str(li)].subseq_graphable)
-                args.append((topk_weight, stacked_idxs, cat_outs, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
         callables.append(self.layers[self.lli].moe_allreduce)
-        args.append((topk_weight, stacked_idxs, cat_outs))
+        args.append((h, topk_weight, topk_ids, idxs, outs))
 
     def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
@@ -861,4 +866,3 @@ if __name__ == "__main__":
     )
 
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
-
