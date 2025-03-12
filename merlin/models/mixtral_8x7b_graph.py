@@ -270,6 +270,9 @@ class TransformerBlock(nn.Module):
             self.prefill_last_agg = None
             self.decode_last_agg = None
 
+    def get_graph(self, during_prefill: bool):
+        return self.prefill_graph if during_prefill else self.decode_graph
+
     # NOTATION for code below
     # h: residual connection
     # r: normal flow
@@ -297,6 +300,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
+        # NOTE: only applicable to the first layer
         r = self.attention(self.attention_norm(x), storage_idx)
         return self.get_routings(x, r)
 
@@ -309,6 +313,7 @@ class TransformerBlock(nn.Module):
         outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
+        # NOTE: only applicable to [2, n_layers]
         return self.first_graphable(
             self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
         )
@@ -318,6 +323,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
+        # NOTE: only applicable to the first layer
         r = self.attention(self.attention_norm(x), storage_idx)
         # WARNING: assumes attention is intra-node TP
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
@@ -332,29 +338,62 @@ class TransformerBlock(nn.Module):
         outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
+        # NOTE: only applicable to [2, n_layers]
         return self.first_parallel_graphable(
             self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
         )
 
-    def forward(
+    def first_forward(
+        self,
+        x: torch.Tensor,  # (batch_size, seq_len, model_dim)
+        storage_idx: torch.Tensor,
+        during_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # NOTE: only applicable to the first layer
+        graph = self.get_graph(during_prefill)
+        # h.shape = (batch_size, seq_len, model_dim)
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(x, storage_idx)
+        outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
+        return h, topk_weight, topk_ids, idxs, outs
+
+    def middle_forward(
         self,
         h: torch.Tensor,  # res-conn from previous layer
         topk_weight: torch.Tensor,
         topk_ids: torch.Tensor,
         idxs: torch.Tensor,
-        x: torch.Tensor,  # (batch_size, seq_len, model_dim)
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
         storage_idx: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        graph = self.prefill_graph if x.shape[1] > 1 else self.decode_graph
-        args = (
-            (x, storage_idx)
-            if h is None
-            else (h, topk_weight, topk_ids, idxs, x, storage_idx)
-        )
+        during_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # NOTE: only applicable to [2, n_layers)
+        graph = self.get_graph(during_prefill)
+        # code below aggregates with previous layer's results then return this layer's
         # h.shape = (batch_size, seq_len, model_dim)
-        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(*args)
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(
+            h, topk_weight, topk_ids, idxs, outs, storage_idx
+        )
         outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
         return h, topk_weight, topk_ids, idxs, outs
+
+    def last_forward(
+        self,
+        h: torch.Tensor,  # res-conn from previous layer
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
+        storage_idx: torch.Tensor,
+        during_prefill: bool,
+    ) -> torch.Tensor:
+        args = self.middle_forward(
+            h, topk_weight, topk_ids, idxs, outs, storage_idx, during_prefill
+        )
+        return (
+            self.prefill_last_agg(*args)
+            if during_prefill
+            else self.decode_last_agg(*args)
+        )
 
 
 class Transformer(nn.Module):
@@ -467,18 +506,15 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor,  # .shape = (bsz, seqlen)
         storage_idx: torch.Tensor,
     ):
-        args = self.layers["0"].forward(
-            None, None, None, None, self.tok_embeddings(tokens), storage_idx
-        )
-        for li in range(1, self.args.n_layers):
-            args = self.layers[str(li)].forward(*args, storage_idx)
-        if tokens.shape[1] > 1:
-            y = self.layers[self.lli].prefill_last_agg(*args)
-        else:
-            y = self.layers[self.lli].decode_last_agg(*args)
+        during_prefill = tokens.shape[1] > 1
+        add_args = (storage_idx, during_prefill)
+        args = self.layers["0"].first_forward(self.tok_embeddings(tokens), *add_args)
+        for li in range(1, self.args.n_layers - 1):
+            args = self.layers[str(li)].middle_forward(*args, *add_args)
+        y = self.layers[self.lli].last_forward(*args, *add_args)
         return self.output(self.norm(y)).float()
 
 
@@ -827,3 +863,4 @@ if __name__ == "__main__":
     )
 
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
+
