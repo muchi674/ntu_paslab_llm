@@ -83,3 +83,24 @@ with torch.cuda.device(device=device):
 for i in range(1000):
     graphed_f_with_loop(xs[i])
 torch.cuda.synchronize(device=device)
+
+w = torch.rand((10, 10), dtype=dtype, device=device)
+
+
+def f(x: torch.Tensor) -> torch.Tensor:
+    return x @ w
+
+
+with torch.cuda.device(device=device):
+    graphed_f = torch.cuda.make_graphed_callables(
+        f,
+        (torch.rand((1, 10), dtype=dtype, device=device),),
+        num_warmup_iters=16,
+    )
+
+
+# warmup
+x = torch.ones((1, 10), dtype=dtype, device=device)
+print(graphed_f(x))
+w.copy_(torch.rand((10, 10), dtype=dtype, device=device))
+print(graphed_f(x))
