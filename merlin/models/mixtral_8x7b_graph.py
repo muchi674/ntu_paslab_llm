@@ -207,12 +207,7 @@ class MoeLayer(nn.Module):
         return topk_weight, topk_ids, cnts.sum(dim=0), idxs, sorted_tokens
 
     def experts_infer(
-        self,
-        topk_weight,
-        topk_ids,
-        cnts: torch.Tensor,
-        idxs,
-        sorted_tokens: torch.Tensor,
+        self, cnts: torch.Tensor, sorted_tokens: torch.Tensor
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         outputs = []
@@ -225,14 +220,23 @@ class MoeLayer(nn.Module):
             expert_out = self.experts.forward(self.li, i, tokens_for_this_expert)
             outputs.append(expert_out)
             start_idx = end_idx
+        return torch.cat(outputs, dim=0)
 
-        outs = torch.cat(outputs, dim=0)
+    def agg_outs(
+        self,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
+    ) -> torch.Tensor:
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
         return (
             new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
             .mul_(topk_weight.unsqueeze(dim=-1))
             .sum(dim=1)
+            .type(new_x.dtype)
         )
 
 
@@ -282,9 +286,17 @@ class TransformerBlock(nn.Module):
         topk_weight, topk_ids, cnts, idxs, sorted_tokens = self.feed_forward.prep_ins(r)
         return h, topk_weight, topk_ids, cnts, idxs, sorted_tokens
 
-    def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
+    def moe_allreduce(
+        self,
+        h: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
+    ):
+        r = self.feed_forward.agg_outs(topk_weight, topk_ids, idxs, outs).view(h.shape)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return h + r.view(h.shape)  # MoE res-conn
+        return h + r  # MoE res-conn
 
     def first_graphable(
         self,
@@ -298,11 +310,16 @@ class TransformerBlock(nn.Module):
     def subseq_graphable(
         self,
         h: torch.Tensor,
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         # NOTE: only applicable to [2, n_layers]
-        return self.first_graphable(self.moe_allreduce(h, r), storage_idx)
+        return self.first_graphable(
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
+        )
 
     def first_parallel_graphable(
         self,
@@ -318,11 +335,16 @@ class TransformerBlock(nn.Module):
     def subseq_parallel_graphable(
         self,
         h: torch.Tensor,
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,
         storage_idx: torch.Tensor,
     ):
         # NOTE: only applicable to [2, n_layers]
-        return self.first_parallel_graphable(self.moe_allreduce(h, r), storage_idx)
+        return self.first_parallel_graphable(
+            self.moe_allreduce(h, topk_weight, topk_ids, idxs, outs), storage_idx
+        )
 
     def first_forward(
         self,
@@ -334,35 +356,42 @@ class TransformerBlock(nn.Module):
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
         h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(x, storage_idx)
-        r = self.feed_forward.experts_infer(
-            topk_weight, topk_ids, cnts, idxs, sorted_tokens
-        )
-        return h, r
+        outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
+        return h, topk_weight, topk_ids, idxs, outs
 
     def middle_forward(
         self,
         h: torch.Tensor,  # res-conn from previous layer
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
         storage_idx: torch.Tensor,
         during_prefill: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
+        # code below aggregates with previous layer's results then return this layer's
         # h.shape = (batch_size, seq_len, model_dim)
-        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(h, r, storage_idx)
-        r = self.feed_forward.experts_infer(
-            topk_weight, topk_ids, cnts, idxs, sorted_tokens
+        h, topk_weight, topk_ids, cnts, idxs, sorted_tokens = graph(
+            h, topk_weight, topk_ids, idxs, outs, storage_idx
         )
-        return h, r
+        outs = self.feed_forward.experts_infer(cnts, sorted_tokens)
+        return h, topk_weight, topk_ids, idxs, outs
 
     def last_forward(
         self,
         h: torch.Tensor,  # res-conn from previous layer
-        r: torch.Tensor,
+        topk_weight: torch.Tensor,
+        topk_ids: torch.Tensor,
+        idxs: torch.Tensor,
+        outs: torch.Tensor,  # (batch_size * seq_len, model_dim)
         storage_idx: torch.Tensor,
         during_prefill: bool,
     ) -> torch.Tensor:
-        args = self.middle_forward(h, r, storage_idx, during_prefill)
+        args = self.middle_forward(
+            h, topk_weight, topk_ids, idxs, outs, storage_idx, during_prefill
+        )
         return (
             self.prefill_last_agg(*args)
             if during_prefill
@@ -400,33 +429,53 @@ class Transformer(nn.Module):
             self.layers[str(li)].attention.set_batch_level_args(freqs_cis, cache, mask)
 
     def get_callables(self, bsz: int, seqlen: int, callables: list, args: list):
-        h = torch.ones(
+        x = torch.ones(
             (bsz, seqlen, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
         storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
-        r = torch.ones(
-            (bsz * seqlen, self.args.dim),
+        h = torch.ones(
+            (bsz, seqlen, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_weight = torch.ones(
+            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_ids = torch.ones(
+            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        idxs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"]),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        outs = torch.ones(
+            (bsz * seqlen * self.args.moe["num_experts_per_tok"], self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
 
         if self.args.attn_tp:
             callables.append(self.layers["0"].first_parallel_graphable)
-            args.append((h, storage_idx))
+            args.append((x, storage_idx))
         else:
             callables.append(self.layers["0"].first_graphable)
-            args.append((h, storage_idx))
+            args.append((x, storage_idx))
         for li in range(1, self.args.n_layers):
             if self.args.attn_tp:
                 callables.append(self.layers[str(li)].subseq_parallel_graphable)
-                args.append((h, r, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
             else:
                 callables.append(self.layers[str(li)].subseq_graphable)
-                args.append((h, r, storage_idx))
+                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
         callables.append(self.layers[self.lli].moe_allreduce)
-        args.append((h, r))
+        args.append((h, topk_weight, topk_ids, idxs, outs))
 
     def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
