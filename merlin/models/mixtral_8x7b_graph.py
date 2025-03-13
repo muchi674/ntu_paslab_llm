@@ -400,53 +400,33 @@ class Transformer(nn.Module):
             self.layers[str(li)].attention.set_batch_level_args(freqs_cis, cache, mask)
 
     def get_callables(self, bsz: int, seqlen: int, callables: list, args: list):
-        x = torch.ones(
-            (bsz, seqlen, self.args.dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
         h = torch.ones(
             (bsz, seqlen, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
-        topk_weight = torch.ones(
-            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        topk_ids = torch.ones(
-            (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        idxs = torch.ones(
-            (bsz * seqlen * self.args.moe["num_experts_per_tok"]),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        outs = torch.ones(
-            (bsz * seqlen * self.args.moe["num_experts_per_tok"], self.args.dim),
+        storage_idx = torch.arange(seqlen, dtype=torch.long, device=self.device)
+        r = torch.ones(
+            (bsz * seqlen, self.args.dim),
             dtype=self.dtype,
             device=self.device,
         )
 
         if self.args.attn_tp:
             callables.append(self.layers["0"].first_parallel_graphable)
-            args.append((x, storage_idx))
+            args.append((h, storage_idx))
         else:
             callables.append(self.layers["0"].first_graphable)
-            args.append((x, storage_idx))
+            args.append((h, storage_idx))
         for li in range(1, self.args.n_layers):
             if self.args.attn_tp:
                 callables.append(self.layers[str(li)].subseq_parallel_graphable)
-                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
+                args.append((h, r, storage_idx))
             else:
                 callables.append(self.layers[str(li)].subseq_graphable)
-                args.append((h, topk_weight, topk_ids, idxs, outs, storage_idx))
+                args.append((h, r, storage_idx))
         callables.append(self.layers[self.lli].moe_allreduce)
-        args.append((h, topk_weight, topk_ids, idxs, outs))
+        args.append((h, r))
 
     def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
