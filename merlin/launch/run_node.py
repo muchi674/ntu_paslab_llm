@@ -131,7 +131,7 @@ def main():
             "nsys profile "
             + "--capture-range=cudaProfilerApi "
             + "--capture-range-end=stop "
-            + "--gpu-metrics-devices=all "
+            + "--cuda-graph-trace=node "
         )
         if args.profiling_output:
             prof_cmd += f"-o {args.profiling_output} "

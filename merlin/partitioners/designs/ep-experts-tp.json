@@ -1,0 +1,14 @@
+{
+    "nodes": [
+        {
+            "node_id": 0,
+            "n_experts": 3,
+            "experts_tp_size": 2
+        },
+        {
+            "node_id": 1,
+            "n_experts": 5,
+            "experts_tp_size": 4
+        }
+    ]
+}

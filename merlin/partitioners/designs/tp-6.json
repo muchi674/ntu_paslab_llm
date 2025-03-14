@@ -1,8 +1,0 @@
-{
-    "split_attn_weights": false,
-    "design": [
-        {
-            "tp_size": 6
-        }
-    ]
-}
