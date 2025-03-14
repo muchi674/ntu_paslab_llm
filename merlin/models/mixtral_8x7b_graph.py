@@ -162,8 +162,8 @@ class Attention(nn.Module):
         values = self.cache[1, self.li]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        # keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
-        # values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
 
         output = F.scaled_dot_product_attention(
             xq,
@@ -172,7 +172,6 @@ class Attention(nn.Module):
             attn_mask=self.mask[storage_idx],
             dropout_p=0.0,
             is_causal=False,
-            enable_gqa=True
         )
         output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
         return self.wo(output)
