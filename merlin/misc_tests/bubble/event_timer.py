@@ -124,12 +124,15 @@ class CrossNodeEventTimer:
         print("average bubble-caused sync latency (ms) per batch")
         print("Prefill", self.out_p.tolist())
         print("Decode", self.out_d.mean(dim=1, keepdim=True).tolist())
+
         print("=" * 20)
         print("average bubble-caused sync latency (ms) per batch when generating 40 tokens")
-        print("Prefill", self.out_p.sum().item())
+        # print("Prefill", self.out_p.sum().item()) // wrong
         # print("Decode", self.out_d.mean(dim=1, keepdim=True).sum().item()) // wrong
+        print("Prefill", self.out_p.mean().item())
         print("Decode", self.out_d.sum(dim=1).mean().item())
-        print("Sum: ", self.out_p.sum().item()+self.out_d.sum(dim=1).mean().item())
+        print("Sum: ", self.out_p.mean().item()+self.out_d.sum(dim=1).mean().item())
+
         print("=" * 20)
         print(f"average bubble-caused sync latency (ms) per token for #batches = {self.out_d.shape[0]}")
         print("Prefill", self.out_p.mean().item())
