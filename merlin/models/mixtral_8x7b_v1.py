@@ -416,35 +416,10 @@ class MoeLayer(nn.Module):
 
     
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        orig_shape = inputs.shape
-        gate_logits = self.gate(inputs)
-        topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
-        y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
-        dist.all_reduce(y, op=dist.ReduceOp.SUM)
-        return y
-    
-    @torch.no_grad()
-    def moe_infer(self, x, topk_ids, topk_weight):
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], 8))
-        cnts = cnts.scatter_(1, topk_ids, 1).sum(dim=0)
-        cnts = cnts.cpu().numpy()
-        tokens_per_expert = (
-            cnts[self.expert_start_idx : self.expert_end_idx]
-        )
-        # for fidx
-        cnts = numpy.insert(cnts, 0, 0)
-        
-        # prefix sum numpy version
-        for i in range(1, cnts.shape[0]):
-            cnts[i] += cnts[i - 1]
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        
-        # get token position
-        idxs = topk_ids.view(-1).argsort()
-        token_idxs = idxs[fidx:bidx] // topk_ids.shape[1]
-        sorted_tokens = x[token_idxs]
+        gate_logits = self.gate(inputs)[:, :3]
+        weights, selected_experts = torch.topk(gate_logits, self.num_experts_per_tok)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        results = torch.zeros_like(inputs)
 
         outputs = []
         start_idx = 0
