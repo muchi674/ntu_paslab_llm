@@ -451,6 +451,7 @@ class MoeLayer(nn.Module):
 
         timer.record_end()
         dist.all_reduce(results, op=dist.ReduceOp.SUM)
+        dist.barrier()
 
         timer.acc_elapsed_time()
         return results
