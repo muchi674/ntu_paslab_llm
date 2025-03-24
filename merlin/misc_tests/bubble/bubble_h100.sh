@@ -9,6 +9,7 @@
 #SBATCH --mail-type=END,BEGIN           # Send the mail when the job starts and finishes.
 #SBATCH --mail-user=s96006730@gmail.com
 #SBATCH --gpus-per-node=6
+#SBATCH --output=/home/u20008787/logs/job%j-bubble-v0.log
 
 # net
 export UCX_NET_DEVICES=mlx5_0:1
@@ -29,18 +30,20 @@ export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 # CMD="nsys profile \
 #     --capture-range=cudaProfilerApi \
 #     --capture-range-end=stop \
-CMD="torchrun \
-    --nnodes=$SLURM_JOB_NUM_NODES \
-    --nproc-per-node=$SLURM_GPUS_PER_NODE \
-    --rdzv_id $RANDOM \
-    --rdzv_backend c10d \
-    --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
-    ./mixtral_8x7b_v0_h100.py \
-    --model-path /home/u20008787/merlin_mixtral_weights/v0 \
-    --prompt-path /home/u20008787/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
-    --n-prompts 4 \
-    --batch-size 1 \
-    --max-tokens 16"
+# CMD="torchrun \
+#     --nnodes=$SLURM_JOB_NUM_NODES \
+#     --nproc-per-node=$SLURM_GPUS_PER_NODE \
+#     --rdzv_id $RANDOM \
+#     --rdzv_backend c10d \
+#     --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
+#     ./mixtral_8x7b_v0_h100.py \
+#     --model-path /home/u20008787/merlin_mixtral_weights/v0 \
+#     --prompt-path /home/u20008787/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
+#     --n-prompts 32 \
+#     --batch-size 1 \
+#     --max-tokens 40"
+
+CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mixtral_8x7b_v0.sh"
 
 # SRUN_CMD="$SINGULARITY $CMD"
 
