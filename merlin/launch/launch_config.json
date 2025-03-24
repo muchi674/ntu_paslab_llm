@@ -5,8 +5,8 @@
     "username": "muchichen",
     "branch_name": "merlin",
     "shared_exec_args": {
-        "n_prompts": 128,
-        "batch_size": 8,
+        "n_prompts": 4,
+        "batch_size": 1,
         "max_tokens": 128,
         "hide_resp": false
     },
@@ -16,7 +16,7 @@
             "node_rank": 0,
             "ngpus": 2,
             "proj_dir": "/mnt/muchichen/ntu_paslab_llm/merlin",
-            "launcher": "launch/run_nodes.py",
+            "launcher": "launch/run_node.py",
             "script": "models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/experts-attn-tp",
             "prompt_path": "/mnt/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
@@ -29,7 +29,7 @@
             "node_rank": 1,
             "ngpus": 4,
             "proj_dir": "/mnt/disk3/muchichen/ntu_paslab_llm/merlin",
-            "launcher": "launch/run_nodes.py",
+            "launcher": "launch/run_node.py",
             "script": "models/mixtral_8x7b_graph.py",
             "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/experts-attn-tp",
             "prompt_path": "/mnt/disk3/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
