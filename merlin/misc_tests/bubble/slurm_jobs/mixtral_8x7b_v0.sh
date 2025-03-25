@@ -1,15 +1,6 @@
 #!/bin/bash
 
 
-# setup master address and port
-# https://iservice.nchc.org.tw/nchc_service/nchc_service_news_content.php?contentId=1000254&type=all_content&newsId=58494
-# HPC容器環境打包技術與效能案例實作.pdf
-# nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-# nodes_array=($nodes)
-# head_node=${nodes_array[0]}
-# export MASTER_ADDR=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
-# export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
-
 # CMD="nsys profile \
 #     --capture-range=cudaProfilerApi \
 #     --capture-range-end=stop \
