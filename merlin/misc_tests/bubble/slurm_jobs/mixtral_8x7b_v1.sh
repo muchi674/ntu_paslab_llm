@@ -38,23 +38,24 @@ do
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
         --node-rank=$SLURM_NODEID \
-        --master-addr=$MASTER_ADDR \
-        --master-port=$MASTER_PORT \
+        # --master-addr=$MASTER_ADDR \
+        # --master-port=$MASTER_PORT \
         # + f"--nnodes={args.nnodes} "
         # + f"--node-rank={args.node_rank} "
         # + f"--nproc-per-node={args.nproc_per_node} "
         # + f"--master-addr={args.master_addr} "
         # + f"--master-port={args.master_port} "
-        # --rdzv_id $RANDOM \
-        # --rdzv_backend c10d \
-        # --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
+        --rdzv_id $RANDOM \
+        --rdzv_backend c10d \
+        --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
         /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/mixtral_8x7b_v1_h100.py \
             --model-path /home/u20008787/merlin_mixtral_weights/v1-n2-d2-4-4 \
             --prompt-path /home/u20008787/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
             --n-prompts $((32 * bs)) \
             --batch-size $bs \
             --max-tokens 40 \
-            --hide-resp
+            --hide-resp \
+            --node-id=$SLURM_NODEID 
 done
 
 # SRUN_CMD="$SINGULARITY $CMD"
