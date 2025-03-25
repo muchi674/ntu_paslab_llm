@@ -38,13 +38,6 @@ do
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
         --node-rank=$SLURM_NODEID \
-        # --master-addr=$MASTER_ADDR \
-        # --master-port=$MASTER_PORT \
-        # + f"--nnodes={args.nnodes} "
-        # + f"--node-rank={args.node_rank} "
-        # + f"--nproc-per-node={args.nproc_per_node} "
-        # + f"--master-addr={args.master_addr} "
-        # + f"--master-port={args.master_port} "
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
@@ -56,6 +49,14 @@ do
             --max-tokens 40 \
             --hide-resp \
             --node-id=$SLURM_NODEID 
+
+        # --master-addr=$MASTER_ADDR \
+        # --master-port=$MASTER_PORT \
+        # + f"--nnodes={args.nnodes} "
+        # + f"--node-rank={args.node_rank} "
+        # + f"--nproc-per-node={args.nproc_per_node} "
+        # + f"--master-addr={args.master_addr} "
+        # + f"--master-port={args.master_port} "
 done
 
 # SRUN_CMD="$SINGULARITY $CMD"
