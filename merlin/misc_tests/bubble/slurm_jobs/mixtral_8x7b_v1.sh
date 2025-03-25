@@ -19,10 +19,12 @@
 NODE_NAME=$SLURMD_NODENAME
 NODE_LIST=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 
+NODE_INDEX=-1
+
 # Loop over the array to find the index of the current node
 for idx in "${!NODE_LIST[@]}"; do
     if [ "${NODE_LIST[$idx]}" == "$NODE_NAME" ]; then
-        echo "Node '$NODE_NAME' is at index: $idx"
+        NODE_INDEX=$idx
         break
     fi
 done
@@ -30,11 +32,11 @@ done
 for ((bs = 1; bs <= 256; bs=bs*2))
 do
     echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    echo "BATCH_SIZE=$bs, NODE_NAME=$NODE_NAME, NODE_LIST=$NODE_LIST"
+    echo "BATCH_SIZE=$bs, NODE_ID=$SLURM_NODEID"
     torchrun \
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
-        --node-rank=$SLURM_NODEID \
+        --node-rank=$NODE_INDEX \
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
