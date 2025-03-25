@@ -16,18 +16,19 @@
 #     --n-prompts 32 \
 #     --batch-size 1 \
 #     --max-tokens 40"
-NODE_NAME=$SLURMD_NODENAME
-NODE_LIST=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 
-NODE_INDEX=-1
+# NODE_NAME=$SLURMD_NODENAME
+# NODE_LIST=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 
-# Loop over the array to find the index of the current node
-for idx in "${!NODE_LIST[@]}"; do
-    if [ "${NODE_LIST[$idx]}" == "$NODE_NAME" ]; then
-        NODE_INDEX=$idx
-        break
-    fi
-done
+# NODE_INDEX=-1
+
+# # Loop over the array to find the index of the current node
+# for idx in "${!NODE_LIST[@]}"; do
+#     if [ "${NODE_LIST[$idx]}" == "$NODE_NAME" ]; then
+#         NODE_INDEX=$idx
+#         break
+#     fi
+# done
 
 for ((bs = 1; bs <= 256; bs=bs*2))
 do
@@ -36,7 +37,7 @@ do
     torchrun \
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
-        --node-rank=$NODE_INDEX \
+        --node-rank=$SLURM_NODEID \
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \

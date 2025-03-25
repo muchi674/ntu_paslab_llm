@@ -38,6 +38,8 @@ LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
+print(f"LOCAL_RANK: {LOCAL_RANK}, WORLD_SIZE: {WORLD_SIZE}, WORLD_RANK: {WORLD_RANK}")
+
 timer = CrossNodeEventTimer(local_rank=LOCAL_RANK, world_size=WORLD_SIZE, world_rank=WORLD_RANK)
 
 
