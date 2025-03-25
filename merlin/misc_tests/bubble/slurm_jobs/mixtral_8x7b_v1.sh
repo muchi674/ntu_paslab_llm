@@ -24,6 +24,7 @@ do
     torchrun \
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
+        --node-rank=$SLURM_NODEID \
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
