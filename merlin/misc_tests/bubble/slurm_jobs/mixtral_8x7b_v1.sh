@@ -20,7 +20,7 @@
 for ((bs = 1; bs <= 256; bs=bs*2))
 do
     echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    echo "BATCH_SIZE=$bs, NODE_NAME=$SLURMD_NODENAME, NODE_LIST=$SLURM_NODELIST"
+    echo "BATCH_SIZE=$bs, NODE_NAME=$SLURMD_NODENAME, NODE_LIST=$SLURM_JOB_NODELIST"
     torchrun \
         --nnodes=$SLURM_JOB_NUM_NODES \
         --nproc-per-node=$SLURM_GPUS_PER_NODE \
