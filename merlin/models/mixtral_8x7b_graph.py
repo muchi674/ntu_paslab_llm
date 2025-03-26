@@ -227,17 +227,18 @@ class MoeLayer(nn.Module):
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         cnts = self.pinned_cnts.numpy()
-        tokens_per_expert = cnts[self.expert_start_idx : self.expert_end_idx]
         # for fidx
         cnts = numpy.insert(cnts, 0, 0)
         # prefix sum numpy version
-        cnts = numpy.cumsum(cnts)
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        # for i in range(1, self.expert_start_idx + 1):
-        #     cnts[i] += cnts[i - 1]
+        # cnts = numpy.cumsum(cnts)
         # fidx = cnts[self.expert_start_idx]
-        # bidx = fidx + numpy.sum(tokens_per_expert)
+        # bidx = cnts[self.expert_end_idx]
+        for i in range(1, self.expert_start_idx + 1):
+            cnts[i] += cnts[i - 1]
+        tokens_per_expert = cnts[self.expert_start_idx : self.expert_end_idx]
+        tokens_per_expert = numpy.insert(tokens_per_expert, 0, 0)
+        fidx = cnts[self.expert_start_idx]
+        bidx = fidx + tokens_per_expert[self.expert_end_idx - self.expert_start_idx]
         # get token position
         idxs = idxs[fidx:bidx]
         token_idxs = idxs // self.num_experts_per_tok
@@ -245,7 +246,8 @@ class MoeLayer(nn.Module):
 
         outputs = []
         start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
+        for i in range(1, tokens_per_expert, 1):
+            num_tokens = tokens_per_expert[i] - tokens_per_expert[i - 1]
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens
