@@ -231,10 +231,10 @@ class MoeLayer(nn.Module):
         # for fidx
         cnts = numpy.insert(cnts, 0, 0)
         # prefix sum numpy version
-        for i in range(1, cnts.shape[0]):
+        for i in range(1, self.expert_start_idx + 1):
             cnts[i] += cnts[i - 1]
         fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
+        bidx = fidx + tokens_per_expert.sum(dim=0)
         # get token position
         idxs = idxs[fidx:bidx]
         token_idxs = idxs // self.num_experts_per_tok
@@ -243,8 +243,8 @@ class MoeLayer(nn.Module):
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
-            # if num_tokens == 0:
-            #     continue
+            if num_tokens == 0:
+                continue
             end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
