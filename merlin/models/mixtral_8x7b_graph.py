@@ -204,9 +204,13 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
+
         self.dummy_zero = torch.zeros(
             (1,), dtype=torch.int64, device=next(iter(experts.ws.values())).device
         )
+        self.pinned_cnts = torch.zeros(
+            (1 + self.num_experts,), dtype=torch.int64, device="cpu"
+        ).pin_memory()
 
     def prep_ins(
         self, x: torch.Tensor
@@ -223,25 +227,26 @@ class MoeLayer(nn.Module):
 
         cnts = torch.cat((self.dummy_zero, cnts), dim=0)  # for fidx
         cnts = torch.cumsum(cnts, dim=0)
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-
-        # get token position
         idxs = topk_ids.view(-1).argsort()
-        idxs = idxs[fidx:bidx]
-        token_idxs = idxs // topk_ids.shape[1]
 
-        return topk_weight, tokens_per_expert, idxs, token_idxs
+        return topk_weight, tokens_per_expert, cnts, idxs
 
     def experts_infer(
         self,
         x: torch.Tensor,
         topk_weight: torch.Tensor,
         tokens_per_expert: torch.Tensor,
+        cnts: torch.Tensor,
         idxs: torch.Tensor,
-        token_idxs: torch.Tensor,
     ) -> torch.Tensor:
+        self.pinned_cnts.copy_(cnts)
+        fidx = self.pinned_cnts[self.expert_start_idx]
+        bidx = self.pinned_cnts[self.expert_end_idx]
+
+        # get token position
+        token_idxs = idxs[fidx:bidx] // self.num_experts_per_tok
         sorted_tokens = x[token_idxs]
+
         outputs = []
         start_idx = 0
         for i, num_tokens in enumerate(tokens_per_expert):
@@ -318,8 +323,8 @@ class TransformerBlock(nn.Module):
     def get_routings(self, h: torch.Tensor, r: torch.Tensor):
         h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_weight, tokens_per_expert, idxs, token_idxs = self.feed_forward.prep_ins(r)
-        return h, r, topk_weight, tokens_per_expert, idxs, token_idxs
+        topk_weight, tokens_per_expert, cnts, idxs = self.feed_forward.prep_ins(r)
+        return h, r, topk_weight, tokens_per_expert, cnts, idxs
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
@@ -371,9 +376,9 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, tokens_per_expert, idxs, token_idxs = graph(x)
+        h, r, topk_weight, tokens_per_expert, cnts, idxs = graph(x)
         r = self.feed_forward.experts_infer(
-            r, topk_weight, tokens_per_expert, idxs, token_idxs
+            r, topk_weight, tokens_per_expert, cnts, idxs
         )
         return h, r
 
@@ -386,9 +391,9 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, tokens_per_expert, idxs, token_idxs = graph(h, r)
+        h, r, topk_weight, tokens_per_expert, cnts, idxs = graph(h, r)
         r = self.feed_forward.experts_infer(
-            r, topk_weight, tokens_per_expert, idxs, token_idxs
+            r, topk_weight, tokens_per_expert, cnts, idxs
         )
         return h, r
 
