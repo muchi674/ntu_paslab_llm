@@ -216,7 +216,7 @@ class MoeLayer(nn.Module):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
         idxs = topk_ids.view(-1).argsort()
-        return topk_weight, cnts.sum(dim=0), idxs
+        return topk_weight, cnts.sum(dim=0), idxs // self.num_experts_per_tok
 
     def experts_infer(
         self,
@@ -236,16 +236,18 @@ class MoeLayer(nn.Module):
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
         # get token position
-        token_idxs = idxs[fidx:bidx] // self.num_experts_per_tok
-        sorted_tokens = x[token_idxs]
+        idxs = idxs[fidx:bidx]
+        sorted_tokens = x[idxs]
 
         outputs = []
         start_idx = 0
-        for ei in numpy.nonzero(tokens_per_expert)[0].tolist():
-            end_idx = start_idx + tokens_per_expert.item(ei)
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
-                ei + self.expert_start_idx,
+                i + self.expert_start_idx,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
@@ -254,9 +256,9 @@ class MoeLayer(nn.Module):
         if len(outputs):
             outs = torch.cat(outputs, dim=0)
             new_x = torch.zeros_like(x)
-            outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
+            outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
-                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+                0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
             )
         else:
             return torch.zeros_like(x)
