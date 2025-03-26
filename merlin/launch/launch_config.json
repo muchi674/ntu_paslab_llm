@@ -2,7 +2,7 @@
     "world_size": 2,
     "master_addr": "10.10.10.1",
     "master_port": "9091",
-    "username": "muchichen",
+    "username": "kai",
     "branch_name": "merlin",
     "shared_exec_args": {
         "n_prompts": 32,
