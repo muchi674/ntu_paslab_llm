@@ -186,8 +186,6 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
