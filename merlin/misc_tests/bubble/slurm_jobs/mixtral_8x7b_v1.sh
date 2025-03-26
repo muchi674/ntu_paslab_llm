@@ -43,6 +43,7 @@ do
         --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
         /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/mixtral_8x7b_v1_h100.py \
             --model-path /home/u20008787/merlin_mixtral_weights/v1-n2-d2-4-4 \
+            --node-id $SLURM_NODEID \
             --prompt-path /home/u20008787/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
             --n-prompts $((32 * bs)) \
             --batch-size $bs \
