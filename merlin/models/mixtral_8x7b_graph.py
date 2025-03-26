@@ -227,32 +227,27 @@ class MoeLayer(nn.Module):
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         cnts = self.pinned_cnts.numpy()
+        tokens_per_expert = cnts[self.expert_start_idx : self.expert_end_idx]
         # for fidx
         cnts = numpy.insert(cnts, 0, 0)
         # prefix sum numpy version
-        # cnts = numpy.cumsum(cnts)
-        # fidx = cnts[self.expert_start_idx]
-        # bidx = cnts[self.expert_end_idx]
-        for i in range(1, self.expert_end_idx, 1):
+        for i in range(1, cnts.shape[0]):
             cnts[i] += cnts[i - 1]
-        tokens_per_expert = cnts[self.expert_start_idx - 1 : self.expert_end_idx]
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
         # get token position
-        idxs = idxs[fidx:bidx]
-        token_idxs = idxs // self.num_experts_per_tok
+        token_idxs = idxs[fidx:bidx] // self.num_experts_per_tok
         sorted_tokens = x[token_idxs]
 
         outputs = []
         start_idx = 0
-        for i in range(1, len(tokens_per_expert), 1):
-            num_tokens = tokens_per_expert[i] - tokens_per_expert[i - 1]
+        for i, num_tokens in enumerate(tokens_per_expert):
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
-                i + self.expert_start_idx - 1,
+                i + self.expert_start_idx,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
@@ -261,7 +256,7 @@ class MoeLayer(nn.Module):
         if len(outputs):
             outs = torch.cat(outputs, dim=0)
             new_x = torch.zeros_like(x)
-            outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
+            outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
                 0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
             )
