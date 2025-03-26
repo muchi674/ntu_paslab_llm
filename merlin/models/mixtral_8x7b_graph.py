@@ -216,7 +216,7 @@ class MoeLayer(nn.Module):
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
         idxs = topk_ids.view(-1).argsort()
-        return topk_weight, cnts.sum(dim=0), idxs // self.num_experts_per_tok
+        return topk_weight, cnts.sum(dim=0), idxs
 
     def experts_infer(
         self,
@@ -237,7 +237,8 @@ class MoeLayer(nn.Module):
         bidx = cnts[self.expert_end_idx]
         # get token position
         idxs = idxs[fidx:bidx]
-        sorted_tokens = x[idxs]
+        token_idxs = idxs // self.num_experts_per_tok
+        sorted_tokens = x[token_idxs]
 
         outputs = []
         start_idx = 0
@@ -258,7 +259,7 @@ class MoeLayer(nn.Module):
             new_x = torch.zeros_like(x)
             outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
-                0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
             )
         else:
             return torch.zeros_like(x)
