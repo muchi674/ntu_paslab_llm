@@ -253,7 +253,7 @@ class MoeLayer(nn.Module):
             end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
-                i + self.expert_start_idx,
+                i + self.expert_start_idx - 1,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
