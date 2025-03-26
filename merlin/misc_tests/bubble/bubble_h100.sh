@@ -26,6 +26,7 @@ nodes_array=($nodes)
 head_node=${nodes_array[0]}
 export MASTER_ADDR=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export RDZV_ID=$RANDOM
 
 # CMD="nsys profile \
 #     --capture-range=cudaProfilerApi \
