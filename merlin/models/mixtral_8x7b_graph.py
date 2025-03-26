@@ -233,7 +233,7 @@ class MoeLayer(nn.Module):
         # cnts = numpy.cumsum(cnts)
         # fidx = cnts[self.expert_start_idx]
         # bidx = cnts[self.expert_end_idx]
-        for i in range(1, self.expert_end_idx + 1, 1):
+        for i in range(1, self.expert_end_idx, 1):
             cnts[i] += cnts[i - 1]
         tokens_per_expert = cnts[self.expert_start_idx - 1 : self.expert_end_idx]
         fidx = cnts[self.expert_start_idx]
