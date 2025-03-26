@@ -237,7 +237,7 @@ class MoeLayer(nn.Module):
             cnts[i] += cnts[i - 1]
         tokens_per_expert = cnts[self.expert_start_idx - 1 : self.expert_end_idx]
         fidx = cnts[self.expert_start_idx]
-        bidx = cnt[self.expert_end_idx]
+        bidx = cnts[self.expert_end_idx]
         # get token position
         idxs = idxs[fidx:bidx]
         token_idxs = idxs // self.num_experts_per_tok
