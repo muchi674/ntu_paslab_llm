@@ -250,7 +250,7 @@ class MoeLayer(nn.Module):
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens
-            expert_out = self.experts.forward(``
+            expert_out = self.experts.forward(
                 self.li,
                 i + self.expert_start_idx - 1,
                 sorted_tokens[start_idx:end_idx],
