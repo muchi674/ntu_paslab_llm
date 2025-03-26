@@ -267,7 +267,10 @@ class MoeLayer(nn.Module):
             new_x = torch.zeros_like(x)
             outs = outs.mul_(topk_weight.view(-1)[idxs[fidx:bidx]].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
-                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+                0,
+                token_idxs[fidx:bidx].unsqueeze(-1).expand(-1, x.shape[-1]),
+                outs,
+                reduce="sum",
             )
         else:
             return torch.zeros_like(x)
