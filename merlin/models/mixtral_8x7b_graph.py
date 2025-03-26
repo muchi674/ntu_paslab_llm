@@ -244,7 +244,8 @@ class MoeLayer(nn.Module):
         bidx = self.pinned_cnts[self.expert_end_idx]
 
         # get token position
-        token_idxs = idxs[fidx:bidx] // self.num_experts_per_tok
+        idxs = idxs[fidx:bidx]
+        token_idxs = idxs // self.num_experts_per_tok
         sorted_tokens = x[token_idxs]
 
         outputs = []
