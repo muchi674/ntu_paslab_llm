@@ -49,7 +49,6 @@ do
             --batch-size $bs \
             --max-tokens 40 \
             --hide-resp \
-            --node-id=$SLURM_NODEID 
 
         # --master-addr=$MASTER_ADDR \
         # --master-port=$MASTER_PORT \
