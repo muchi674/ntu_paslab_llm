@@ -240,8 +240,9 @@ class MoeLayer(nn.Module):
         idxs: torch.Tensor,
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
-        fidx = self.pinned_cnts[self.expert_start_idx]
-        bidx = self.pinned_cnts[self.expert_end_idx]
+        cnts = self.pinned_cnts.numpy()
+        fidx = cnts[self.expert_start_idx]
+        bidx = cnts[self.expert_end_idx]
 
         # get token position
         idxs = idxs[fidx:bidx]
