@@ -246,7 +246,7 @@ class MoeLayer(nn.Module):
 
         outputs = []
         start_idx = 0
-        for i in range(1, tokens_per_expert, 1):
+        for i in range(1, len(tokens_per_expert), 1):
             num_tokens = tokens_per_expert[i] - tokens_per_expert[i - 1]
             if num_tokens == 0:
                 continue
