@@ -241,13 +241,11 @@ class MoeLayer(nn.Module):
 
         outputs = []
         start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-            end_idx = start_idx + num_tokens
+        for ei in numpy.nonzero(tokens_per_expert)[0].tolist():
+            end_idx = start_idx + tokens_per_expert.item(ei)
             expert_out = self.experts.forward(
                 self.li,
-                i + self.expert_start_idx,
+                ei + self.expert_start_idx,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
