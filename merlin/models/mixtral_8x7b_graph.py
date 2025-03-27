@@ -233,7 +233,7 @@ class MoeLayer(nn.Module):
         cnts = self.pinned_cnts
         tokens_per_expert = cnts[
             self.expert_start_idx + 1 : self.expert_end_idx + 1
-        ]
+        ].numpy()
         cnts = torch.cumsum(cnts, dim=0)
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
