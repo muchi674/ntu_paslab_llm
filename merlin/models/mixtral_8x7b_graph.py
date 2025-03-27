@@ -365,7 +365,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
@@ -378,7 +378,7 @@ class TransformerBlock(nn.Module):
         h: torch.Tensor,  # res-conn from previous layer
         r: torch.Tensor,
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
