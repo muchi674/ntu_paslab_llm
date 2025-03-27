@@ -247,7 +247,7 @@ class MoeLayer(nn.Module):
         # for i, num_tokens in enumerate(tokens_per_expert):
             # if num_tokens == 0:
             #     continue
-        for ei in enumerate(active_experts):
+        for ei in active_experts:
             end_idx = start_idx + tokens_per_expert[ei]
             # end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
