@@ -370,7 +370,7 @@ class TransformerBlock(nn.Module):
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
         h, r, topk_weight, cnts, idxs, sorted_tokens = graph(x)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs, sorted_tokens)
+        r = self.feed_forward.experts_infer(topk_weight, cnts, idxs, sorted_tokens)
         return h, r
 
     def middle_forward(
@@ -383,7 +383,7 @@ class TransformerBlock(nn.Module):
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
         h, r, topk_weight, cnts, idxs, sorted_tokens = graph(h, r)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs, sorted_tokens)
+        r = self.feed_forward.experts_infer(topk_weight, cnts, idxs, sorted_tokens)
         return h, r
 
     def last_forward(
