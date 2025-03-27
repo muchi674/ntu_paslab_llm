@@ -186,6 +186,8 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        if f"{li}.{ei}.w1" not in self.ws:
+            return torch.zeros_like(x)
         w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
         w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
         w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
@@ -231,13 +233,15 @@ class MoeLayer(nn.Module):
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         cnts = self.pinned_cnts
-        tokens_per_expert = cnts[
-            self.expert_start_idx + 1 : self.expert_end_idx + 1
-        ].tolist()
-        cnts = torch.cumsum(cnts, dim=0)
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        idxs = idxs[fidx:bidx]
+
+        tokens_per_expert = cnts
+        # tokens_per_expert = cnts[
+        #     self.expert_start_idx + 1 : self.expert_end_idx + 1
+        # ].tolist()
+        # cnts = torch.cumsum(cnts, dim=0)
+        # fidx = cnts[self.expert_start_idx]
+        # bidx = cnts[self.expert_end_idx]
+        # idxs = idxs[fidx:bidx]
         sorted_tokens = x[idxs]
 
         outputs = []
@@ -246,23 +250,30 @@ class MoeLayer(nn.Module):
             if num_tokens == 0:
                 continue
             end_idx = start_idx + num_tokens
+            # expert_out = self.experts.forward(
+            #     self.li,
+            #     i + self.expert_start_idx,
+            #     sorted_tokens[start_idx:end_idx],
+            # )
             expert_out = self.experts.forward(
                 self.li,
-                i + self.expert_start_idx,
+                i,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
             start_idx = end_idx
 
-        if len(outputs):
-            outs = torch.cat(outputs, dim=0)
-            new_x = torch.zeros_like(x)
-            outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
-            return new_x.scatter_reduce_(
-                0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
-            )
-        else:
-            return torch.zeros_like(x)
+        # if len(outputs):
+        #     outs = torch.cat(outputs, dim=0)
+        #     new_x = torch.zeros_like(x)
+        #     outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
+        #     return new_x.scatter_reduce_(
+        #         0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+        #     )
+        # else:
+        #     return torch.zeros_like(x)
+        outs = torch.cat(outputs, dim=0)
+        return outs.mul(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
 
 
 class RMSNorm(torch.nn.Module):
@@ -365,7 +376,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
@@ -378,7 +389,7 @@ class TransformerBlock(nn.Module):
         h: torch.Tensor,  # res-conn from previous layer
         r: torch.Tensor,
         during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
