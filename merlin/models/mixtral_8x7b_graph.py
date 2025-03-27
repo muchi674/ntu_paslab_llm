@@ -209,18 +209,18 @@ class MoeLayer(nn.Module):
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
-    def cpu_prep_in(self, x: torch.Tensor, cnts: torch.Tensor, idxs: torch.Tensor):
-        self.pinned_cnts.copy_(cnts)
-        cnts = self.pinned_cnts
-        tokens_per_expert = cnts[
-            self.expert_start_idx + 1 : self.expert_end_idx + 1
-        ].numpy()
-        cnts = torch.cumsum(cnts, dim=0)
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        idxs = idxs[fidx:bidx]
-        sorted_tokens = x[idxs]
-        return tokens_per_expert, idxs, sorted_tokens
+    def prep_ins(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
+        gate_logits = self.gate(x)
+        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
+        cnts.scatter_(1, topk_ids, 1)
+        cnts = torch.cat((self.dummy_zero, cnts.sum(dim=0)))
+        idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
+        return topk_weight, cnts, idxs
 
     def experts_infer(
         self,
@@ -881,3 +881,4 @@ if __name__ == "__main__":
     )
 
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
+    
