@@ -211,7 +211,7 @@ class MoeLayer(nn.Module):
 
     def prep_ins(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -220,35 +220,39 @@ class MoeLayer(nn.Module):
         cnts.scatter_(1, topk_ids, 1)
         cnts = torch.cat((self.dummy_zero, cnts.sum(dim=0)))
         idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
-        return topk_weight, cnts, idxs, x[idxs]
+        return topk_weight, cnts, idxs
 
     def experts_infer(
         self,
+        x: torch.Tensor,
         topk_weight: torch.Tensor,
         cnts: torch.Tensor,
         idxs: torch.Tensor,
-        sorted_tokens: torch.Tensor
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         cnts = self.pinned_cnts
-        tokens_per_expert = cnts[
-            self.expert_start_idx + 1 : self.expert_end_idx + 1
-        ].tolist()
+        # tokens_per_expert = cnts[
+        #     self.expert_start_idx + 1 : self.expert_end_idx + 1
+        # ].numpy()
+        tokens_per_expert = cnts[self.expert_start_idx + 1 : self.expert_end_idx + 1]
+        active_experts = torch.nonzero(tokens_per_expert, as_tuple=True)[0].numpy()
         cnts = torch.cumsum(cnts, dim=0)
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
         idxs = idxs[fidx:bidx]
-        sorted_tokens = sorted_tokens[fidx:bidx]
+        sorted_tokens = x[idxs]
 
         outputs = []
         start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-            end_idx = start_idx + num_tokens
+        # for i, num_tokens in enumerate(tokens_per_expert):
+            # if num_tokens == 0:
+            #     continue
+        for ei in enumerate(active_experts):
+            end_idx = start_idx + tokens_per_expert[ei]
+            # end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
-                i + self.expert_start_idx,
+                ei + self.expert_start_idx,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
@@ -256,13 +260,13 @@ class MoeLayer(nn.Module):
 
         if len(outputs):
             outs = torch.cat(outputs, dim=0)
-            new_x = torch.zeros_like(sorted_tokens)
+            new_x = torch.zeros_like(x)
             outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
-                0, idxs.unsqueeze(-1).expand(-1, sorted_tokens.shape[-1]), outs, reduce="sum"
+                0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
             )
         else:
-            return torch.zeros_like(sorted_tokens)
+            return torch.zeros_like(x)
 
 
 class RMSNorm(torch.nn.Module):
@@ -316,8 +320,8 @@ class TransformerBlock(nn.Module):
     def get_routings(self, h: torch.Tensor, r: torch.Tensor):
         h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_weight, cnts, idxs, sorted_tokens = self.feed_forward.prep_ins(r)
-        return h, r, topk_weight, cnts, idxs, sorted_tokens
+        topk_weight, cnts, idxs = self.feed_forward.prep_ins(r)
+        return h, r, topk_weight, cnts, idxs
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
@@ -369,8 +373,8 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs, sorted_tokens = graph(x)
-        r = self.feed_forward.experts_infer(topk_weight, cnts, idxs, sorted_tokens)
+        h, r, topk_weight, cnts, idxs = graph(x)
+        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
         return h, r
 
     def middle_forward(
@@ -382,8 +386,8 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs, sorted_tokens = graph(h, r)
-        r = self.feed_forward.experts_infer(topk_weight, cnts, idxs, sorted_tokens)
+        h, r, topk_weight, cnts, idxs = graph(h, r)
+        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
         return h, r
 
     def last_forward(
