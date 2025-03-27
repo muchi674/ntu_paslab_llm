@@ -316,8 +316,8 @@ class TransformerBlock(nn.Module):
     def get_routings(self, h: torch.Tensor, r: torch.Tensor):
         h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
         r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_weight, cnts, idxs = self.feed_forward.prep_ins(r)
-        return h, r, topk_weight, cnts, idxs
+        topk_weight, cnts, idxs, sorted_tokens = self.feed_forward.prep_ins(r)
+        return h, r, topk_weight, cnts, idxs, sorted_tokens
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
@@ -369,8 +369,8 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to the first layer
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs = graph(x)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
+        h, r, topk_weight, cnts, idxs, sorted_tokens = graph(x)
+        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs, sorted_tokens)
         return h, r
 
     def middle_forward(
@@ -382,8 +382,8 @@ class TransformerBlock(nn.Module):
         # NOTE: only applicable to [2, n_layers)
         graph = self.get_graph(during_prefill)
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs = graph(h, r)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
+        h, r, topk_weight, cnts, idxs, sorted_tokens = graph(h, r)
+        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs, sorted_tokens)
         return h, r
 
     def last_forward(
