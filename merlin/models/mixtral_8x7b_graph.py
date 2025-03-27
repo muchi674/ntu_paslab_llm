@@ -211,7 +211,7 @@ class MoeLayer(nn.Module):
 
     def prep_ins(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -220,25 +220,25 @@ class MoeLayer(nn.Module):
         cnts.scatter_(1, topk_ids, 1)
         cnts = torch.cat((self.dummy_zero, cnts.sum(dim=0)))
         idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
-        return topk_weight, cnts, idxs
+        return topk_weight, cnts, idxs, x[idxs]
 
     def experts_infer(
         self,
-        x: torch.Tensor,
         topk_weight: torch.Tensor,
         cnts: torch.Tensor,
         idxs: torch.Tensor,
+        sorted_tokens: torch.Tensor
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
         cnts = self.pinned_cnts
         tokens_per_expert = cnts[
             self.expert_start_idx + 1 : self.expert_end_idx + 1
-        ].numpy()
+        ].tolist()
         cnts = torch.cumsum(cnts, dim=0)
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
         idxs = idxs[fidx:bidx]
-        sorted_tokens = x[idxs]
+        sorted_tokens = sorted_tokens[fidx:bidx]
 
         outputs = []
         start_idx = 0
@@ -256,13 +256,13 @@ class MoeLayer(nn.Module):
 
         if len(outputs):
             outs = torch.cat(outputs, dim=0)
-            new_x = torch.zeros_like(x)
+            new_x = torch.zeros_like(sorted_tokens)
             outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
             return new_x.scatter_reduce_(
-                0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+                0, idxs.unsqueeze(-1).expand(-1, sorted_tokens.shape[-1]), outs, reduce="sum"
             )
         else:
-            return torch.zeros_like(x)
+            return torch.zeros_like(sorted_tokens)
 
 
 class RMSNorm(torch.nn.Module):
