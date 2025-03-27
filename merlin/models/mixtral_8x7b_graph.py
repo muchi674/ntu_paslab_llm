@@ -202,8 +202,11 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
+        self.dummy_zero = torch.zeros(
+            (1,), dtype=torch.int64, device=next(iter(experts.ws.values())).device
+        )
         self.pinned_cnts = torch.zeros(
-            (self.num_experts,), dtype=torch.int64, device="cpu"
+            (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
     def prep_ins(
@@ -215,8 +218,9 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
+        cnts = torch.cat((self.dummy_zero, cnts.sum(dim=0)))
         idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
-        return topk_weight, cnts.sum(dim=0), idxs
+        return topk_weight, cnts, idxs
 
     def experts_infer(
         self,
@@ -226,9 +230,11 @@ class MoeLayer(nn.Module):
         idxs: torch.Tensor,
     ) -> torch.Tensor:
         self.pinned_cnts.copy_(cnts)
-        cnts = self.pinned_cnts.numpy()
-        tokens_per_expert = cnts[self.expert_start_idx : self.expert_end_idx]
-        cnts = numpy.cumsum(numpy.insert(cnts, 0, 0))
+        cnts = self.pinned_cnts
+        tokens_per_expert = cnts[
+            self.expert_start_idx + 1 : self.expert_end_idx + 1
+        ].tolist()
+        cnts = torch.cumsum(cnts)
         fidx = cnts[self.expert_start_idx]
         bidx = cnts[self.expert_end_idx]
         idxs = idxs[fidx:bidx]
