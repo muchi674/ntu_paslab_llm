@@ -5,9 +5,9 @@
     "username": "muchichen",
     "branch_name": "merlin",
     "shared_exec_args": {
-        "n_prompts": 4,
+        "n_prompts": 16,
         "batch_size": 1,
-        "max_tokens": 16,
+        "max_tokens": 128,
         "hide_resp": false
     },
     "nodes": {
@@ -21,7 +21,7 @@
             "model_path": "/mnt/llm_team/merlin_mixtral_weights/ep-experts-attn-tp",
             "prompt_path": "/mnt/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
             "node_id": 0,
-            "profile": true,
+            "profile": false,
             "profiling_output": "n51-EP-E-TP-bs1"
         },
         "10.10.10.2": {

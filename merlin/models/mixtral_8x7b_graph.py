@@ -272,8 +272,11 @@ class MoeLayer(nn.Module):
         #     )
         # else:
         #     return torch.zeros_like(x)
-        outs = torch.cat(outputs, dim=0)
-        return outs.mul(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
+        outs = torch.cat(outputs, dim=0).mul(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
+        new_x = torch.zeros_like(x)
+        return new_x.scatter_reduce_(
+            0, idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
+        )
 
 
 class RMSNorm(torch.nn.Module):
