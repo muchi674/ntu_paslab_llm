@@ -208,20 +208,6 @@ class MoeLayer(nn.Module):
         self.pinned_cnts = torch.zeros(
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
-        self.opt_cpu_prep_in = torch.compile(self.cpu_prep_in)
-
-    def prep_ins(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
-        cnts.scatter_(1, topk_ids, 1)
-        cnts = torch.cat((self.dummy_zero, cnts.sum(dim=0)))
-        idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
-        return topk_weight, cnts, idxs
 
     def cpu_prep_in(self, x: torch.Tensor, cnts: torch.Tensor, idxs: torch.Tensor):
         self.pinned_cnts.copy_(cnts)
@@ -243,17 +229,16 @@ class MoeLayer(nn.Module):
         cnts: torch.Tensor,
         idxs: torch.Tensor,
     ) -> torch.Tensor:
-        # self.pinned_cnts.copy_(cnts)
-        # cnts = self.pinned_cnts
-        # tokens_per_expert = cnts[
-        #     self.expert_start_idx + 1 : self.expert_end_idx + 1
-        # ].numpy()
-        # cnts = torch.cumsum(cnts, dim=0)
-        # fidx = cnts[self.expert_start_idx]
-        # bidx = cnts[self.expert_end_idx]
-        # idxs = idxs[fidx:bidx]
-        # sorted_tokens = x[idxs]
-        tokens_per_expert, idxs, sorted_tokens = self.opt_cpu_prep_in(x, cnts, idxs)
+        self.pinned_cnts.copy_(cnts)
+        cnts = self.pinned_cnts
+        tokens_per_expert = cnts[
+            self.expert_start_idx + 1 : self.expert_end_idx + 1
+        ].numpy()
+        cnts = torch.cumsum(cnts, dim=0)
+        fidx = cnts[self.expert_start_idx]
+        bidx = cnts[self.expert_end_idx]
+        idxs = idxs[fidx:bidx]
+        sorted_tokens = x[idxs]
 
         outputs = []
         start_idx = 0
