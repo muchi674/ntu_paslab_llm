@@ -208,6 +208,7 @@ class MoeLayer(nn.Module):
         self.pinned_cnts = torch.zeros(
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
+        self.opt_cpu_prep_in = torch.compile(self.cpu_prep_in)
 
     def prep_ins(
         self, x: torch.Tensor
@@ -222,6 +223,19 @@ class MoeLayer(nn.Module):
         idxs = topk_ids.view(-1).argsort() // self.num_experts_per_tok
         return topk_weight, cnts, idxs
 
+    def cpu_prep_in(self, x: torch.Tensor, cnts: torch.Tensor, idxs: torch.Tensor):
+        self.pinned_cnts.copy_(cnts)
+        cnts = self.pinned_cnts
+        tokens_per_expert = cnts[
+            self.expert_start_idx + 1 : self.expert_end_idx + 1
+        ].numpy()
+        cnts = torch.cumsum(cnts, dim=0)
+        fidx = cnts[self.expert_start_idx]
+        bidx = cnts[self.expert_end_idx]
+        idxs = idxs[fidx:bidx]
+        sorted_tokens = x[idxs]
+        return tokens_per_expert, idxs, sorted_tokens
+
     def experts_infer(
         self,
         x: torch.Tensor,
@@ -229,30 +243,27 @@ class MoeLayer(nn.Module):
         cnts: torch.Tensor,
         idxs: torch.Tensor,
     ) -> torch.Tensor:
-        self.pinned_cnts.copy_(cnts)
-        cnts = self.pinned_cnts
+        # self.pinned_cnts.copy_(cnts)
+        # cnts = self.pinned_cnts
         # tokens_per_expert = cnts[
         #     self.expert_start_idx + 1 : self.expert_end_idx + 1
         # ].numpy()
-        tokens_per_expert = cnts[self.expert_start_idx + 1 : self.expert_end_idx + 1]
-        active_experts = torch.nonzero(tokens_per_expert, as_tuple=True)[0].numpy()
-        cnts = torch.cumsum(cnts, dim=0)
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        idxs = idxs[fidx:bidx]
-        sorted_tokens = x[idxs]
+        # cnts = torch.cumsum(cnts, dim=0)
+        # fidx = cnts[self.expert_start_idx]
+        # bidx = cnts[self.expert_end_idx]
+        # idxs = idxs[fidx:bidx]
+        # sorted_tokens = x[idxs]
+        tokens_per_expert, idxs, sorted_tokens = self.opt_cpu_prep_in(x, cnts, idxs)
 
         outputs = []
         start_idx = 0
-        # for i, num_tokens in enumerate(tokens_per_expert):
-            # if num_tokens == 0:
-            #     continue
-        for ei in active_experts:
-            end_idx = start_idx + tokens_per_expert[ei]
-            # end_idx = start_idx + num_tokens
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
             expert_out = self.experts.forward(
                 self.li,
-                ei + self.expert_start_idx,
+                i + self.expert_start_idx,
                 sorted_tokens[start_idx:end_idx],
             )
             outputs.append(expert_out)
