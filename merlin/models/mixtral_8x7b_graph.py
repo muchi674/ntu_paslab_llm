@@ -6,8 +6,6 @@ import json
 import os
 import time
 
-import numpy
-
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
