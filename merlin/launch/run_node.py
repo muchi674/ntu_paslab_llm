@@ -157,6 +157,7 @@ def main():
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
     Cmd("tmux send-keys -t 0 'source .venv/bin/activate' Enter \;")
     Cmd("tmux send-keys -t 0 'export OMP_NUM_THREADS=8' Enter \;")
+    Cmd("tmux send-keys -t 0 'export CUDA_LAUNCH_BLOCKING=1' Enter \;")
     # Cmd("tmux send-keys -t 0 'export NCCL_DEBUG=INFO' Enter \;")
     Cmd(
         f"tmux send-keys -t 0 '{header}"
