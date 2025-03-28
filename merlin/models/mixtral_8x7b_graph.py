@@ -478,6 +478,7 @@ class Transformer(nn.Module):
                 self.layers["0"].first_decode_graphable,
             ),
         )
+        # without this causes cublas_status_not_initialized error
         res_r, topk_weight, cnts, idxs = func(h, next_h)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
