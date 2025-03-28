@@ -104,8 +104,8 @@ def main():
     except FileNotFoundError:
         raise
 
-    world_size, master_addr, master_port, nodes, username = itemgetter(
-        "world_size", "master_addr", "master_port", "nodes", "username"
+    world_size, master_addr, master_port, nodes, username, branch_name = itemgetter(
+        "world_size", "master_addr", "master_port", "nodes", "username", "branch_name"
     )(config)
 
     if not args.terminate:
@@ -113,8 +113,6 @@ def main():
         tmp = config["shared_exec_args"]
         if "prompt" in tmp:
             shared_exec_args += f'--prompt="{tmp["prompt"]}" '
-        else:
-            shared_exec_args += f'--prompt-path={os.path.expanduser(tmp["prompt_path"])} '
         for k in ["n_prompts", "batch_size", "max_tokens"]:
             if k in tmp:
                 shared_exec_args += f'--{k.replace("_", "-")}={tmp[k]} '
@@ -124,18 +122,38 @@ def main():
     url: str
     node_info: dict
     for url, node_info in nodes.items():
-        ssh_port, node_rank, ngpus, script, model_path, node_id = itemgetter(
-            "ssh_port", "node_rank", "ngpus", "script", "model_path", "node_id"
-        )(node_info)
+        (
+            ssh_port,
+            node_rank,
+            ngpus,
+            proj_dir,
+            launcher,
+            script,
+            model_path,
+            prompt_path,
+            node_id,
+        ) = [
+            node_info.get(k)
+            for k in (
+                "ssh_port",
+                "node_rank",
+                "ngpus",
+                "proj_dir",
+                "launcher",
+                "script",
+                "model_path",
+                "prompt_path",
+                "node_id",
+            )
+        ]
         print(f"node {url}")
         base_cmd = (
             f"ssh -i ~/.ssh/id_merlin {username}@{url} -p {ssh_port} "
             + "'"
-            + f'export PATH="$PATH:/home/{username}/miniconda3/condabin/" && '
-            + f"cd /home/{username}/ntu_paslab_llm/merlin && "
-            + f"git pull origin merlin && "
-            + f"conda activate merlin && "
-            + f"python /home/{username}/ntu_paslab_llm/merlin/launch/run_node.py "
+            + f"cd {proj_dir} && "
+            + f"git pull origin {branch_name} && "
+            + f"source .venv/bin/activate && "
+            + f"python {proj_dir}/{launcher} "
         )
 
         if args.terminate:
@@ -145,6 +163,11 @@ def main():
             else:
                 print("[terminated successfully]")
             continue
+
+        if prompt_path is not None:
+            prompt_path = f"--prompt-path={os.path.expanduser(prompt_path)} "
+        else:
+            prompt_path = ""
 
         if node_info.get("profile", False):
             base_cmd += "--profile "
@@ -158,9 +181,10 @@ def main():
             + f"--nproc-per-node={ngpus} "
             + f"--master-addr={master_addr} "
             + f"--master-port={master_port} "
-            + f"--script={os.path.expanduser(script)} "
+            + f"--script={proj_dir}/{script} "
             + f"--model-path={model_path} "
             + f"--node-id={node_id} "
+            + prompt_path
             + shared_exec_args
             + "'"
         )

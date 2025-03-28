@@ -180,30 +180,6 @@ def ceildiv(a, b):
     return -(a // -b)
 
 
-def lookup_latency(table: dict, data_size: int):
-    # NOTE: comm latencies are measured in ms
-    ks = sorted([int(k) for k in table.keys()])
-    lower_k, upper_k = None, None
-    for k in ks:
-        if data_size == k:
-            return table[str(k)] / 1000
-        if data_size < k:
-            upper_k = k
-            break
-        lower_k = k
-
-    if lower_k is None:
-        return table[str(upper_k)] / 1000
-    if upper_k is None:
-        return data_size / ks[-1] * table[str(ks[-1])] / 1000
-    return (
-        table[str(lower_k)]
-        + (data_size - lower_k)
-        / (upper_k - lower_k)
-        * (table[str(upper_k)] - table[str(lower_k)])
-    ) / 1000
-
-
 def estimate_lower_bound_exec_time(
     bench_res: dict,
     batch_size: int,
@@ -235,8 +211,7 @@ def estimate_lower_bound_exec_time(
     n_experts = expert_specs["n_experts"]
     top_k = expert_specs["top_k"]
 
-    model_comm_size = precision_bytes * batch_size * prompt_len * model_d
-
+    comm_k = f"{batch_size}-{prompt_len}-{model_d}"
     stage = "decode" if prompt_len == 1 else "prefill"
     exec_time_by_node = []
     for node_idx, node in enumerate(SETUP):
@@ -252,13 +227,9 @@ def estimate_lower_bound_exec_time(
             # or attn_parallelism == "cp"  # partitions input
             parallel_size = n_local_gpus if attn_is_intra else total_n_gpus
             if attn_is_intra:
-                comm_time = lookup_latency(
-                    bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
-                )
+                comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
             else:
-                comm_time = lookup_latency(
-                    bench_res["inter_coll_comm"], model_comm_size
-                )
+                comm_time = bench_res["inter_coll_comm"][comm_k]
 
         compute_time = (
             bench_res["qkvo"][stage][str(parallel_size)][str(batch_size)]
@@ -269,12 +240,8 @@ def estimate_lower_bound_exec_time(
 
         # TODO: for now, we are assuming that expert selection follows an uniform dist
         n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
-        intra_node_comm_time = lookup_latency(
-            bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
-        )
-        inter_node_comm_time = lookup_latency(
-            bench_res["inter_coll_comm"], model_comm_size
-        )
+        intra_node_comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
+        inter_node_comm_time = bench_res["inter_coll_comm"][comm_k]
         if experts_parallelism is None:
             parallel_size = 1
             n_local_experts = n_experts
@@ -314,19 +281,17 @@ def estimate_lower_bound_exec_time(
 
         extra_comm_time = 0.0
         if pp_is_naive:
-            extra_comm_time += lookup_latency(
-                bench_res[str(node_idx)]["intra_p2p_comm"], model_comm_size
-            ) * (n_local_gpus - 1)
+            c = n_local_gpus - 1
+            extra_comm_time += bench_res[str(node_idx)]["intra_p2p_comm"][comm_k] * c
         if pp_strategy:
             if node_idx < len(SETUP) - 1:
-                extra_comm_time += lookup_latency(
-                    bench_res["inter_p2p_comm"], model_comm_size
-                )
+                extra_comm_time += bench_res["inter_p2p_comm"][comm_k]
             else:
-                out_size = precision_bytes * batch_size * prompt_len * vocab_d
-                extra_comm_time += lookup_latency(
-                    bench_res["inter_coll_comm"], out_size
-                )
+                # TODO: this approximation might be inaccurate
+                # NOTE: this could error out with too big of a batch size
+                c = ceildiv(vocab_d, model_d)
+                k = f"{batch_size * c}-{prompt_len}-{model_d}"
+                extra_comm_time += bench_res["inter_coll_comm"][k]
 
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
