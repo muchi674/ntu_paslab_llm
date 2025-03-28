@@ -1,8 +1,9 @@
-import subprocess
-import argparse
-import time
+from datetime import datetime
 from types import SimpleNamespace
+import argparse
+import subprocess
 import sys
+import time
 
 """terminal color"""
 TC = SimpleNamespace(
@@ -153,6 +154,9 @@ def main():
     if args.hide_resp:
         exec_target += "--hide-resp "
 
+    # only for benchmarking
+    out_filename = datetime.now().strftime("%m-%d-%Y_%H:%M") + ".txt"
+
     Cmd("tmux set-option -g mouse on")
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
     Cmd("tmux send-keys -t 0 'source .venv/bin/activate' Enter \;")
@@ -166,6 +170,7 @@ def main():
         + f"--master-addr={args.master_addr} "
         + f"--master-port={args.master_port} "
         + exec_target
+        + f">> {out_filename} "
         + f"' Enter \;"
     )
 
