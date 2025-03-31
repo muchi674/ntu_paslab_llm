@@ -31,8 +31,10 @@
 # done
 
 # for ((bs = 1; bs <= 256; bs=bs*2))
-for bs in 128 128;
+# for bs in 128 128;
+for i in {1..3}
 do
+    bs=256
     echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     echo "BATCH_SIZE=$bs, NODE_ID=$SLURM_NODEID"
     # CMD="torchrun \
