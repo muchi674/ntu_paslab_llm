@@ -770,7 +770,7 @@ def main(
             tokenizer,
             model,
             global_group,
-            max_tokens=128,
+            max_tokens=16,
             max_batch_size=1,
             # temperature=0,
             eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
