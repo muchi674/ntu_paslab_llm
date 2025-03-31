@@ -30,7 +30,8 @@
 #     fi
 # done
 
-for ((bs = 1; bs <= 256; bs=bs*2))
+# for ((bs = 1; bs <= 256; bs=bs*2))
+for bs in 128, 256;
 do
     echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
     echo "BATCH_SIZE=$bs, NODE_ID=$SLURM_NODEID"
