@@ -9,7 +9,7 @@
 #SBATCH --mail-type=END,BEGIN           # Send the mail when the job starts and finishes.
 #SBATCH --mail-user=s96006730@gmail.com
 #SBATCH --gpus-per-node=2
-#SBATCH --output=/home/u20008787/logs/job%j-bubble-v1.log
+#SBATCH --output=/home/u20008787/logs/job%j-bubble-v2.log
 
 # net
 export UCX_NET_DEVICES=mlx5_0:1
@@ -44,7 +44,7 @@ export RDZV_ID=$RANDOM
 #     --batch-size 1 \
 #     --max-tokens 40"
 
-CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mixtral_8x7b_v1.sh"
+CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mixtral_8x7b_v2.sh"
 
 # SRUN_CMD="$SINGULARITY $CMD"
 
