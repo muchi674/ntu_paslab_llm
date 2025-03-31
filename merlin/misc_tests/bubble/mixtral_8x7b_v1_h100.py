@@ -725,15 +725,16 @@ def main(
     model = Transformer.load(Path(model_path), node_id, gpu)
 
     # warmup
-    generate(
-        ["hello, how are you?"],
-        tokenizer,
-        model,
-        max_tokens=16,
-        max_batch_size=1,
-        # temperature=0,
-        eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
-    )
+    for i in range(8):
+        generate(
+            ["hello, how are you?"],
+            tokenizer,
+            model,
+            max_tokens=16,
+            max_batch_size=1,
+            # temperature=0,
+            eos_id=tokenizer.instruct_tokenizer.tokenizer.eos_id,
+        )
 
     torch.cuda.cudart().cudaProfilerStart()
     timer.reset()
