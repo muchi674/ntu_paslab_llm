@@ -725,7 +725,7 @@ def main(
     model = Transformer.load(Path(model_path), node_id, gpu)
 
     # warmup
-    for i in range(8):
+    for i in range(16):
         generate(
             ["hello, how are you?"],
             tokenizer,
