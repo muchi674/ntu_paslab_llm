@@ -3,13 +3,13 @@
 #Batch Job Paremeters
 #SBATCH --account=GOV113121
 #SBATCH --partition=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
 #SBATCH --cpus-per-gpu=1
 #SBATCH --mail-type=END,BEGIN           # Send the mail when the job starts and finishes.
 #SBATCH --mail-user=s96006730@gmail.com
 #SBATCH --gpus-per-node=2
-#SBATCH --output=/home/u20008787/logs/job%j-bubble-v2.log
+#SBATCH --output=/home/u20008787/logs/job%j-bubble-mb-n1-d2.log
 
 # net
 export UCX_NET_DEVICES=mlx5_0:1
@@ -44,7 +44,7 @@ export RDZV_ID=$RANDOM
 #     --batch-size 1 \
 #     --max-tokens 40"
 
-CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mixtral_8x7b_v2.sh"
+CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mb.sh"
 
 # SRUN_CMD="$SINGULARITY $CMD"
 

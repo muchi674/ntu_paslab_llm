@@ -2,6 +2,7 @@ import os
 import torch
 import torch.distributed as dist
 from torch import nn
+from argparse import ArgumentParser
 
 from event_timer import CrossNodeEventTimer
 
@@ -15,6 +16,7 @@ WORLD_RANK = int(os.environ["RANK"])
 timer = CrossNodeEventTimer(local_rank=LOCAL_RANK, world_size=WORLD_SIZE, world_rank=WORLD_RANK)
 
 NUM_COMP_KERNEL = 10
+TIMES_COPIES = 4 # 2^16
 # NUM_COMM_KERNEL = 1
 
 '''
@@ -51,27 +53,27 @@ NUM_COMP_KERNEL = 10
 
 class CompKernel(nn.Module):
     def __init__(self, input_dim, output_dim):
+        super().__init__()
         self.kernel_type = 'comp'
-        self.net = nn.Linear(input_dim, output_dim, bias=False)
+        self.net = nn.Linear(input_dim, output_dim, bias=False, dtype=torch.bfloat16)
 
     def forward(self, input):
         return self.net(input)
 
 class AllReduceKernel(nn.Module):
     def __init__(self):
+        super().__init__()
         self.kernel_type = 'comm'
 
     def forward(self, input):
-        timer.record_end()
         dist.all_reduce(input, op=dist.ReduceOp.SUM)
         dist.barrier()
-
-        timer.acc_elapsed_time()
 
         return input
 
 class WorkLoadBase(nn.Module):
     def __init__(self, device: torch.device):
+        super().__init__()
         self.device = device
 
         self.hidden_size = 4096
@@ -81,17 +83,25 @@ class WorkLoadBase(nn.Module):
 
         self.kernels = self._gen_mock_net()
         
-    def forward(self, input):
-        for kernel in self.kernels:
+    def forward(self, input: torch.Tensor):
+        for i, kernel in enumerate(self.kernels):
             if kernel.kernel_type == 'comp':
                 input = kernel(input)
             elif kernel.kernel_type == 'comm':
+                timer.record_end()
+
                 input = kernel(input)
 
-    def gen_mock_input(self, batch_size: int) -> torch.Tensor:
-        seqlen = 1 # prefill 128, decode 1
+                timer.acc_elapsed_time()
+                if i != len(self.kernels) - 1:
+                    timer.record_start()
+
+        return input
+
+    def gen_mock_input(self, batch_size: int, seqlen: int = 1) -> torch.Tensor:
+        # for seqlen: prefill 128, decode 1
         input_dim = [batch_size, seqlen, self.hidden_size]
-        return torch.rand(input_dim, dtype=torch.bfloat16)
+        return torch.rand(input_dim, dtype=torch.bfloat16, device=self.device)
     
     def _gen_mock_net(self) -> nn.ModuleList:
         kernels = nn.ModuleList()
@@ -103,6 +113,9 @@ class WorkLoadBase(nn.Module):
 
         kernels.append(AllReduceKernel())       
 
+        import copy
+        for i in range(TIMES_COPIES):
+            kernels.extend(copy.deepcopy(kernels))
         return kernels
     
 
@@ -111,27 +124,43 @@ class SyncLatencyMicroBenchmark:
         self.workload = workload
 
     @torch.inference_mode()
-    def run(self, num_batches:int = 32, batch_size: int = 1, max_tokens: int = 40):
+    def run_prefill(self, num_batches:int = 32, batch_size: int = 1):
         self.workload = self.workload.eval()
 
-        timer.record_start(self.device)
+        input = self.workload.gen_mock_input(batch_size=batch_size, seqlen=128)
+        for i in range(num_batches):
+            timer.record_start(self.device)
+            input = self.workload(input)
 
-        input = self.workload.gen_mock_input(batch_size=batch_size)
+            timer.record_elapsed_time()
+            timer.flush_buffer(isPrefill=True)
+
+    @torch.inference_mode()
+    def run_decode(self, num_batches:int = 32, batch_size: int = 1, max_tokens: int = 40):
+        self.workload = self.workload.eval()
+
+        
+        input = self.workload.gen_mock_input(batch_size=batch_size, seqlen=1)
         for i in range(num_batches):
             for i in range(max_tokens):
+                timer.record_start(self.device)
                 input = self.workload(input)
 
                 timer.record_elapsed_time()
 
             timer.flush_buffer(isPrefill=False)
 
-        timer.all_gather(num_batches, max_tokens, None)
+        
         
     @property
     def device(self) -> torch.device:
         return self.workload.device
 
-def main():
+def main(
+        num_batches: int =32,
+        batch_size: int = 1,
+        max_tokens: int = 40
+    ):
     print(f"SLURM_PROCID: {SLURM_PROCID}; "
           f"GROUP_RANK: {GROUP_RANK}; "
           f"LOCAL_RANK: {LOCAL_RANK}; "
@@ -142,16 +171,20 @@ def main():
         "nccl", rank=WORLD_RANK, world_size=WORLD_SIZE, device_id=gpu
     )
     # group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
+    workload = WorkLoadBase(device=gpu).to(device=gpu)
+    mb = SyncLatencyMicroBenchmark(workload=workload)
+    mb.run_decode(num_batches=16, batch_size=batch_size, max_tokens=max_tokens) # warmup
+    timer.reset()
 
     torch.cuda.cudart().cudaProfilerStart()
-    timer.reset()
     # =============================================================================
     # TODO
-    
-    workload = WorkLoadBase(device=gpu)
-    mb = SyncLatencyMicroBenchmark(workload=workload)
-    mb.run()
-    timer.get_sync_latency()
+    mb.run_prefill(num_batches=num_batches, batch_size=batch_size)
+    mb.run_decode(num_batches=num_batches, batch_size=batch_size, max_tokens=max_tokens)
+    timer.all_gather(num_batches, max_tokens, None)
+
+    if WORLD_RANK == 0:
+        timer.get_sync_latency()
     
     # =============================================================================
     torch.cuda.cudart().cudaProfilerStop()
@@ -162,4 +195,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    # parser.add_argument("--model-path", type=str)
+    # parser.add_argument("--node-id", type=int)
+    # parser.add_argument("--prompt", type=str)
+    # parser.add_argument("--prompt-path", type=str)
+    # parser.add_argument("--n-prompts", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens", type=int, default=40)
+    # parser.add_argument("--hide-resp", action="store_true")
+    args = parser.parse_args()
+
+    main(batch_size=args.batch_size, max_tokens=args.max_tokens)
