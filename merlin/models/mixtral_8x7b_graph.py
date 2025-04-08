@@ -184,10 +184,11 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+        w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
+        w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = nn.functional.silu(gate_states) * up_states
+        return hidden_states @ w_down
 
 
 class MoeLayer(nn.Module):
@@ -214,8 +215,9 @@ class MoeLayer(nn.Module):
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        tokens_per_expert = topk_ids.flatten().bincount(minlength=self.num_experts)
-        offsets = torch.cat((self.dummy_zero, tokens_per_expert.cumsum(dim=0)))
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
+        cnts.scatter_(1, topk_ids, 1)
+        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
         idxs = topk_ids.flatten().argsort()
         return topk_weight, offsets, idxs
 
@@ -227,7 +229,8 @@ class MoeLayer(nn.Module):
         idxs: torch.Tensor,
         next_r: torch.Tensor,  # zeros_like x
     ) -> torch.Tensor:
-        expert_offsets = self.pinned_offsets.copy_(offsets).tolist()
+        self.pinned_offsets.copy_(offsets)
+        expert_offsets = self.pinned_offsets.tolist()
         adj_idxs = idxs // self.num_experts_per_tok
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
 
