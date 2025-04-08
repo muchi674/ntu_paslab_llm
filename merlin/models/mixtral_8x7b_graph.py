@@ -344,7 +344,7 @@ class TransformerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # h.shape = (batch_size, seq_len, model_dim)
         h, res_r, topk_weight, offsets, idxs = data[self.li]
-        next_r = data[self.li + 1][1]  # (h, r, res_r, topk_weight, cnts, idxs)
+        next_r = data[self.li + 1][1]  # (h, r, res_r, topk_weight, offsets, idxs)
         h.copy_(x)
         graphs[self.li].replay()
 
@@ -357,7 +357,7 @@ class TransformerBlock(nn.Module):
         data: list,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _h, _r, res_r, topk_weight, offsets, idxs = data[self.li]
-        # (h, r, res_r, topk_weight, cnts, idxs) or (h, r, out)
+        # (h, r, res_r, topk_weight, offsets, idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
         graphs[self.li].replay()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, idxs, next_r)
@@ -461,18 +461,18 @@ class Transformer(nn.Module):
             ),
         )
         # without this causes cublas_status_not_initialized error
-        res_r, topk_weight, cnts, idxs = func(h, next_h)
+        res_r, topk_weight, offsets, idxs = func(h, next_h)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            res_r, topk_weight, cnts, idxs = func(h, next_h)
-        static_data.append((h, res_r, topk_weight, cnts, idxs))
+            res_r, topk_weight, offsets, idxs = func(h, next_h)
+        static_data.append((h, res_r, topk_weight, offsets, idxs))
 
         for li in range(1, self.args.n_layers):
             h = next_h
             r = get_ones(False)
             next_h = get_ones()
             res_r = get_ones(False)
-            topk_weight, cnts, idxs = get_misc()
+            topk_weight, offsets, idxs = get_misc()
             func = select_graphable(
                 prefill,
                 (
@@ -484,8 +484,8 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                res_r, topk_weight, cnts, idxs = func(h, r, next_h)
-            static_data.append((h, r, res_r, topk_weight, cnts, idxs))
+                res_r, topk_weight, offsets, idxs = func(h, r, next_h)
+            static_data.append((h, r, res_r, topk_weight, offsets, idxs))
 
         h = next_h
         r = get_ones(False)
