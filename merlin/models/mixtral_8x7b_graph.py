@@ -210,7 +210,7 @@ class MoeLayer(nn.Module):
 
     def prep_ins(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
@@ -221,7 +221,7 @@ class MoeLayer(nn.Module):
         offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
         idxs = topk_ids.flatten().argsort()
         adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
-        return topk_weight, offsets, idxs, adj_idxs
+        return x[adj_idxs], topk_weight[idxs], offsets, idxs, adj_idxs
 
     def experts_infer(
         self,
@@ -243,9 +243,9 @@ class MoeLayer(nn.Module):
             expert_out = self.experts.forward(
                 self.li,
                 ei,
-                x[adj_idxs[l:r]],
+                x[l:r],
             )
-            expert_out.mul_(topk_weight[idxs[l:r]])
+            expert_out.mul_(topk_weight[l:r])
             next_r.index_add_(0, adj_idxs[l:r], expert_out)
 
 
@@ -295,8 +295,8 @@ class TransformerBlock(nn.Module):
         torch.add(h, r, out=next_h)
         # (batch_size * seq_len, model_dim)
         r = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
-        topk_weight, offsets, idxs, adj_idxs = self.feed_forward.prep_ins(r)
-        return r, topk_weight, offsets, idxs, adj_idxs
+        sorted_r, topk_weight, offsets, idxs, adj_idxs = self.feed_forward.prep_ins(r)
+        return sorted_r, topk_weight, offsets, idxs, adj_idxs
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
