@@ -215,11 +215,13 @@ class MoeLayer(nn.Module):
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
         offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
         idxs = topk_ids.flatten().argsort()
-        return topk_weight, offsets, idxs
+        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
+        return topk_weight, offsets, idxs, adj_idxs
 
     def experts_infer(
         self,
@@ -227,12 +229,11 @@ class MoeLayer(nn.Module):
         topk_weight: torch.Tensor,
         offsets: torch.Tensor,
         idxs: torch.Tensor,
+        adj_idxs: torch.Tensor,
         next_r: torch.Tensor,  # zeros_like x
     ) -> torch.Tensor:
         self.pinned_offsets.copy_(offsets)
         expert_offsets = self.pinned_offsets.tolist()
-        adj_idxs = idxs // self.num_experts_per_tok
-        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
 
         for ei in range(self.expert_start_idx, self.expert_end_idx):
             l = expert_offsets[ei]
@@ -346,24 +347,29 @@ class TransformerBlock(nn.Module):
         data: list,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # h.shape = (batch_size, seq_len, model_dim)
-        h, res_r, topk_weight, offsets, idxs = data[self.li]
-        next_r = data[self.li + 1][1]  # (h, r, res_r, topk_weight, offsets, idxs)
+        h, res_r, topk_weight, offsets, idxs, adj_idxs = data[self.li]
+        # (h, r, res_r, topk_weight, offsets, idxs, adj_idxs)
+        next_r = data[self.li + 1][1]
         h.copy_(x)
         graphs[self.li].replay()
 
         # h.shape = (batch_size * seq_len, model_dim)
-        self.feed_forward.experts_infer(res_r, topk_weight, offsets, idxs, next_r)
+        self.feed_forward.experts_infer(
+            res_r, topk_weight, offsets, idxs, adj_idxs, next_r
+        )
 
     def middle_forward(
         self,
         graphs: list[torch.cuda.CUDAGraph],
         data: list,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _h, _r, res_r, topk_weight, offsets, idxs = data[self.li]
-        # (h, r, res_r, topk_weight, offsets, idxs) or (h, r, out)
+        _h, _r, res_r, topk_weight, offsets, idxs, adj_idxs = data[self.li]
+        # (h, r, res_r, topk_weight, offsets, idxs, adj_idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
         graphs[self.li].replay()
-        self.feed_forward.experts_infer(res_r, topk_weight, offsets, idxs, next_r)
+        self.feed_forward.experts_infer(
+            res_r, topk_weight, offsets, idxs, adj_idxs, next_r
+        )
 
     def last_forward(
         self,
@@ -432,12 +438,17 @@ class Transformer(nn.Module):
         def get_misc():
             return (
                 torch.ones(
-                    (bsz * seqlen, self.args.moe["num_experts_per_tok"]),
+                    (bsz * seqlen * self.args.moe["num_experts_per_tok"], 1),
                     dtype=self.dtype,
                     device=self.device,
                 ),
                 torch.ones(
                     (1 + self.args.moe["num_experts"],),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.ones(
+                    (bsz * seqlen * self.args.moe["num_experts_per_tok"],),
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -453,7 +464,7 @@ class Transformer(nn.Module):
         h = get_ones()
         next_h = get_ones()
         res_r = get_ones(False)
-        topk_weight, offsets, idxs = get_misc()
+        topk_weight, offsets, idxs, adj_idxs = get_misc()
         func = select_graphable(
             prefill,
             (
@@ -464,18 +475,18 @@ class Transformer(nn.Module):
             ),
         )
         # without this causes cublas_status_not_initialized error
-        res_r, topk_weight, offsets, idxs = func(h, next_h)
+        res_r, topk_weight, offsets, idxs, adj_idxs = func(h, next_h)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            res_r, topk_weight, offsets, idxs = func(h, next_h)
-        static_data.append((h, res_r, topk_weight, offsets, idxs))
+            res_r, topk_weight, offsets, idxs, adj_idxs = func(h, next_h)
+        static_data.append((h, res_r, topk_weight, offsets, idxs, adj_idxs))
 
         for li in range(1, self.args.n_layers):
             h = next_h
             r = get_ones(False)
             next_h = get_ones()
             res_r = get_ones(False)
-            topk_weight, offsets, idxs = get_misc()
+            topk_weight, offsets, idxs, adj_idxs = get_misc()
             func = select_graphable(
                 prefill,
                 (
@@ -487,8 +498,8 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                res_r, topk_weight, offsets, idxs = func(h, r, next_h)
-            static_data.append((h, r, res_r, topk_weight, offsets, idxs))
+                res_r, topk_weight, offsets, idxs, adj_idxs = func(h, r, next_h)
+            static_data.append((h, r, res_r, topk_weight, offsets, idxs, adj_idxs))
 
         h = next_h
         r = get_ones(False)
