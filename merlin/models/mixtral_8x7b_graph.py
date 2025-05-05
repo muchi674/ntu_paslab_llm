@@ -295,8 +295,8 @@ class TransformerBlock(nn.Module):
         torch.add(h, r, out=next_h)
         # (batch_size * seq_len, model_dim)
         r = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
-        topk_weight, offsets, idxs = self.feed_forward.prep_ins(r)
-        return r, topk_weight, offsets, idxs
+        topk_weight, offsets, idxs, adj_idxs = self.feed_forward.prep_ins(r)
+        return r, topk_weight, offsets, idxs, adj_idxs
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
