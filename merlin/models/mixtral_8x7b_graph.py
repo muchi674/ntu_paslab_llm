@@ -234,18 +234,23 @@ class MoeLayer(nn.Module):
         self.pinned_offsets.copy_(offsets)
         expert_offsets = self.pinned_offsets.tolist()
 
+        expert_outs = []
         for ei in range(self.expert_start_idx, self.expert_end_idx):
             l = expert_offsets[ei]
             r = expert_offsets[ei + 1]
             if l == r:
                 continue
-            expert_out = self.experts.forward(
-                self.li,
-                ei,
-                sorted_x[l:r],
+            expert_outs.append(
+                self.experts.forward(
+                    self.li,
+                    ei,
+                    sorted_x[l:r],
+                )
             )
-            expert_out.mul_(topk_weight[l:r])
-            next_r.index_add_(0, adj_idxs[l:r], expert_out)
+
+        expert_outs = torch.cat(expert_outs)
+        expert_outs.mul_(topk_weight)
+        next_r.index_add_(0, adj_idxs, expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
