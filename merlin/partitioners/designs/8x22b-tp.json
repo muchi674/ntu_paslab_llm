@@ -1,0 +1,4 @@
+{
+    "glob_experts_tp_size": 8,
+    "attn_tp_size": 8
+}
