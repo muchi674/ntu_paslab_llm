@@ -6,8 +6,6 @@ import json
 import os
 import time
 
-import numpy
-
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -186,10 +184,11 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+        w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
+        w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = nn.functional.silu(gate_states) * up_states
+        return hidden_states @ w_down
 
 
 class MoeLayer(nn.Module):
@@ -202,71 +201,56 @@ class MoeLayer(nn.Module):
         self.li = li
         self.gate = gate
         self.experts = experts
-        self.pinned_cnts = torch.zeros(
-            (self.num_experts,), dtype=torch.int64, device="cpu"
+        self.dummy_zero = torch.zeros(
+            (1,), dtype=torch.int64, device=next(iter(experts.ws.values())).device
+        )
+        self.pinned_offsets = torch.zeros(
+            (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
     def prep_ins(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
-        idxs = topk_ids.view(-1).argsort()
-        return topk_weight, cnts.sum(dim=0), idxs
+        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
+        idxs = topk_ids.flatten().argsort()
+        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
+        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
 
     def experts_infer(
         self,
-        x: torch.Tensor,
+        sorted_x: torch.Tensor,
         topk_weight: torch.Tensor,
-        cnts: torch.Tensor,
-        idxs: torch.Tensor,
+        offsets: torch.Tensor,
+        adj_idxs: torch.Tensor,
+        next_r: torch.Tensor,
     ) -> torch.Tensor:
-        self.pinned_cnts.copy_(cnts)
-        cnts = self.pinned_cnts.numpy()
-        # for fidx
-        cnts = numpy.insert(cnts, 0, 0)
-        # prefix sum numpy version
-        # cnts = numpy.cumsum(cnts)
-        # fidx = cnts[self.expert_start_idx]
-        # bidx = cnts[self.expert_end_idx]
-        for i in range(1, self.expert_end_idx + 1, 1):
-            cnts[i] += cnts[i - 1]
-        tokens_per_expert = cnts[self.expert_start_idx - 1 : self.expert_end_idx]
-        fidx = cnts[self.expert_start_idx]
-        bidx = cnts[self.expert_end_idx]
-        # get token position
-        idxs = idxs[fidx:bidx]
-        token_idxs = idxs // self.num_experts_per_tok
-        sorted_tokens = x[token_idxs]
+        self.pinned_offsets.copy_(offsets)
+        expert_offsets = self.pinned_offsets.tolist()
 
-        outputs = []
-        start_idx = 0
-        for i in range(1, len(tokens_per_expert), 1):
-            num_tokens = tokens_per_expert[i] - tokens_per_expert[i - 1]
-            if num_tokens == 0:
+        expert_outs = []
+        for ei in range(self.expert_start_idx, self.expert_end_idx):
+            l = expert_offsets[ei]
+            r = expert_offsets[ei + 1]
+            if l == r:
                 continue
-            end_idx = start_idx + num_tokens
-            expert_out = self.experts.forward(
-                self.li,
-                i + self.expert_start_idx - 1,
-                sorted_tokens[start_idx:end_idx],
+            expert_outs.append(
+                self.experts.forward(
+                    self.li,
+                    ei,
+                    sorted_x[l:r],
+                )
             )
-            outputs.append(expert_out)
-            start_idx = end_idx
 
-        if len(outputs):
-            outs = torch.cat(outputs, dim=0)
-            new_x = torch.zeros_like(x)
-            outs = outs.mul_(topk_weight.view(-1)[idxs].unsqueeze(dim=-1))
-            return new_x.scatter_reduce_(
-                0, token_idxs.unsqueeze(-1).expand(-1, x.shape[-1]), outs, reduce="sum"
-            )
-        else:
-            return torch.zeros_like(x)
+        expert_outs = torch.cat(expert_outs)
+        expert_outs.mul_(topk_weight)
+        next_r.index_add_(0, adj_idxs, expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
@@ -286,6 +270,7 @@ class RMSNorm(torch.nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, li: int, experts: Experts, local_group):
         super().__init__()
+        self.li = li
         self.local_group = local_group
         self.attention = Attention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -296,14 +281,6 @@ class TransformerBlock(nn.Module):
             gate=nn.Linear(args.dim, args.moe["num_experts"], bias=False),
             experts=experts,
         )
-        self.prefill_graph = None
-        self.decode_graph = None
-        if li == args.n_layers - 1:
-            self.prefill_last_agg = None
-            self.decode_last_agg = None
-
-    def get_graph(self, during_prefill: bool):
-        return self.prefill_graph if during_prefill else self.decode_graph
 
     # NOTATION for code below
     # h: residual connection
@@ -317,91 +294,90 @@ class TransformerBlock(nn.Module):
     def decode_attn(self, x: torch.Tensor):
         return self.attention(self.attention_norm(x), self.attention.decode_storage_idx)
 
-    def get_routings(self, h: torch.Tensor, r: torch.Tensor):
-        h = h + r  # attn residual connection, (batch_size, seq_len, model_dim)
-        r = self.ffn_norm(h).view(-1, h.shape[-1])  # (batch_size * seq_len, model_dim)
-        topk_weight, cnts, idxs = self.feed_forward.prep_ins(r)
-        return h, r, topk_weight, cnts, idxs
+    def get_routings(self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor):
+        # attn residual connection, (batch_size, seq_len, model_dim)
+        torch.add(h, r, out=next_h)
+        # (batch_size * seq_len, model_dim)
+        r = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
+        sorted_r, topk_weight, offsets, adj_idxs = self.feed_forward.prep_ins(r)
+        return sorted_r, topk_weight, offsets, adj_idxs
 
     def moe_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
         return h + r.view(h.shape)  # MoE res-conn
 
-    def first_prefill_graphable(self, x: torch.Tensor):
-        # NOTE: only applicable to the first layer
-        return self.get_routings(x, self.prefill_attn(x))
+    def first_prefill_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
+        return self.get_routings(x, self.prefill_attn(x), next_h)
 
-    def subseq_prefill_graphable(self, h: torch.Tensor, r: torch.Tensor):
-        # NOTE: only applicable to [2, n_layers]
-        return self.first_prefill_graphable(self.moe_allreduce(h, r))
+    def subseq_prefill_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_prefill_graphable(self.moe_allreduce(h, r), next_h)
 
-    def first_decode_graphable(self, x: torch.Tensor):
-        # NOTE: only applicable to the first layer
-        return self.get_routings(x, self.decode_attn(x))
+    def first_decode_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
+        return self.get_routings(x, self.decode_attn(x), next_h)
 
-    def subseq_decode_graphable(self, h: torch.Tensor, r: torch.Tensor):
-        # NOTE: only applicable to [2, n_layers]
-        return self.first_decode_graphable(self.moe_allreduce(h, r))
+    def subseq_decode_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_decode_graphable(self.moe_allreduce(h, r), next_h)
 
-    def first_prefill_parallel_graphable(self, x: torch.Tensor):
-        # NOTE: only applicable to the first layer
+    def first_prefill_parallel_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
         # WARNING: assumes attention is intra-node TP
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_routings(x, r)
+        return self.get_routings(x, r, next_h)
 
-    def subseq_prefill_parallel_graphable(self, h: torch.Tensor, r: torch.Tensor):
-        # NOTE: only applicable to [2, n_layers]
-        return self.first_prefill_parallel_graphable(self.moe_allreduce(h, r))
+    def subseq_prefill_parallel_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_prefill_parallel_graphable(self.moe_allreduce(h, r), next_h)
 
-    def first_decode_parallel_graphable(self, x: torch.Tensor):
-        # NOTE: only applicable to the first layer
+    def first_decode_parallel_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
         # WARNING: assumes attention is intra-node TP
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_routings(x, r)
+        return self.get_routings(x, r, next_h)
 
-    def subseq_decode_parallel_graphable(self, h: torch.Tensor, r: torch.Tensor):
-        # NOTE: only applicable to [2, n_layers]
-        return self.first_decode_parallel_graphable(self.moe_allreduce(h, r))
+    def subseq_decode_parallel_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_decode_parallel_graphable(self.moe_allreduce(h, r), next_h)
 
     def first_forward(
         self,
         x: torch.Tensor,  # (batch_size, seq_len, model_dim)
-        during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # NOTE: only applicable to the first layer
-        graph = self.get_graph(during_prefill)
+        graphs: list[torch.cuda.CUDAGraph],
+        data: list,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs = graph(x)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
-        return h, r
+        h, res_r, topk_weight, offsets, adj_idxs = data[self.li]
+        # (h, r, res_r, topk_weight, offsets, adj_idxs)
+        next_r = data[self.li + 1][1]
+        h.copy_(x)
+        graphs[self.li].replay()
+
+        # h.shape = (batch_size * seq_len, model_dim)
+        self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
 
     def middle_forward(
         self,
-        h: torch.Tensor,  # res-conn from previous layer
-        r: torch.Tensor,
-        during_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # NOTE: only applicable to [2, n_layers)
-        graph = self.get_graph(during_prefill)
-        # h.shape = (batch_size, seq_len, model_dim)
-        h, r, topk_weight, cnts, idxs = graph(h, r)
-        r = self.feed_forward.experts_infer(r, topk_weight, cnts, idxs)
-        return h, r
+        graphs: list[torch.cuda.CUDAGraph],
+        data: list,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _h, _r, res_r, topk_weight, offsets, adj_idxs = data[self.li]
+        # (h, r, res_r, topk_weight, offsets, adj_idxs) or (h, r, out)
+        next_r = data[self.li + 1][1]
+        graphs[self.li].replay()
+        self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
 
     def last_forward(
         self,
-        h: torch.Tensor,  # res-conn from previous layer
-        r: torch.Tensor,
-        during_prefill: bool,
+        graphs: list[torch.cuda.CUDAGraph],
+        data: list,
     ) -> torch.Tensor:
-        args = self.middle_forward(h, r, during_prefill)
-        return (
-            self.prefill_last_agg(*args)
-            if during_prefill
-            else self.decode_last_agg(*args)
-        )
+        self.middle_forward(graphs, data)
+        graphs[-1].replay()  # last moe-allreduce
 
 
 class Transformer(nn.Module):
@@ -440,91 +416,125 @@ class Transformer(nn.Module):
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
 
-    def get_callables(
-        self, bsz: int, seqlen: int, prefill: bool, callables: list, args: list
-    ):
-        h = torch.ones(
-            (bsz, seqlen, self.args.dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        r = torch.ones(
-            (bsz * seqlen, self.args.dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
+    def help_draw_graphs(self, bsz: int, seqlen: int, prefill: bool, pool):
+        top_k = self.args.moe["num_experts_per_tok"]
 
-        if prefill:
-            if self.args.attn_tp:
-                callables.append(self.layers["0"].first_prefill_parallel_graphable)
+        def select_graphable(prefill: bool, options: tuple):
+            idx = 0 if prefill else 2
+            idx += 0 if self.args.attn_tp else 1
+            return options[idx]
+
+        def get_ins(for_h: bool = True):
+            shape: tuple
+            if for_h:
+                shape = (bsz, seqlen, self.args.dim)
             else:
-                callables.append(self.layers["0"].first_prefill_graphable)
-        else:
-            if self.args.attn_tp:
-                callables.append(self.layers["0"].first_decode_parallel_graphable)
-            else:
-                callables.append(self.layers["0"].first_decode_graphable)
-        args.append((h,))
+                shape = (bsz * seqlen, self.args.dim)
+            return torch.ones(
+                shape,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+        def get_outs():
+            return (
+                torch.ones(
+                    (bsz * seqlen * top_k, self.args.dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                torch.ones(
+                    (bsz * seqlen * top_k, 1),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                torch.ones(
+                    (1 + self.args.moe["num_experts"],),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.ones(
+                    (bsz * seqlen * top_k,),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            )
+
+        graphs = []
+        static_data = []
+        h = get_ins()
+        next_h = get_ins()
+        res_r, topk_weight, offsets, adj_idxs = get_outs()
+        func = select_graphable(
+            prefill,
+            (
+                self.layers["0"].first_prefill_parallel_graphable,
+                self.layers["0"].first_prefill_graphable,
+                self.layers["0"].first_decode_parallel_graphable,
+                self.layers["0"].first_decode_graphable,
+            ),
+        )
+        # without this causes cublas_status_not_initialized error
+        res_r, topk_weight, offsets, adj_idxs = func(h, next_h)
+        graphs.append(torch.cuda.CUDAGraph())
+        with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
+            res_r, topk_weight, offsets, adj_idxs = func(h, next_h)
+        static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
+
         for li in range(1, self.args.n_layers):
-            if prefill:
-                if self.args.attn_tp:
-                    callables.append(
-                        self.layers[str(li)].subseq_prefill_parallel_graphable
-                    )
-                else:
-                    callables.append(self.layers[str(li)].subseq_prefill_graphable)
-            else:
-                if self.args.attn_tp:
-                    callables.append(
-                        self.layers[str(li)].subseq_decode_parallel_graphable
-                    )
-                else:
-                    callables.append(self.layers[str(li)].subseq_decode_graphable)
-            args.append((h, r))
-        callables.append(self.layers[self.lli].moe_allreduce)
-        args.append((h, r))
+            h = next_h
+            r = get_ins(False)
+            next_h = get_ins()
+            res_r, topk_weight, offsets, adj_idxs = get_outs()
+            func = select_graphable(
+                prefill,
+                (
+                    self.layers[str(li)].subseq_prefill_parallel_graphable,
+                    self.layers[str(li)].subseq_prefill_graphable,
+                    self.layers[str(li)].subseq_decode_parallel_graphable,
+                    self.layers[str(li)].subseq_decode_graphable,
+                ),
+            )
+            graphs.append(torch.cuda.CUDAGraph())
+            with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
+                res_r, topk_weight, offsets, adj_idxs = func(h, r, next_h)
+            static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
+
+        h = next_h
+        r = get_ins(False)
+        out = get_ins()
+        graphs.append(torch.cuda.CUDAGraph())
+        with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
+            out = self.layers[self.lli].moe_allreduce(h, r)
+        static_data.append((h, r, out))
+
+        return graphs, static_data
 
     def draw_graphs(self, batch_size: int, prefill_len: int):
         with torch.cuda.device(device=self.device):
-            callables = []
-            args = []
-            self.get_callables(batch_size, prefill_len, True, callables, args)
-            self.get_callables(batch_size, 1, False, callables, args)
-            graphed_callables = torch.cuda.make_graphed_callables(
-                tuple(callables),
-                tuple(args),
-                num_warmup_iters=16,
+            prefill_graphs, prefill_data = self.help_draw_graphs(
+                batch_size, prefill_len, True, None
             )
-            i = 0
-            while i < self.args.n_layers:
-                self.layers[str(i)].prefill_graph = graphed_callables[i]
-                i += 1
-            self.layers[self.lli].prefill_last_agg = graphed_callables[i]
-            i += 1  # i = 33
-            j = 0
-            while j < self.args.n_layers:
-                self.layers[str(j)].decode_graph = graphed_callables[i + j]
-                j += 1
-            self.layers[self.lli].decode_last_agg = graphed_callables[i + j]
+            decode_graphs, decode_data = self.help_draw_graphs(
+                batch_size, 1, False, prefill_graphs[-1].pool()
+            )
+        return prefill_graphs, prefill_data, decode_graphs, decode_data
 
-    def clear_graph(self):
+    def reset_graph_data(self, data: list):
         for li in range(self.args.n_layers):
-            self.layers[str(li)].prefill_graph = None
-            self.layers[str(li)].decode_graph = None
-        self.layers[self.lli].prefill_last_agg = None
-        self.layers[self.lli].decode_last_agg = None
+            data[li + 1][1].zero_()
 
     def forward(
         self,
         tokens: torch.Tensor,  # .shape = (bsz, seqlen)
-        during_prefill: bool,
+        graphs: list[torch.cuda.CUDAGraph],
+        data: list,
     ):
-        args = self.layers["0"].first_forward(
-            self.tok_embeddings(tokens), during_prefill
-        )
+        self.layers["0"].first_forward(self.tok_embeddings(tokens), graphs, data)
         for li in range(1, self.args.n_layers - 1):
-            args = self.layers[str(li)].middle_forward(*args, during_prefill)
-        y = self.layers[self.lli].last_forward(*args, during_prefill)
+            self.layers[str(li)].middle_forward(graphs, data)
+        self.layers[self.lli].last_forward(graphs, data)
+        y = data[-1][2]  # (h, r, out)
         return self.output(self.norm(y)).float()
 
 
@@ -651,7 +661,6 @@ class Mixtral8x7B:
         max_gen_len: int,
         temperature: float,
         device: torch.device,
-        draw_new_graph: bool = True,
         profile: bool = False,
     ) -> tuple[list[str], int, float, int, float]:
 
@@ -681,16 +690,27 @@ class Mixtral8x7B:
             p_store_idx,
             d_store_idx,
         )
-        if draw_new_graph:
-            model.draw_graphs(bsz, min_p_len)
+        prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
+            bsz, min_p_len
+        )
         dist.barrier()
+        model.reset_graph_data(prefill_data)
+        model.reset_graph_data(decode_data)
 
         # warmup
         model.forward(
-            torch.ones((bsz, min_p_len), dtype=torch.long, device=device), True
+            torch.ones((bsz, min_p_len), dtype=torch.long, device=device),
+            prefill_graphs,
+            prefill_data,
         )
-        model.forward(torch.ones((bsz, 1), dtype=torch.long, device=device), False)
+        model.forward(
+            torch.ones((bsz, 1), dtype=torch.long, device=device),
+            decode_graphs,
+            decode_data,
+        )
         self.clear_cache(cache)
+        model.reset_graph_data(prefill_data)
+        model.reset_graph_data(decode_data)
 
         dist.barrier()
         tic = time.time()
@@ -715,13 +735,18 @@ class Mixtral8x7B:
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
             dist.barrier()
-            if prev_pos > 0:
+            if prev_pos == 0:
+                graphs, data = prefill_graphs, prefill_data
+            else:
+                graphs, data = decode_graphs, decode_data
                 d_store_idx.copy_(
                     torch.arange(prev_pos, cur_pos, dtype=torch.long, device=device)
                 )
-            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos == 0)
+            if cur_pos > min_p_len + 1:
+                model.reset_graph_data(decode_data)
+            logits = model.forward(tokens[:, prev_pos:cur_pos], graphs, data)
 
-            if cur_pos == min_p_len:
+            if prev_pos == 0:
                 prefill_time = time.time() - tic
                 tic = time.time()
             if temperature > 0:
@@ -772,7 +797,6 @@ class Mixtral8x7B:
         decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
-        self.model.clear_graph()
         torch.cuda.empty_cache()
 
         return responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time
@@ -815,7 +839,6 @@ def main(
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
-            draw_new_graph=True,
             profile=end == n_prompts,
         )
 

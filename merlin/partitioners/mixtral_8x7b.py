@@ -136,6 +136,7 @@ class Partitioner:
 
     def partition_expert_weights(self, ws: dict) -> None:
         interm_dim = self.model_config["intermediate_size"]
+        n_experts = self.model_config["num_local_experts"]
         partitions = {}
 
         for li in range(self.model_config["num_hidden_layers"]):
@@ -143,14 +144,24 @@ class Partitioner:
             w2: torch.Tensor = ws.pop(f"layers.{li}.block_sparse_moe.w2")
             w3: torch.Tensor = ws.pop(f"layers.{li}.block_sparse_moe.w3")
 
-            for wi, w in enumerate([w1, w2, w3]):
+            for ei, w1_slice, w2_slice, w3_slice in zip(
+                range(n_experts),
+                torch.split(w1, interm_dim),
+                torch.split(w2, interm_dim),
+                torch.split(w3, interm_dim),
+            ):
+                step, devices = self.expert_map[f"{li}-{ei}"]
 
-                for ei, expert_slice in enumerate(torch.split(w, interm_dim)):
-                    step, devices = self.expert_map[f"{li}-{ei}"]
-
-                    for di, tp_slice in zip(devices, torch.split(expert_slice, step)):
-                        sk = f"{li}.{ei}.w{wi + 1}"
-                        partitions.setdefault(di, {})[sk] = tp_slice.clone()
+                for di, w1_tp_slice, w2_tp_slice, w3_tp_slice in zip(
+                    devices,
+                    torch.split(w1_slice, step),
+                    torch.split(w2_slice, step),
+                    torch.split(w3_slice, step),
+                ):
+                    partitions.setdefault(di, {})[f"{li}.{ei}.w_gate_up"] = torch.cat(
+                        (w1_tp_slice, w3_tp_slice)
+                    )
+                    partitions[di][f"{li}.{ei}.w_down"] = w2_tp_slice.T.clone()
 
         for di, partition in partitions.items():
             torch.save(partition, self.output_path / f"experts-{di}.pt")
