@@ -15,8 +15,6 @@ from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-import termcolor
-
 # Environment variables set by torch.distributed.launch
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -86,7 +84,11 @@ class ModelArgs:
     vocab_size: int
     rope_theta: float
     moe: dict
-    attn_tp: bool = False
+    first_layer: int = None
+    last_layer: int = None
+    has_pp: bool = False
+    parallel_experts: bool = False
+    parallel_attn: bool = False
 
     @classmethod
     def from_hf_config(cls, params: dict):
@@ -196,8 +198,8 @@ class MoeLayer(nn.Module):
         super().__init__()
         self.num_experts: int = args.moe["num_experts"]
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
-        self.expert_start_idx = args.moe["expert_start_idx"]
-        self.expert_end_idx = args.moe["expert_end_idx"]
+        self.first_expert = args.moe["first_expert"]
+        self.last_expert = args.moe["last_expert"]
         self.li = li
         self.gate = gate
         self.experts = experts
@@ -235,7 +237,7 @@ class MoeLayer(nn.Module):
         expert_offsets = self.pinned_offsets.tolist()
 
         expert_outs = []
-        for ei in range(self.expert_start_idx, self.expert_end_idx):
+        for ei in range(self.first_expert, self.last_expert + 1):
             l = expert_offsets[ei]
             r = expert_offsets[ei + 1]
             if l == r:
@@ -564,25 +566,57 @@ class Mixtral8x7B:
             mmap=True,
         )
 
-        intra_node_parallel = False
-        # adjust for tensor parallel attention
-        # WARNING: assumes that attention is intra-node parallel
-        # TODO: adjust for pipeline parallelism
+        # expert key structure: "li.ei.wi"
+        fli, lli, fei, lei = (
+            model_args.n_layers,
+            -1,
+            model_args.moe["num_experts"],
+            -1,
+        )
+        for k in experts:
+            info = k.split(".")
+            li, ei = int(info[0]), int(info[1])
+            fli = min(li, fli)
+            lli = max(li, lli)
+            fei = min(ei, fei)
+            lei = max(ei, lei)
+
+        model_args.first_layer = fli
+        model_args.last_layer = lli
+        model_args.moe["first_expert"] = fei
+        model_args.moe["last_expert"] = lei
+
+        # check if PP is applied
+        is_first_stage = "tok_embeddings.weight" in non_experts
+        is_last_stage = "output.weight" in non_experts
+        model_args.has_pp = not is_first_stage or not is_last_stage
+
+        # check if EP or TP is applied on experts
         if (
-            non_experts[f"layers.0.attention.wq.weight"].shape[0]
+            any(
+                f"{model_args.first_layer}.{ei}.w_down" not in experts
+                for ei in range(model_args.moe["num_experts"])
+            )
+            or experts[f"{model_args.first_layer}.0.w_down"].shape[1]
+            < model_args.hidden_dim
+        ):
+            model_args.parallel_experts = True
+
+        # check if intra-node TP is applied on attention
+        if (
+            non_experts[f"layers.{model_args.first_layer}.attention.wq.weight"].shape[0]
             < model_args.n_heads * model_args.head_dim
         ):
             assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
             assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
             model_args.n_heads //= LOCAL_WORLD_SIZE
             model_args.n_kv_heads //= LOCAL_WORLD_SIZE
-            model_args.attn_tp = True
-            intra_node_parallel = True
+            model_args.parallel_attn = True
 
-        # TODO: add logic for PP intra-node experts' parallelism
-
-        local_group = None
-        if intra_node_parallel:
+        comms: list
+        if (
+            model_args.has_pp and model_args.parallel_experts
+        ) or model_args.parallel_attn:
             global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
             local_map = torch.tensor(
                 [node_id, WORLD_RANK], dtype=torch.int64, device=device
@@ -590,19 +624,33 @@ class Mixtral8x7B:
             dist.all_gather_into_tensor(global_map, local_map)
             first_node = torch.min(global_map[:, 0]).item()
             last_node = torch.max(global_map[:, 0]).item()
+            local_group, local_leader = None, None
 
             for ni in range(first_node, last_node + 1):
                 ranks_on_node = global_map[global_map[:, 0] == ni][:, 1].tolist()
-                node_group = dist.new_group(ranks_on_node, backend="nccl")
+                node_group = dist.new_group(
+                    ranks_on_node, backend="nccl", use_local_synchronization=True
+                )
                 if node_id == ni:
                     local_group = node_group
+                    local_leader = min(ranks_on_node)
 
-        # expert setup "li.ei.wi"
-        eis = set()
-        for k in experts.keys():
-            eis.add(int(k.split(".")[1]))
-        model_args.moe["expert_start_idx"] = min(eis)
-        model_args.moe["expert_end_idx"] = max(eis) + 1
+            prev_node = node_id - 1 if node_id != first_node else last_node
+            next_node = node_id + 1 if node_id != last_node else first_node
+            prev_stage_lead = torch.min(
+                global_map[global_map[:, 0] == prev_node][:, 1]
+            ).item()
+            next_stage_lead = torch.min(
+                global_map[global_map[:, 0] == next_node][:, 1]
+            ).item()
+
+            comms = [local_group, local_leader, prev_stage_lead, next_stage_lead]
+        else:
+            prev_stage_lead = (WORLD_RANK - 1 + WORLD_SIZE) % WORLD_SIZE
+            next_stage_lead = (WORLD_RANK + 1) % WORLD_SIZE
+            comms = [None, WORLD_RANK, prev_stage_lead, next_stage_lead]
+        comms.append(is_first_stage)
+        comms.append(is_last_stage)
 
         with torch.device("meta"):
             model = Transformer(model_args, Experts(experts), local_group)
@@ -766,15 +814,6 @@ class Mixtral8x7B:
             prev_pos = cur_pos
             if all(eos_reached):
                 break
-
-        if min_p_len != max_p_len:
-            warning = termcolor.colored(
-                "-" * 25
-                + "\nprompts have non-unifrom length, performance analysis might be inaccurate\n"
-                + "-" * 25,
-                "red",
-            )
-            print(warning)
 
         # this part is from here:
         # https://github.com/meta-llama/llama3/blob/main/llama/generation.py
