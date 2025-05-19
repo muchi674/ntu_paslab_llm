@@ -542,6 +542,8 @@ class Transformer(nn.Module):
                 idx += 3
             elif self.args.parallel_experts:
                 idx += 1
+            else:
+                return options[idx]
             if self.args.has_pp:
                 idx += 1
             return options[idx]
@@ -550,8 +552,8 @@ class Transformer(nn.Module):
             idx = 0
             if self.args.parallel_experts:
                 idx += 1
-            if self.args.has_pp:
-                idx += 1
+                if self.args.has_pp:
+                    idx += 1
             return options[idx]
 
         def get_ins(for_h: bool = True):
