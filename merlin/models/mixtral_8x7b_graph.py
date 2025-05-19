@@ -470,11 +470,13 @@ class Transformer(nn.Module):
                     args=args,
                     li=li - args.first_layer,
                     experts=experts,
-                    group=self.local_group,
+                    local_group=self.local_group,
                 )
                 for li in range(args.first_layer, args.last_layer + 1)
             }
         )
+        self.prefill_in_buffer: torch.Tensor
+        self.decode_in_buffer: torch.Tensor
         self.prefill_out_buffer: torch.Tensor
         self.decode_out_buffer: torch.Tensor
 
@@ -496,10 +498,20 @@ class Transformer(nn.Module):
         prefill_storage_idx: torch.Tensor,
         decode_storage_idx: torch.Tensor,
     ):
-        for li in range(self.args.n_layers):
+        for li in range(self.args.first_layer, self.args.last_layer + 1):
             self.layers[str(li)].attention.set_batch_level_args(
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
+        self.prefill_in_buffer = torch.zeros(
+            (bsz, seqlen, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.decode_in_buffer = torch.zeros(
+            (bsz, 1, self.args.dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
         self.prefill_out_buffer = torch.zeros(
             (bsz, seqlen, self.args.vocab_size),
             dtype=self.dtype,
@@ -654,7 +666,7 @@ class Transformer(nn.Module):
         return prefill_graphs, prefill_data, decode_graphs, decode_data
 
     def reset_graph_data(self, data: list[tuple[torch.Tensor]]):
-        for li in range(self.args.n_layers):
+        for li in range(self.args.last_layer - self.args.first_layer + 1):
             data[li + 1][1].zero_()
 
     def forward(
@@ -667,6 +679,8 @@ class Transformer(nn.Module):
         if self.is_first_stage:
             xs = self.tok_embeddings(xs)
         elif self.args.has_pp:
+            # ignore supplied token_ids
+            xs = self.prefill_in_buffer if prefill else self.decode_in_buffer
             if WORLD_RANK == self.local_leader:
                 for req in dist.batch_isend_irecv(
                     [dist.P2POp(dist.irecv, xs, self.prev_stage_leader)]
@@ -836,7 +850,7 @@ class Mixtral8x7B:
         return torch.empty(
             (
                 2,  # key and value
-                self.model.args.n_layers,
+                self.model.args.last_layer - self.model.args.first_layer + 1,
                 max_batch_size,
                 self.model.args.n_kv_heads,
                 max_seq_len,
@@ -907,11 +921,13 @@ class Mixtral8x7B:
             torch.ones((bsz, min_p_len), dtype=torch.long, device=device),
             prefill_graphs,
             prefill_data,
+            True,
         )
         model.forward(
             torch.ones((bsz, 1), dtype=torch.long, device=device),
             decode_graphs,
             decode_data,
+            False,
         )
         self.clear_cache(cache)
         model.reset_graph_data(prefill_data)
@@ -949,7 +965,12 @@ class Mixtral8x7B:
                 )
             if cur_pos > min_p_len + 1:
                 model.reset_graph_data(decode_data)
-            logits = model.forward(tokens[:, prev_pos:cur_pos], graphs, data)
+            logits = model.forward(
+                tokens[:, prev_pos:cur_pos],
+                graphs,
+                data,
+                prev_pos == 0,
+            )
 
             if prev_pos == 0:
                 prefill_time = time.time() - tic
