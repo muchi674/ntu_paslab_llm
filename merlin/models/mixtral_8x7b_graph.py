@@ -200,7 +200,7 @@ class MoeLayer(nn.Module):
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.first_expert = args.moe["first_expert"]
         self.last_expert = args.moe["last_expert"]
-        self.li = li
+        self.glob_li = li + args.first_layer
         self.gate = gate
         self.experts = experts
         self.dummy_zero = torch.zeros(
@@ -244,7 +244,7 @@ class MoeLayer(nn.Module):
                 continue
             expert_outs.append(
                 self.experts.forward(
-                    self.li,
+                    self.glob_li,
                     ei,
                     sorted_x[l:r],
                 )
