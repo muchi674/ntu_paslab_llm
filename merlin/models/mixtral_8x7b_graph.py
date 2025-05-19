@@ -284,12 +284,14 @@ class TransformerBlock(nn.Module):
             experts=experts,
         )
 
-    # --------------------
+    # ****************************************************************************************************
     # The section below is necessary since cuda graph only take functions with torch.tensor typed arguments
 
     # NOTATION for code below
     # h: residual connection
     # r: normal flow
+    # SUPPORTED COMBINATIONS:
+    # prefill/decode, first/subseq, not-prl/prl attn, not-prl/inter-prl/intra-prl experts
 
     def prefill_attn(self, x: torch.Tensor):
         return self.attention(
@@ -307,16 +309,27 @@ class TransformerBlock(nn.Module):
         sorted_r, topk_weight, offsets, adj_idxs = self.feed_forward.prep_ins(r)
         return sorted_r, topk_weight, offsets, adj_idxs
 
+    def moe_single_device(self, h: torch.Tensor, r: torch.Tensor):
+        return h + r.view(h.shape)  # MoE res-conn
+
     def moe_inter_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return h + r.view(h.shape)  # MoE res-conn
+        return h + r.view(h.shape)
 
     def moe_intra_allreduce(self, h: torch.Tensor, r: torch.Tensor):
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return h + r.view(h.shape)  # MoE res-conn
+        return h + r.view(h.shape)
+
+    # ==================================================
+    # PREFILL, SINGLE-DEVICE-ATTN
 
     def first_prefill_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
         return self.get_routings(x, self.prefill_attn(x), next_h)
+
+    def subseq_prefill_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_prefill_graphable(self.moe_single_device(h, r), next_h)
 
     def subseq_prefill_graphable_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -327,6 +340,9 @@ class TransformerBlock(nn.Module):
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
     ):
         return self.first_prefill_graphable(self.moe_intra_allreduce(h, r), next_h)
+
+    # --------------------------------------------------
+    # PREFILL, INTRA-TP-ATTN
 
     def first_prefill_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
@@ -348,8 +364,16 @@ class TransformerBlock(nn.Module):
             self.moe_intra_allreduce(h, r), next_h
         )
 
+    # ==================================================
+    # DECODE, SINGLE-DEVICE-ATTN
+
     def first_decode_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
         return self.get_routings(x, self.decode_attn(x), next_h)
+
+    def subseq_decode_graphable(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_decode_graphable(self.moe_single_device(h, r), next_h)
 
     def subseq_decode_graphable_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -360,6 +384,9 @@ class TransformerBlock(nn.Module):
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
     ):
         return self.first_decode_graphable(self.moe_intra_allreduce(h, r), next_h)
+
+    # --------------------------------------------------
+    # DECODE, INTRA-TP-ATTN
 
     def first_decode_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
@@ -381,7 +408,7 @@ class TransformerBlock(nn.Module):
             self.moe_intra_allreduce(h, r), next_h
         )
 
-    # --------------------
+    # ****************************************************************************************************
 
     def first_forward(
         self,
@@ -448,6 +475,8 @@ class Transformer(nn.Module):
                 for li in range(args.first_layer, args.last_layer + 1)
             }
         )
+        self.prefill_out_buffer: torch.Tensor
+        self.decode_out_buffer: torch.Tensor
 
     @property
     def dtype(self) -> torch.dtype:
@@ -459,6 +488,8 @@ class Transformer(nn.Module):
 
     def set_batch_level_args(
         self,
+        bsz: int,
+        seqlen: int,
         freqs_cis: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
@@ -469,13 +500,46 @@ class Transformer(nn.Module):
             self.layers[str(li)].attention.set_batch_level_args(
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
+        self.prefill_out_buffer = torch.zeros(
+            (bsz, seqlen, self.args.vocab_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.decode_out_buffer = torch.zeros(
+            (bsz, 1, self.args.vocab_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
 
     def help_draw_graphs(self, bsz: int, seqlen: int, prefill: bool, pool):
         top_k = self.args.moe["num_experts_per_tok"]
 
-        def select_graphable(prefill: bool, options: tuple):
-            idx = 0 if prefill else 2
-            idx += 0 if self.args.attn_tp else 1
+        def select_first_graphable(prefill: bool, options: tuple):
+            idx = 0
+            if not prefill:
+                idx += len(options) // 2
+            if self.args.parallel_attn:
+                idx += 1
+            return options[idx]
+
+        def select_subseq_graphable(prefill: bool, options: tuple):
+            idx = 0
+            if not prefill:
+                idx += len(options) // 2
+            if self.args.parallel_attn:
+                idx += 3
+            elif self.args.parallel_experts:
+                idx += 1
+            if self.args.has_pp:
+                idx += 1
+            return options[idx]
+
+        def select_last_graphable(options: tuple):
+            idx = 0
+            if self.args.parallel_experts:
+                idx += 1
+            if self.args.has_pp:
+                idx += 1
             return options[idx]
 
         def get_ins(for_h: bool = True):
@@ -519,13 +583,14 @@ class Transformer(nn.Module):
         h = get_ins()
         next_h = get_ins()
         res_r, topk_weight, offsets, adj_idxs = get_outs()
-        func = select_graphable(
+        k = str(self.args.first_layer)
+        func = select_first_graphable(
             prefill,
             (
-                self.layers["0"].first_prefill_graphable_intra_attn,
-                self.layers["0"].first_prefill_graphable,
-                self.layers["0"].first_decode_parallel_graphable,
-                self.layers["0"].first_decode_graphable,
+                self.layers[k].first_prefill_graphable,
+                self.layers[k].first_prefill_graphable_intra_attn,
+                self.layers[k].first_decode_graphable,
+                self.layers[k].first_decode_graphable_intra_attn,
             ),
         )
         # without this causes cublas_status_not_initialized error
@@ -535,18 +600,25 @@ class Transformer(nn.Module):
             res_r, topk_weight, offsets, adj_idxs = func(h, next_h)
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
-        for li in range(1, self.args.n_layers):
+        for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
             h = next_h
             r = get_ins(False)
             next_h = get_ins()
             res_r, topk_weight, offsets, adj_idxs = get_outs()
-            func = select_graphable(
+            k = str(li)
+            func = select_subseq_graphable(
                 prefill,
                 (
-                    self.layers[str(li)].subseq_prefill_parallel_graphable,
-                    self.layers[str(li)].subseq_prefill_graphable,
-                    self.layers[str(li)].subseq_decode_parallel_graphable,
-                    self.layers[str(li)].subseq_decode_graphable,
+                    self.layers[k].subseq_prefill_graphable,
+                    self.layers[k].subseq_prefill_graphable_inter_moe,
+                    self.layers[k].subseq_prefill_graphable_intra_moe,
+                    self.layers[k].subseq_prefill_graphable_intra_attn_inter_moe,
+                    self.layers[k].subseq_prefill_graphable_intra_attn_intra_moe,
+                    self.layers[k].subseq_decode_graphable,
+                    self.layers[k].subseq_decode_graphable_inter_moe,
+                    self.layers[k].subseq_decode_graphable_intra_moe,
+                    self.layers[k].subseq_decode_graphable_intra_attn_inter_moe,
+                    self.layers[k].subseq_decode_graphable_intra_attn_intra_moe,
                 ),
             )
             graphs.append(torch.cuda.CUDAGraph())
@@ -557,9 +629,16 @@ class Transformer(nn.Module):
         h = next_h
         r = get_ins(False)
         out = get_ins()
+        func = select_last_graphable(
+            (
+                self.layers[k].moe_single_device,
+                self.layers[k].moe_inter_allreduce,
+                self.layers[k].moe_intra_allreduce,
+            )
+        )
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-            out = self.layers[self.lli].moe_allreduce(h, r)
+            out = func(h, r)
         static_data.append((h, r, out))
 
         return graphs, static_data
@@ -583,6 +662,7 @@ class Transformer(nn.Module):
         xs: torch.Tensor,  # .shape = (bsz, seqlen) or (bsz, seqlen, dim)
         graphs: list[torch.cuda.CUDAGraph],
         data: list[tuple[torch.Tensor]],
+        prefill: bool,
     ) -> torch.Tensor:
         if self.is_first_stage:
             xs = self.tok_embeddings(xs)
@@ -596,7 +676,7 @@ class Transformer(nn.Module):
                 dist.broadcast(xs, self.local_leader, group=self.local_group)
 
         self.layers[str(self.args.first_layer)].first_forward(xs, graphs, data)
-        for li in range(self.args.first_layer + 1, self.args.last_layer - 1):
+        for li in range(self.args.first_layer + 1, self.args.last_layer):
             self.layers[str(li)].middle_forward(graphs, data)
         self.layers[str(self.args.last_layer)].last_forward(graphs, data)
         ys = data[-1][2]  # (h, r, out)
@@ -609,12 +689,9 @@ class Transformer(nn.Module):
                     [dist.P2POp(dist.isend, ys, self.next_stage_leader)]
                 ):
                     req.wait()
-            ys = torch.zeros(
-                (ys.shape[0], ys.shape[1], self.args.vocab_size),
-                dtype=self.dtype,
-                device=self.device,
-            )
-        dist.broadcast(ys, WORLD_SIZE - 1)
+            ys = self.prefill_out_buffer if prefill else self.decode_out_buffer
+        if self.args.has_pp:
+            dist.broadcast(ys, WORLD_SIZE - 1)
         return ys.float()
 
 
@@ -810,6 +887,8 @@ class Mixtral8x7B:
         p_store_idx = torch.arange(min_p_len, dtype=torch.long, device=device)
         d_store_idx = torch.arange(1, dtype=torch.long, device=device)
         model.set_batch_level_args(
+            bsz,
+            min_p_len,
             freqs_cis,
             cache,
             mask,
