@@ -27,8 +27,6 @@
 
 ## Build image [in the local machine] (optional)
 
-(Optional): The environment can be set up on the login node using tools like Conda and `pip install`. Activate the target environment before running a job, as it will be shared across computing nodes.
-
 For those requiring packages installed with `sudo`:
 
 Build the image in our local machine from the definition (`paslab_llm.def`)
@@ -44,13 +42,23 @@ Apptainer> exit
 Upload the built image (`paslab_llm.sif` 6.3G) to the remote slurm server
 
 ```bash
-$ sftp <location>
+$ sftp <remote location>
 sftp> put paslab_llm.sif
+```
+
+```bash
+# In slurm_job.sh
+SIF=/home/<YOUR_USERNAME>/paslab_llm.sif
+SINGULARITY="singularity run --nv $SIF"
+#...
+SRUN_CMD="$SINGULARITY $CMD"
+# ...
+srun $SRUN_CMD
 ```
 
 ## Environment setup [in the login node]
 
-The environment is shared to all nodes
+The environment is shared to all nodes: The environment can be set up on the login node using tools like Conda and `pip install`. Activate the target environment before running a job, as it will be shared across computing nodes.
 
 ```bash
 $ module load miniconda3 # You can install it yourself if the `miniconda3` module is not available in the environment
