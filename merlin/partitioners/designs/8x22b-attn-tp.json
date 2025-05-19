@@ -1,0 +1,9 @@
+{
+    "glob_experts_tp_size": 8,
+    "nodes": [
+        {
+            "node_id": 0,
+            "attn_tp_size": 8
+        }
+    ]
+}

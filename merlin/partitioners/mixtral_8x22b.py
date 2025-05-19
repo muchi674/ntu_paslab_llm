@@ -132,6 +132,7 @@ class Partitioner:
         weights = {}
         for wf in weight_files:
             weights.update(load_file(wf))
+        del weight_files
         return weights
 
     def partition_expert_weights(self, ws: dict) -> None:
@@ -142,18 +143,26 @@ class Partitioner:
         
         for ep in [4,5,6,7]:  # TODO: other 4 experts
             for li in tqdm(range(self.model_config["num_hidden_layers"]), desc=f"partitioning expert {ep}"):
-                print(f"partitioning expert {ep} layer {li}")
+                # print(f"partitioning expert {ep} layer {li}")
                 w1: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w1.weight")
                 w2: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w2.weight")
                 w3: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w3.weight")
-                # print(w1.shape, w2.shape, w3.shape)
-                for wi, w in enumerate([w1, w2, w3]):
-                    step, devices = self.expert_map[f"{li}-{ep}"]
-                    # print(devices, step)
-                    for di, tp_slice in zip(devices, torch.split(w, step, dim = wi % 2 )):
-                        sk = f"{li}.{ep}.w{wi + 1}"
-                        # print(sk, tp_slice.shape)
-                        partitions.setdefault(di, {})[sk] = tp_slice.clone()
+                step, devices = self.expert_map[f"{li}-{ep}"]
+                # for wi, w in enumerate([w1, w2, w3]):
+                #     for di, tp_slice in zip(devices, torch.split(w, step, dim = wi % 2 )):
+                #         sk = f"{li}.{ep}.w{wi + 1}"
+                #         # print(sk, tp_slice.shape)
+                #         partitions.setdefault(di, {})[sk] = tp_slice.clone()
+                for di, w1_tp_slice, w2_tp_slice, w3_tp_slice in zip(
+                    devices,
+                    torch.split(w1, step),
+                    torch.split(w2, step, dim=1),
+                    torch.split(w3, step),
+                ):
+                    partitions.setdefault(di, {})[f"{li}.{ep}.w_gate_up"] = torch.cat(
+                        (w1_tp_slice, w3_tp_slice)
+                    )
+                    partitions[di][f"{li}.{ep}.w_down"] = w2_tp_slice.T.clone()
                 del w1, w2, w3
                 
         for di, partition in tqdm(partitions.items(), desc="saving partitions"):
@@ -270,4 +279,4 @@ if __name__ == "__main__":
     weights_partitioner.start()
 
 
-# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b-tp.json --output-path=../../mnt/data2/llm_team/merlin_mixtral_8x22B_weight/
+# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b.json --output-path=../../mnt/data2/llm_team/merlin_mixtral_8x22B_weight/attn-tp-8/
