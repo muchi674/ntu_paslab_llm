@@ -470,7 +470,7 @@ class Transformer(nn.Module):
                     args=args,
                     li=li - args.first_layer,
                     experts=experts,
-                    group=self.local_group,
+                    local_group=self.local_group,
                 )
                 for li in range(args.first_layer, args.last_layer + 1)
             }
