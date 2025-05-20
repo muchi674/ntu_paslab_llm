@@ -200,7 +200,7 @@ class MoeLayer(nn.Module):
         self.num_experts_per_tok: int = args.moe["num_experts_per_tok"]
         self.first_expert = args.moe["first_expert"]
         self.last_expert = args.moe["last_expert"]
-        self.li = li
+        self.glob_li = li + args.first_layer
         self.gate = gate
         self.experts = experts
         self.dummy_zero = torch.zeros(
@@ -244,15 +244,18 @@ class MoeLayer(nn.Module):
                 continue
             expert_outs.append(
                 self.experts.forward(
-                    self.li,
+                    self.glob_li,
                     ei,
                     sorted_x[l:r],
                 )
             )
 
-        expert_outs = torch.cat(expert_outs)
-        expert_outs.mul_(topk_weight)
-        next_r.index_add_(0, adj_idxs, expert_outs)
+        if len(expert_outs):
+            l = expert_offsets[self.first_expert]
+            r = expert_offsets[self.last_expert + 1]
+            expert_outs = torch.cat(expert_outs)
+            expert_outs.mul_(topk_weight[l:r])
+            next_r.index_add_(0, adj_idxs[l:r], expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
@@ -461,7 +464,7 @@ class Transformer(nn.Module):
         self._precomputed_freqs_cis: torch.Tensor = None
         if self.is_first_stage:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        elif self.is_last_stage:
+        if self.is_last_stage:
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
@@ -470,11 +473,13 @@ class Transformer(nn.Module):
                     args=args,
                     li=li - args.first_layer,
                     experts=experts,
-                    group=self.local_group,
+                    local_group=self.local_group,
                 )
                 for li in range(args.first_layer, args.last_layer + 1)
             }
         )
+        self.prefill_in_buffer: torch.Tensor
+        self.decode_in_buffer: torch.Tensor
         self.prefill_out_buffer: torch.Tensor
         self.decode_out_buffer: torch.Tensor
 
@@ -496,20 +501,32 @@ class Transformer(nn.Module):
         prefill_storage_idx: torch.Tensor,
         decode_storage_idx: torch.Tensor,
     ):
-        for li in range(self.args.n_layers):
+        for li in range(self.args.first_layer, self.args.last_layer + 1):
             self.layers[str(li)].attention.set_batch_level_args(
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
-        self.prefill_out_buffer = torch.zeros(
-            (bsz, seqlen, self.args.vocab_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.decode_out_buffer = torch.zeros(
-            (bsz, 1, self.args.vocab_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if self.args.has_pp and not self.is_first_stage:
+            self.prefill_in_buffer = torch.zeros(
+                (bsz, seqlen, self.args.dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.decode_in_buffer = torch.zeros(
+                (bsz, 1, self.args.dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if self.args.has_pp and not self.is_last_stage:
+            self.prefill_out_buffer = torch.zeros(
+                (bsz, seqlen, self.args.vocab_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.decode_out_buffer = torch.zeros(
+                (bsz, 1, self.args.vocab_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
 
     def help_draw_graphs(self, bsz: int, seqlen: int, prefill: bool, pool):
         top_k = self.args.moe["num_experts_per_tok"]
@@ -530,6 +547,8 @@ class Transformer(nn.Module):
                 idx += 3
             elif self.args.parallel_experts:
                 idx += 1
+            else:
+                return options[idx]
             if self.args.has_pp:
                 idx += 1
             return options[idx]
@@ -538,8 +557,8 @@ class Transformer(nn.Module):
             idx = 0
             if self.args.parallel_experts:
                 idx += 1
-            if self.args.has_pp:
-                idx += 1
+                if self.args.has_pp:
+                    idx += 1
             return options[idx]
 
         def get_ins(for_h: bool = True):
@@ -654,7 +673,7 @@ class Transformer(nn.Module):
         return prefill_graphs, prefill_data, decode_graphs, decode_data
 
     def reset_graph_data(self, data: list[tuple[torch.Tensor]]):
-        for li in range(self.args.n_layers):
+        for li in range(self.args.last_layer - self.args.first_layer + 1):
             data[li + 1][1].zero_()
 
     def forward(
@@ -667,6 +686,8 @@ class Transformer(nn.Module):
         if self.is_first_stage:
             xs = self.tok_embeddings(xs)
         elif self.args.has_pp:
+            # ignore supplied token_ids
+            xs = self.prefill_in_buffer if prefill else self.decode_in_buffer
             if WORLD_RANK == self.local_leader:
                 for req in dist.batch_isend_irecv(
                     [dist.P2POp(dist.irecv, xs, self.prev_stage_leader)]
@@ -836,7 +857,7 @@ class Mixtral8x7B:
         return torch.empty(
             (
                 2,  # key and value
-                self.model.args.n_layers,
+                self.model.args.last_layer - self.model.args.first_layer + 1,
                 max_batch_size,
                 self.model.args.n_kv_heads,
                 max_seq_len,
@@ -895,6 +916,18 @@ class Mixtral8x7B:
             p_store_idx,
             d_store_idx,
         )
+
+        tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
+        for k, t in enumerate(encoded_prompts):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=device)
+        input_text_mask = tokens != pad_id
+
+        dummy_p_xs = torch.ones((bsz, min_p_len), dtype=torch.long, device=device)
+        dummy_d_xs = torch.ones((bsz, 1), dtype=torch.long, device=device)
+        n_warmups = 16
+
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
         )
@@ -903,19 +936,13 @@ class Mixtral8x7B:
         model.reset_graph_data(decode_data)
 
         # warmup
-        model.forward(
-            torch.ones((bsz, min_p_len), dtype=torch.long, device=device),
-            prefill_graphs,
-            prefill_data,
-        )
-        model.forward(
-            torch.ones((bsz, 1), dtype=torch.long, device=device),
-            decode_graphs,
-            decode_data,
-        )
+        for _ in range(n_warmups):
+            model.forward(dummy_p_xs, prefill_graphs, prefill_data, True)
+            model.reset_graph_data(prefill_data)
+        for _ in range(n_warmups):
+            model.forward(dummy_d_xs, decode_graphs, decode_data, False)
+            model.reset_graph_data(decode_data)
         self.clear_cache(cache)
-        model.reset_graph_data(prefill_data)
-        model.reset_graph_data(decode_data)
 
         dist.barrier()
         tic = time.time()
@@ -924,14 +951,6 @@ class Mixtral8x7B:
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
 
-        tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
-        for k, t in enumerate(encoded_prompts):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device=device)
-        input_text_mask = tokens != pad_id
-
         # notice:
         # 1. it seems that prompts with length < max will generate
         # max_seq_len - len(prompt) tokens
@@ -939,7 +958,7 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            dist.barrier()
+            # dist.barrier()
             if prev_pos == 0:
                 graphs, data = prefill_graphs, prefill_data
             else:
@@ -949,7 +968,12 @@ class Mixtral8x7B:
                 )
             if cur_pos > min_p_len + 1:
                 model.reset_graph_data(decode_data)
-            logits = model.forward(tokens[:, prev_pos:cur_pos], graphs, data)
+            logits = model.forward(
+                tokens[:, prev_pos:cur_pos],
+                graphs,
+                data,
+                prev_pos == 0,
+            )
 
             if prev_pos == 0:
                 prefill_time = time.time() - tic
@@ -962,8 +986,9 @@ class Mixtral8x7B:
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            next_token = (
+                input_text_mask[:, cur_pos] * tokens[:, cur_pos]
+                + ~input_text_mask[:, cur_pos] * next_token
             )
             tokens[:, cur_pos] = next_token
             eos_reached |= ~input_text_mask[:, cur_pos] & (next_token == eos_id)
@@ -1069,11 +1094,11 @@ def main(
         start = end
         time.sleep(3)
 
-    if WORLD_RANK == 0:
+    if WORLD_RANK == 0 and len(prefill_tps) > 1:
         print("=" * 20)
         print("RUN STATISTICS")
-        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+        print(f"avg prefill throughput: {mean(prefill_tps[1:]):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps[1:]):.2f} t/s")
 
     dist.barrier()
     # dist.destroy_process_group()
