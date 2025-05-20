@@ -12,6 +12,8 @@ from safetensors.torch import load_file
 import torch
 from tqdm import tqdm
 
+ONLY_PART_NON_EXPERT_WEIGHTS = False
+
 def ceildiv(a, b):
     # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
     return -(a // -b)
@@ -164,7 +166,7 @@ class Partitioner:
                     )
                     partitions[di][f"{li}.{ep}.w_down"] = w2_tp_slice.T.clone()
                 del w1, w2, w3
-                
+        
         for di, partition in tqdm(partitions.items(), desc="saving partitions"):
             file_path = self.output_path / f"experts-{di}.pt"
             if file_path.exists():
@@ -177,7 +179,15 @@ class Partitioner:
         return ws
 
     def partition_non_expert_weights(self, ws: dict) -> None:
+        if(ONLY_PART_NON_EXPERT_WEIGHTS):
+            for ep in range(8):  
+                for li in range(self.model_config["num_hidden_layers"]):
+                    w1: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w1.weight")
+                    w2: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w2.weight")
+                    w3: torch.Tensor = ws.pop(f"model.layers.{li}.block_sparse_moe.experts.{ep}.w3.weight")
+                    del w1, w2, w3
         print("partitioning non-expert weights")
+        print(ws.keys())
         n_model_layers = self.model_config["num_hidden_layers"]
         for li in range(n_model_layers):
             ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(   
@@ -261,6 +271,7 @@ class Partitioner:
         # logging.info("finished partitioning expert weights")
         # self.partition_non_expert_weights(ws)
         # logging.info("finished partitioning non-expert weights")
+        ONLY_PART_NON_EXPERT_WEIGHTS = True
         self.partition_non_expert_weights(self.load_weights())
         logging.info("finished partitioning non-expert weights")
 
@@ -278,5 +289,7 @@ if __name__ == "__main__":
     )
     weights_partitioner.start()
 
-
-# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b.json --output-path=../../mnt/data2/llm_team/merlin_mixtral_8x22B_weight/attn-tp-8/
+### attn-tp-8
+# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b-attn-tp.json --output-path=../../mnt/data2/llm_team/merlin_mixtral_8x22B_weight/attn-tp-8/
+### ep-8
+# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b-ep.json --output-path=../../mnt/data1/llm_team/merlin_mixtral_8x22B_weight/ep-8/
