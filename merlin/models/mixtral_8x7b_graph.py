@@ -250,9 +250,12 @@ class MoeLayer(nn.Module):
                 )
             )
 
-        expert_outs = torch.cat(expert_outs)
-        expert_outs.mul_(topk_weight)
-        next_r.index_add_(0, adj_idxs, expert_outs)
+        if len(expert_outs):
+            l = expert_offsets[self.first_expert]
+            r = expert_offsets[self.last_expert + 1]
+            expert_outs = torch.cat(expert_outs)
+            expert_outs.mul_(topk_weight[l:r])
+            next_r.index_add_(0, adj_idxs, expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
