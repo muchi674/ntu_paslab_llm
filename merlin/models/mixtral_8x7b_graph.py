@@ -926,7 +926,7 @@ class Mixtral8x7B:
 
         dummy_p_xs = torch.ones((bsz, min_p_len), dtype=torch.long, device=device)
         dummy_d_xs = torch.ones((bsz, 1), dtype=torch.long, device=device)
-        n_warmups = 16
+        n_warmups = 32
 
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
@@ -1094,11 +1094,11 @@ def main(
         start = end
         time.sleep(3)
 
-    if WORLD_RANK == 0:
+    if WORLD_RANK == 0 and len(prefill_tps) > 1:
         print("=" * 20)
         print("RUN STATISTICS")
-        print(f"avg prefill throughput: {mean(prefill_tps):.2f} t/s")
-        print(f"avg decode throughput: {mean(decode_tps):.2f} t/s")
+        print(f"avg prefill throughput: {mean(prefill_tps[1:]):.2f} t/s")
+        print(f"avg decode throughput: {mean(decode_tps[1:]):.2f} t/s")
 
     dist.barrier()
     # dist.destroy_process_group()
