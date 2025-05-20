@@ -502,26 +502,28 @@ class Transformer(nn.Module):
             self.layers[str(li)].attention.set_batch_level_args(
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
-        self.prefill_in_buffer = torch.zeros(
-            (bsz, seqlen, self.args.dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.decode_in_buffer = torch.zeros(
-            (bsz, 1, self.args.dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.prefill_out_buffer = torch.zeros(
-            (bsz, seqlen, self.args.vocab_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.decode_out_buffer = torch.zeros(
-            (bsz, 1, self.args.vocab_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if self.args.has_pp and not self.args.is_first_stage:
+            self.prefill_in_buffer = torch.zeros(
+                (bsz, seqlen, self.args.dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.decode_in_buffer = torch.zeros(
+                (bsz, 1, self.args.dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if self.args.has_pp and not self.args.is_last_stage:
+            self.prefill_out_buffer = torch.zeros(
+                (bsz, seqlen, self.args.vocab_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.decode_out_buffer = torch.zeros(
+                (bsz, 1, self.args.vocab_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
 
     def help_draw_graphs(self, bsz: int, seqlen: int, prefill: bool, pool):
         top_k = self.args.moe["num_experts_per_tok"]
