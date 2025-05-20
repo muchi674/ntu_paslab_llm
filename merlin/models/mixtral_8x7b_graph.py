@@ -926,7 +926,7 @@ class Mixtral8x7B:
 
         dummy_p_xs = torch.ones((bsz, min_p_len), dtype=torch.long, device=device)
         dummy_d_xs = torch.ones((bsz, 1), dtype=torch.long, device=device)
-        n_warmups = 32
+        n_warmups = 16
 
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
