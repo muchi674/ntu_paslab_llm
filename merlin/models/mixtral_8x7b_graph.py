@@ -505,7 +505,7 @@ class Transformer(nn.Module):
             self.layers[str(li)].attention.set_batch_level_args(
                 freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
             )
-        if self.args.has_pp and not self.args.is_first_stage:
+        if self.args.has_pp and not self.is_first_stage:
             self.prefill_in_buffer = torch.zeros(
                 (bsz, seqlen, self.args.dim),
                 dtype=self.dtype,
@@ -516,7 +516,7 @@ class Transformer(nn.Module):
                 dtype=self.dtype,
                 device=self.device,
             )
-        if self.args.has_pp and not self.args.is_last_stage:
+        if self.args.has_pp and not self.is_last_stage:
             self.prefill_out_buffer = torch.zeros(
                 (bsz, seqlen, self.args.vocab_size),
                 dtype=self.dtype,
