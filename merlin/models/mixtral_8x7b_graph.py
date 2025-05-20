@@ -916,6 +916,18 @@ class Mixtral8x7B:
             p_store_idx,
             d_store_idx,
         )
+
+        tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
+        for k, t in enumerate(encoded_prompts):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=device)
+        input_text_mask = tokens != pad_id
+
+        dummy_p_xs = torch.ones((bsz, min_p_len), dtype=torch.long, device=device)
+        dummy_d_xs = torch.ones((bsz, 1), dtype=torch.long, device=device)
+        n_warmups = 16
+
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
         )
@@ -924,21 +936,13 @@ class Mixtral8x7B:
         model.reset_graph_data(decode_data)
 
         # warmup
-        model.forward(
-            torch.ones((bsz, min_p_len), dtype=torch.long, device=device),
-            prefill_graphs,
-            prefill_data,
-            True,
-        )
-        model.forward(
-            torch.ones((bsz, 1), dtype=torch.long, device=device),
-            decode_graphs,
-            decode_data,
-            False,
-        )
+        for _ in range(n_warmups):
+            model.forward(dummy_p_xs, prefill_graphs, prefill_data, True)
+            model.reset_graph_data(prefill_data)
+        for _ in range(n_warmups):
+            model.forward(dummy_d_xs, decode_graphs, decode_data, False)
+            model.reset_graph_data(decode_data)
         self.clear_cache(cache)
-        model.reset_graph_data(prefill_data)
-        model.reset_graph_data(decode_data)
 
         dist.barrier()
         tic = time.time()
@@ -947,14 +951,6 @@ class Mixtral8x7B:
         if profile:
             torch.cuda.cudart().cudaProfilerStart()
 
-        tokens = torch.full((bsz, max_seq_len), pad_id, dtype=torch.long, device=device)
-        for k, t in enumerate(encoded_prompts):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device=device)
-        input_text_mask = tokens != pad_id
-
         # notice:
         # 1. it seems that prompts with length < max will generate
         # max_seq_len - len(prompt) tokens
@@ -962,7 +958,7 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            dist.barrier()
+            # dist.barrier()
             if prev_pos == 0:
                 graphs, data = prefill_graphs, prefill_data
             else:
@@ -990,8 +986,9 @@ class Mixtral8x7B:
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            next_token = (
+                input_text_mask[:, cur_pos] * tokens[:, cur_pos]
+                + ~input_text_mask[:, cur_pos] * next_token
             )
             tokens[:, cur_pos] = next_token
             eos_reached |= ~input_text_mask[:, cur_pos] & (next_token == eos_id)
