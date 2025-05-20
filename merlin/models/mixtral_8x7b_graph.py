@@ -461,7 +461,7 @@ class Transformer(nn.Module):
         self._precomputed_freqs_cis: torch.Tensor = None
         if self.is_first_stage:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        elif self.is_last_stage:
+        if self.is_last_stage:
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
