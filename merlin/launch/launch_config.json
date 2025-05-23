@@ -5,9 +5,9 @@
   "username": "joe",
   "branch_name": "merlin-joe",
   "shared_exec_args": {
-    "n_prompts": 8,
+    "n_prompts": 16,
     "batch_size": 4,
-    "max_tokens": 128,
+    "max_tokens": 8,
     "hide_resp": false
   },
   "nodes": {
@@ -17,8 +17,8 @@
       "ngpus": 2,
       "proj_dir": "/mnt/joe/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
-      "script": "models/mixtral_8x7b_v0.py",
-      "model_path": "/mnt/llm_team/merlin_mixtral_weights/experts-tp",
+      "script": "models/mixtral_8x7b_graph.py",
+      "model_path": "/mnt/llm_team/merlin_mixtral_weights/ep-experts-tp",
       "prompt_path": "/mnt/joe/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 0,
       "profile": false,
@@ -30,12 +30,12 @@
       "ngpus": 4,
       "proj_dir": "/mnt/disk3/joe/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
-      "script": "models/mixtral_8x7b_v0.py",
-      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/experts-tp",
+      "script": "models/mixtral_8x7b_graph.py",
+      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/ep-experts-tp",
       "prompt_path": "/mnt/disk3/joe/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 1,
-      "profile": false,
-      "profiling_output": "n46-EA-TP-bs16"
+      "profile": true,
+      "profiling_output": "n46-EP-TP-bs4-graph"
     }
   }
 }
