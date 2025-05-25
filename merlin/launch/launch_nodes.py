@@ -152,7 +152,7 @@ def main():
             + "'"
             + f"cd {proj_dir} && "
             + f"git pull origin {branch_name} && "
-            + f"source .venv/bin/activate && "
+            + f"conda activate merlin && "
             + f"python {proj_dir}/{launcher} "
         )
 
