@@ -8,7 +8,7 @@ import argparse
 import glob
 import json
 import logging
-
+import shutil
 import torch
 
 
@@ -26,7 +26,12 @@ class Partitioner:
         self.model_config, self.expert_map, self.attn_tp_map, self.non_expert_pp_map = (
             self.get_configs()
         )
-
+    def copy_non_safetensors_files(self) -> None:
+        for fp in self.model_path.iterdir():
+            if fp.is_file() and fp.suffix != ".safetensors" and fp.suffix != ".pt":
+                dest = self.output_path / fp.name
+                if fp.resolve() != dest.resolve():
+                    shutil.copy2(fp, dest)  
     def get_configs(self) -> tuple[dict, dict]:
 
         def get_devices(parallel_size: int, node_id: int):
@@ -251,6 +256,8 @@ class Partitioner:
         logging.info("finished partitioning expert weights")
         self.partition_non_expert_weights(ws)
         logging.info("finished partitioning non-expert weights")
+        self.copy_non_safetensors_files()
+        logging.info("copied non-pt model files")
 
 
 if __name__ == "__main__":
