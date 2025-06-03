@@ -432,7 +432,7 @@ class MoeLayer(nn.Module):
 
         # for experiment #
         torch.cuda.synchronize(device=inputs.device)
-        dist.barrier(group=self.group)
+        dist.barrier()
         ##################
 
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
