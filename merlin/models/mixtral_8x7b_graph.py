@@ -1051,8 +1051,8 @@ def main(
 
     prefill_tps = []
     decode_tps = []
-    start = 0
-    for end in range(batch_size, n_prompts + 1, batch_size):
+    for start in range(0, n_prompts, batch_size):
+        end = start + batch_size
         prompt_batch = prompts[start:end]
         bsz = len(prompt_batch)
         responses, n_p_tkns, n_gen_tkns, prefill_time, decode_time = model.generate(
@@ -1060,7 +1060,7 @@ def main(
             max_gen_len=max_gen_len,
             temperature=0.0,
             device=gpu,
-            profile=end == n_prompts,
+            profile=end >= n_prompts,
         )
 
         if WORLD_RANK == 0:
@@ -1091,7 +1091,6 @@ def main(
                     print(f"PROMPT:\n{p}")
                     print(f"RESPONSE:\n{resp}\n")
 
-        start = end
         time.sleep(3)
 
     if WORLD_RANK == 0 and len(prefill_tps) > 1:
