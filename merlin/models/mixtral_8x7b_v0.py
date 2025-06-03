@@ -713,7 +713,7 @@ def main(
     )
     group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     tokenizer = MistralTokenizer.v1()
-    model = Transformer.load(Path(model_path), node_id, gpu, group)
+    model = Transformer.load(Path(model_path), gpu, group)
 
     # warmup
     generate(
