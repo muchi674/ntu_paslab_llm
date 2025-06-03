@@ -389,11 +389,18 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
 
+    # def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+    #     w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+    #     w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+    #     w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
+    #     return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+        w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
+        w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = nn.functional.silu(gate_states) * up_states
+        return hidden_states @ w_down
 
 
 class MoeLayer(nn.Module):
@@ -414,6 +421,12 @@ class MoeLayer(nn.Module):
         topk_weight, topk_idx = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(inputs.dtype)
         y = self.moe_infer(inputs, topk_idx, topk_weight).view(*orig_shape)
+
+        # for experiment #
+        torch.cuda.synchronize(device=inputs.device)
+        dist.barrier(group=self.group)
+        ##################
+        
         dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.group)
         return y
 
