@@ -44,7 +44,7 @@ export RDZV_ID=$RANDOM
 #     --batch-size 1 \
 #     --max-tokens 40"
 
-CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/input_seqlen/slurm_jobs/mixtral_8x7b_v0_maxtokens.sh"
+CMD="bash /home/u20008787/ntu_paslab_llm/merlin/misc_tests/bubble/slurm_jobs/mb_single.sh"
 
 # SRUN_CMD="$SINGULARITY $CMD"
 

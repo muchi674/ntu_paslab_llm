@@ -83,7 +83,7 @@ class WorkLoadBase(nn.Module):
 
         self.kernels = self._gen_mock_net()
         
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         for i, kernel in enumerate(self.kernels):
             if kernel.kernel_type == 'comp':
                 input = kernel(input)
@@ -136,7 +136,7 @@ class SyncLatencyMicroBenchmark:
             timer.flush_buffer(isPrefill=True)
 
     @torch.inference_mode()
-    def run_decode(self, num_batches:int = 32, batch_size: int = 1, max_tokens: int = 40):
+    def run_decode(self, num_batches:int = 32, batch_size: int = 1, max_tokens: int = 128):
         self.workload = self.workload.eval()
 
         
@@ -144,13 +144,25 @@ class SyncLatencyMicroBenchmark:
         for i in range(num_batches):
             for i in range(max_tokens):
                 timer.record_start(self.device)
-                input = self.workload(input)
+                # input = self.workload(input)
+                output: torch.Tensor = self.workload(input)
+                next_token = output[:, -1, :]
+                input = torch.cat([input, next_token], dim=1)
 
                 timer.record_elapsed_time()
 
             timer.flush_buffer(isPrefill=False)
 
-        
+    @torch.inference_mode()
+    def dry_run_decode(self, num_batches:int = 32, batch_size: int = 1, max_tokens: int = 40):
+        self.workload = self.workload.eval()
+
+        input = self.workload.gen_mock_input(batch_size=batch_size, seqlen=1)
+        for i in range(num_batches):
+            for i in range(max_tokens):
+                output: torch.Tensor = self.workload(input)
+                next_token = output[:, -1, :]
+                input = torch.cat([input, next_token], dim=1)
         
     @property
     def device(self) -> torch.device:
@@ -173,18 +185,22 @@ def main(
     # group = dist.new_group(list(range(WORLD_SIZE)), use_local_synchronization=True)
     workload = WorkLoadBase(device=gpu).to(device=gpu)
     mb = SyncLatencyMicroBenchmark(workload=workload)
-    mb.run_decode(num_batches=16, batch_size=batch_size, max_tokens=max_tokens) # warmup
-    timer.reset()
+    # mb.run_decode(num_batches=16, batch_size=batch_size, max_tokens=max_tokens) # warmup
+    mb.dry_run_decode(num_batches=16, batch_size=batch_size, max_tokens=max_tokens)
+    # timer.reset()
 
     torch.cuda.cudart().cudaProfilerStart()
     # =============================================================================
     # TODO
-    mb.run_prefill(num_batches=num_batches, batch_size=batch_size)
-    mb.run_decode(num_batches=num_batches, batch_size=batch_size, max_tokens=max_tokens)
-    timer.all_gather(num_batches, max_tokens, None)
+    # mb.run_prefill(num_batches=num_batches, batch_size=batch_size)
+    # mb.run_decode(num_batches=num_batches, batch_size=batch_size, max_tokens=max_tokens)
+    mb.dry_run_decode(num_batches=num_batches, batch_size=batch_size, max_tokens=max_tokens)
+
+    # timer.all_gather(num_batches, max_tokens, None)
 
     if WORLD_RANK == 0:
-        timer.get_sync_latency()
+        # timer.get_sync_latency()
+        pass
     
     # =============================================================================
     torch.cuda.cudart().cudaProfilerStop()
@@ -202,7 +218,7 @@ if __name__ == "__main__":
     # parser.add_argument("--prompt-path", type=str)
     # parser.add_argument("--n-prompts", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-tokens", type=int, default=40)
+    parser.add_argument("--max-tokens", type=int, default=128)
     # parser.add_argument("--hide-resp", action="store_true")
     args = parser.parse_args()
 
