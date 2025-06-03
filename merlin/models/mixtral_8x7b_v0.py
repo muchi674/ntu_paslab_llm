@@ -558,7 +558,7 @@ class Transformer(nn.Module):
         return outs.float()
 
     @staticmethod
-    def load(model_path: Path, node_id: int, gpu: torch.device, group) -> "Transformer":
+    def load(model_path: Path, gpu: torch.device, group) -> "Transformer":
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
         non_experts = torch.load(
             model_path / "non-experts.pt",
@@ -567,8 +567,7 @@ class Transformer(nn.Module):
             mmap=True,
         )
         experts = torch.load(
-            # model_path / f"experts-{WORLD_RANK}.pt",
-            model_path / f"experts-{node_id}-{LOCAL_RANK}.pt",
+            model_path / f"experts-{WORLD_RANK}.pt",
             map_location=gpu,
             weights_only=True,
             mmap=True,
@@ -691,7 +690,6 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
 def main(
     model_path: str,
-    node_id: int,
     prompt: str,
     prompt_path: str,
     n_prompts: int = 1,
@@ -808,7 +806,6 @@ if __name__ == "__main__":
 
     main(
         args.model_path,
-        args.node_id,
         args.prompt,
         args.prompt_path,
         args.n_prompts,
