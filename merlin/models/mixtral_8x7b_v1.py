@@ -394,13 +394,21 @@ class Experts:
     def __init__(self, ws: dict):
         self.ws: dict[str, torch.Tensor] = ws
 
-    def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
-        if f"{li}.{ei}.w1" not in self.ws:
-            return None
-        w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
-        w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
-        w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
-        return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+    # def forward(self, li: int, ei: int, x: torch.Tensor) -> Optional[torch.Tensor]:
+    #     if f"{li}.{ei}.w1" not in self.ws:
+    #         return None
+    #     w1: torch.Tensor = self.ws[f"{li}.{ei}.w1"].T
+    #     w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
+    #     w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
+    #     return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
+    
+    def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
+        w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
+        w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = nn.functional.silu(gate_states) * up_states
+        return hidden_states @ w_down
+
 
 
 class MoeLayer(nn.Module):
