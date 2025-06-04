@@ -758,9 +758,14 @@ class Mixtral8x7B:
     @staticmethod
     def build(model_path: str, node_id: int, device: torch.device) -> "Mixtral8x7B":
         model_path = Path(model_path)
-        non_experts_filename = "non-experts.pt"
-        if not (model_path / non_experts_filename).is_file():
-            non_experts_filename = f"non-experts-{node_id}-{LOCAL_RANK}.pt"
+        non_experts_filename: str
+        for filename in [
+            "non-experts.pt",
+            f"non-experts-{WORLD_RANK}.pt",
+            f"non-experts-{node_id}-{LOCAL_RANK}.pt",
+        ]:
+            if (model_path / filename).is_file():
+                non_experts_filename = filename
         experts_filename = f"experts-{WORLD_RANK}.pt"
         if not (model_path / experts_filename).is_file():
             experts_filename = f"experts-{node_id}-{LOCAL_RANK}.pt"
