@@ -5,8 +5,8 @@
   "username": "gaven",
   "branch_name": "merlin-gaven",
   "shared_exec_args": {
-    "n_prompts": 32,
-    "batch_size": 1,
+    "n_prompts": 512,
+    "batch_size": 16,
     "max_tokens": 128,
     "hide_resp": false
   },
@@ -18,7 +18,7 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/llm_team/merlin_mixtral_weights/experts-attn-tp",
+      "model_path": "/mnt/llm_team/merlin_mixtral_weights/ep-experts-attn-tp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 0,
       "profile": false,
@@ -31,7 +31,7 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/experts-attn-tp",
+      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/ep-experts-attn-tp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 1,
       "profile": false,
