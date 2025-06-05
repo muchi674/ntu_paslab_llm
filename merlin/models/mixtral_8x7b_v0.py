@@ -394,11 +394,7 @@ class Experts:
     #     w2: torch.Tensor = self.ws[f"{li}.{ei}.w2"]
     #     w3: torch.Tensor = self.ws[f"{li}.{ei}.w3"].T
     #     return (nn.functional.silu(x @ w1) * (x @ w3)) @ w2
-<<<<<<< HEAD
-
-=======
     
->>>>>>> 9b64ba40ba051eee18a739d744fddbfe64a52418
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
