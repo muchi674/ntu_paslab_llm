@@ -166,7 +166,7 @@ class Partitioner:
 
     def save_weights(self, ws: dict[str, torch.Tensor], file_path: Path) -> None:
         if file_path.exists():
-            existing = torch.load(file_path, weights_only=True, mmap=True)
+            existing = torch.load(file_path, weights_only=True)
         else:
             existing = {}
         existing.update(ws)
