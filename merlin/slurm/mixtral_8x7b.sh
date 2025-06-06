@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #Batch Job Paremeters
-#SBATCH --account=GOV
+#SBATCH --account=GOV113121
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
