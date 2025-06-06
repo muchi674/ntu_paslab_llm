@@ -3,17 +3,15 @@ Partitioner designer for mixtral-8x22b weights from
 https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1
 """
 
-from pathlib import Path
 import argparse
-import glob
-import logging
+import gc
 import json
+import logging
+from pathlib import Path
 
+import torch
 from safetensors.torch import load_file
 from tqdm import tqdm
-import torch
-
-ONLY_PART_NON_EXPERT_WEIGHTS = False
 
 
 def ceildiv(a, b):
@@ -57,6 +55,7 @@ class Partitioner:
         non_expert_pp_map = {}
         next_layer, next_expert = 0, 0
         glob_experts_tp_size = design.get("glob_experts_tp_size", None)
+        glob_attn_tp_size = design.get("glob_attn_tp_size", None)
 
         for d in design.get("nodes", [{}]):
             (
@@ -84,7 +83,10 @@ class Partitioner:
                 glob_experts_tp_size or experts_tp_size or ep_size or pp_size,
                 None if glob_experts_tp_size else node_id,
             )
-            attn_devices = get_devices(attn_tp_size, node_id)
+            attn_devices = get_devices(
+                glob_attn_tp_size or attn_tp_size,
+                None if glob_attn_tp_size else node_id,
+            )
             pp_bin_size = ceildiv(
                 n_layers or model_config["num_hidden_layers"], pp_size or 1
             )
@@ -132,88 +134,86 @@ class Partitioner:
         assert next_expert == 0 or next_expert == model_config["num_local_experts"]
         return model_config, expert_map, attn_tp_map, non_expert_pp_map
 
-    def load_weights(self) -> dict:
-        weight_files = glob.glob(str(self.model_path / "model-*-of-00059.safetensors"))
-        weights = {}
-        for wf in weight_files:
-            weights.update(load_file(wf))
-        del weight_files
-        return weights
+    def get_weights_map(self) -> dict:
+        with open(self.model_path / "model.safetensors.index.json", "r") as f:
+            metadata = json.load(f)
 
-    def partition_expert_weights(self, ws: dict) -> None:
-        print("partitioning expert weights")
-        interm_dim = self.model_config["intermediate_size"]
-        partitions = {}
-        # for each expert, we need to gather the weights from all layers then partition
-
-        for ep in [4, 5, 6, 7]:  # TODO: other 4 experts
-            for li in tqdm(
-                range(self.model_config["num_hidden_layers"]),
-                desc=f"partitioning expert {ep}",
-            ):
-                # print(f"partitioning expert {ep} layer {li}")
-                w1: torch.Tensor = ws.pop(
-                    f"model.layers.{li}.block_sparse_moe.experts.{ep}.w1.weight"
-                )
-                w2: torch.Tensor = ws.pop(
-                    f"model.layers.{li}.block_sparse_moe.experts.{ep}.w2.weight"
-                )
-                w3: torch.Tensor = ws.pop(
-                    f"model.layers.{li}.block_sparse_moe.experts.{ep}.w3.weight"
-                )
-                step, devices = self.expert_map[f"{li}-{ep}"]
-                # for wi, w in enumerate([w1, w2, w3]):
-                #     for di, tp_slice in zip(devices, torch.split(w, step, dim = wi % 2 )):
-                #         sk = f"{li}.{ep}.w{wi + 1}"
-                #         # print(sk, tp_slice.shape)
-                #         partitions.setdefault(di, {})[sk] = tp_slice.clone()
-                for di, w1_tp_slice, w2_tp_slice, w3_tp_slice in zip(
-                    devices,
-                    torch.split(w1, step),
-                    torch.split(w2, step, dim=1),
-                    torch.split(w3, step),
-                ):
-                    partitions.setdefault(di, {})[f"{li}.{ep}.w_gate_up"] = torch.cat(
-                        (w1_tp_slice, w3_tp_slice)
-                    )
-                    partitions[di][f"{li}.{ep}.w_down"] = w2_tp_slice.T.clone()
-                del w1, w2, w3
-
-        for di, partition in tqdm(partitions.items(), desc="saving partitions"):
-            file_path = self.output_path / f"experts-{di}.pt"
-            if file_path.exists():
-                existing = torch.load(file_path)
+        weights_map = [
+            (set(), set()) for _ in range(self.model_config["num_hidden_layers"])
+        ]
+        for weight_name, file_name in metadata["weight_map"].items():
+            li: int
+            if weight_name == "model.embed_tokens.weight":
+                li = 0
+            elif weight_name == "model.norm.weight" or weight_name == "lm_head.weight":
+                li = -1
             else:
-                existing = {}
-            existing.update(partition)
-            torch.save(existing, file_path)
-            del existing
+                li = int(weight_name.split(".")[2])
+
+            weights_map[li][0].add(weight_name)
+            weights_map[li][1].add(file_name)
+
+        return weights_map
+
+    def load_layer_weights(self, w_names: set[str], w_filenames: set[str]) -> dict:
+        ws = {}
+        for filename in w_filenames:
+            tmp = load_file(self.model_path / filename)
+            for k, v in tmp.items():
+                if k in w_names:
+                    ws[k] = v
         return ws
 
-    def partition_non_expert_weights(self, ws: dict) -> None:
-        if ONLY_PART_NON_EXPERT_WEIGHTS:
-            for ep in range(8):
-                for li in range(self.model_config["num_hidden_layers"]):
-                    w1: torch.Tensor = ws.pop(
-                        f"model.layers.{li}.block_sparse_moe.experts.{ep}.w1.weight"
-                    )
-                    w2: torch.Tensor = ws.pop(
-                        f"model.layers.{li}.block_sparse_moe.experts.{ep}.w2.weight"
-                    )
-                    w3: torch.Tensor = ws.pop(
-                        f"model.layers.{li}.block_sparse_moe.experts.{ep}.w3.weight"
-                    )
-                    del w1, w2, w3
-        print("partitioning non-expert weights")
-        print(ws.keys())
-        n_model_layers = self.model_config["num_hidden_layers"]
-        for li in range(n_model_layers):
-            ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
-                f"model.layers.{li}.block_sparse_moe.gate.weight"
+    def save_weights(self, ws: dict[str, torch.Tensor], file_path: Path) -> None:
+        if file_path.exists():
+            existing = torch.load(file_path, weights_only=True, mmap=True)
+        else:
+            existing = {}
+        existing.update(ws)
+        torch.save(existing, file_path)
+
+    def partition_expert_weights(
+        self, ws: dict[str, torch.Tensor], li: int
+    ) -> dict[str, torch.Tensor]:
+        partitions = {}
+
+        for ei in range(self.model_config["num_local_experts"]):
+            w1: torch.Tensor = ws.pop(
+                f"model.layers.{li}.block_sparse_moe.experts.{ei}.w1.weight"
             )
+            w2: torch.Tensor = ws.pop(
+                f"model.layers.{li}.block_sparse_moe.experts.{ei}.w2.weight"
+            )
+            w3: torch.Tensor = ws.pop(
+                f"model.layers.{li}.block_sparse_moe.experts.{ei}.w3.weight"
+            )
+            step, devices = self.expert_map[f"{li}-{ei}"]
+            for di, w1_tp_slice, w2_tp_slice, w3_tp_slice in zip(
+                devices,
+                torch.split(w1, step),
+                torch.split(w2, step, dim=1),
+                torch.split(w3, step),
+            ):
+                partitions.setdefault(di, {})[f"{li}.{ei}.w_gate_up"] = torch.cat(
+                    (w1_tp_slice, w3_tp_slice)
+                )
+                partitions[di][f"{li}.{ei}.w_down"] = w2_tp_slice.clone()
+
+        for di, partition in partitions.items():
+            file_path = self.output_path / f"experts-{di}.pt"
+            self.save_weights(partition, file_path)
+
+        return ws
+
+    def partition_non_expert_weights(
+        self, ws: dict[str, torch.Tensor], li: int
+    ) -> dict[str, torch.Tensor]:
+        ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
+            f"model.layers.{li}.block_sparse_moe.gate.weight"
+        )
 
         if not self.attn_tp_map and not self.non_expert_pp_map:
-            torch.save(ws, self.output_path / f"non-experts.pt")
+            self.save_weights(ws, self.output_path / f"non-experts.pt")
             return
 
         n_attn_heads = self.model_config["num_attention_heads"]
@@ -223,75 +223,77 @@ class Partitioner:
         attn_linear_wis = ["wq", "wk", "wv", "wo"]
         partitions = {}
 
-        for li in tqdm(range(n_model_layers), desc="partitioning non-expert weights"):
-            wq, wk, wv, wo, attn_norm, ffn_norm, gate = [
-                ws.pop(wi)
-                for wi in [  # TODO: format modify
-                    f"model.layers.{li}.self_attn.q_proj.weight",
-                    f"model.layers.{li}.self_attn.k_proj.weight",
-                    f"model.layers.{li}.self_attn.v_proj.weight",
-                    f"model.layers.{li}.self_attn.o_proj.weight",
-                    f"model.layers.{li}.input_layernorm.weight",
-                    f"model.layers.{li}.post_attention_layernorm.weight",
-                    f"layers.{li}.feed_forward.gate.weight",
-                ]
+        wq, wk, wv, wo, attn_norm, ffn_norm, gate = [
+            ws.pop(wi)
+            for wi in [  # TODO: format modify
+                f"model.layers.{li}.self_attn.q_proj.weight",
+                f"model.layers.{li}.self_attn.k_proj.weight",
+                f"model.layers.{li}.self_attn.v_proj.weight",
+                f"model.layers.{li}.self_attn.o_proj.weight",
+                f"model.layers.{li}.input_layernorm.weight",
+                f"model.layers.{li}.post_attention_layernorm.weight",
+                f"layers.{li}.feed_forward.gate.weight",
             ]
+        ]
 
-            if self.attn_tp_map:
-                for devices in self.attn_tp_map[str(li)]:
-                    tp_size = len(devices)
-                    assert n_attn_heads % tp_size == 0
-                    assert n_kv_heads % tp_size == 0
-                    qo_step = n_attn_heads * head_dim // tp_size
-                    kv_step = n_kv_heads * head_dim // tp_size
-                    steps = [qo_step, kv_step, kv_step, qo_step]
+        if self.attn_tp_map:
+            for devices in self.attn_tp_map[str(li)]:
+                tp_size = len(devices)
+                assert n_attn_heads % tp_size == 0
+                assert n_kv_heads % tp_size == 0
+                qo_step = n_attn_heads * head_dim // tp_size
+                kv_step = n_kv_heads * head_dim // tp_size
+                steps = [qo_step, kv_step, kv_step, qo_step]
 
-                    for wi, step, w in zip(attn_linear_wis, steps, [wq, wk, wv, wo.T]):
+                for wi, step, w in zip(attn_linear_wis, steps, [wq, wk, wv, wo.T]):
 
-                        for di, w_slice in zip(devices, torch.split(w, step)):
-                            partitions.setdefault(di, {})[
-                                f"layers.{li}.attention.{wi}.weight"
-                            ] = (w_slice.clone() if wi != "wo" else w_slice.T.clone())
-            else:
-                for di in self.non_expert_pp_map[str(li)]:
-                    for wi, w in zip(attn_linear_wis, [wq, wk, wv, wo]):
+                    for di, w_slice in zip(devices, torch.split(w, step)):
                         partitions.setdefault(di, {})[
                             f"layers.{li}.attention.{wi}.weight"
-                        ] = w
+                        ] = (w_slice.clone() if wi != "wo" else w_slice.T.clone())
+        else:
+            for di in self.non_expert_pp_map[str(li)]:
+                for wi, w in zip(attn_linear_wis, [wq, wk, wv, wo]):
+                    partitions.setdefault(di, {})[
+                        f"layers.{li}.attention.{wi}.weight"
+                    ] = w
 
-            non_attn_dest = self.non_expert_pp_map.get(str(li), [])
-            if not non_attn_dest:
-                for devices in self.attn_tp_map[str(li)]:
-                    non_attn_dest.extend(devices)
+        non_attn_dest = self.non_expert_pp_map.get(str(li), [])
+        if not non_attn_dest:
+            for devices in self.attn_tp_map[str(li)]:
+                non_attn_dest.extend(devices)
 
+        for di in non_attn_dest:
+            partitions[di][f"layers.{li}.attention_norm.weight"] = attn_norm
+            partitions[di][f"layers.{li}.ffn_norm.weight"] = ffn_norm
+            partitions[di][f"layers.{li}.feed_forward.gate.weight"] = gate
+
+        if li == 0:
+            w_embed = ws.pop("model.embed_tokens.weight")
             for di in non_attn_dest:
-                partitions[di][f"layers.{li}.attention_norm.weight"] = attn_norm
-                partitions[di][f"layers.{li}.ffn_norm.weight"] = ffn_norm
-                partitions[di][f"layers.{li}.feed_forward.gate.weight"] = gate
+                partitions[di]["tok_embeddings.weight"] = w_embed
+        elif li == self.model_config["num_hidden_layers"] - 1:
+            w_norm = ws.pop("model.norm.weight")
+            w_output = ws.pop("lm_head.weight")
+            for di in non_attn_dest:
+                partitions[di]["norm.weight"] = w_norm
+                partitions[di]["output.weight"] = w_output
 
-            if li == 0:
-                w_embed = ws.pop("model.embed_tokens.weight")
-                for di in non_attn_dest:
-                    partitions[di]["tok_embeddings.weight"] = w_embed
-            elif li == n_model_layers - 1:
-                w_norm = ws.pop("model.norm.weight")
-                w_output = ws.pop("lm_head.weight")
-                # w_output = ws.pop("output.weight")
-                for di in non_attn_dest:
-                    partitions[di]["norm.weight"] = w_norm
-                    partitions[di]["output.weight"] = w_output
+        for di, partition in partitions.items():
+            self.save_weights(partition, self.output_path / f"non-experts-{di}.pt")
 
-        for di, partition in tqdm(partitions.items(), desc="saving partitions"):
-            torch.save(partition, self.output_path / f"non-experts-{di}.pt")
+    def process_layer(self, w_map: list[tuple[set, set]], li: int):
+        ws = self.load_layer_weights(*w_map[li])
+        ws = self.partition_expert_weights(ws, li)
+        self.partition_non_expert_weights(ws, li)
 
     def start(self) -> None:
-        # ws = self.partition_expert_weights(self.load_weights())
-        # logging.info("finished partitioning expert weights")
-        # self.partition_non_expert_weights(ws)
-        # logging.info("finished partitioning non-expert weights")
-        ONLY_PART_NON_EXPERT_WEIGHTS = True
-        self.partition_non_expert_weights(self.load_weights())
-        logging.info("finished partitioning non-expert weights")
+        w_map: list[tuple[set, set]] = self.get_weights_map()
+        pbar = tqdm(range(self.model_config["num_hidden_layers"]))
+        for li in pbar:
+            pbar.set_description(f"partitioning layer: {li}")
+            self.process_layer(w_map, li)
+            gc.collect()
 
 
 if __name__ == "__main__":
@@ -306,8 +308,3 @@ if __name__ == "__main__":
         args.model_path, args.design_path, args.output_path
     )
     weights_partitioner.start()
-
-### attn-tp-8
-# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b-attn-tp.json --output-path=../../mnt/data2/llm_team/merlin_mixtral_8x22B_weight/attn-tp-8/
-### ep-8
-# python3 ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py --model-path=../../mnt/data2/llm_team/Mixtral-8x22B-Instruct-v0.1/ --design-path=ntu_paslab_llm/merlin/partitioners/designs/8x22b-ep.json --output-path=../../mnt/data1/llm_team/merlin_mixtral_8x22B_weight/ep-8/
