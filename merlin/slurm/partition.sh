@@ -2,13 +2,13 @@
 
 #Batch Job Paremeters
 #SBATCH --account=GOV113121
-#SBATCH --partition=normal
+#SBATCH --partition=dev
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=200G
 #SBATCH --gpus-per-node=1
-#SBATCH --time=06:00:00                 # total run time limit (HH:MM:SS)
+#SBATCH --time=02:00:00                 # total run time limit (HH:MM:SS)
 
 # net
 export UCX_NET_DEVICES=mlx5_0:1
@@ -44,7 +44,8 @@ echo "[`date`] started partitioning weights"
 CMD="python /home/paslab504llm/ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py \
     --model-path $OG_MODEL_PATH \
     --design-path $DESIGN_PATH \
-    --output-path $PRL_MODEL_PATH"
+    --output-path $PRL_MODEL_PATH \
+    --n-part 2"
 
 # https://discuss.pytorch.org/t/distributed-training-on-slurm-cluster/150417/8
 echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
