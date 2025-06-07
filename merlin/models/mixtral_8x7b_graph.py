@@ -1,19 +1,18 @@
-from dataclasses import dataclass
-from pathlib import Path
-from statistics import mean
 import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
 
-from torch import nn
+import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch
-
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from torch import nn
 
 # Environment variables set by torch.distributed.launch
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
@@ -875,7 +874,12 @@ class Mixtral8x7B:
         with torch.device("meta"):
             model = Transformer(model_args, Experts(experts), comms)
         model.load_state_dict(non_experts, assign=True, strict=True)
-        tokenizer = MistralTokenizer.v1()
+
+        # TODO: refactor
+        if model_args.dim == 4096:
+            tokenizer = MistralTokenizer.v1()
+        elif model_args.dim == 6144:
+            tokenizer = MistralTokenizer.v3()
 
         return Mixtral8x7B(model, tokenizer)
 
