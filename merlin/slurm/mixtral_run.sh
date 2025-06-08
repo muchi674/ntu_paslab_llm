@@ -3,8 +3,8 @@
 which python
 
 OG_MODEL_PATH="/home/paslab504llm/Mixtral-8x22B-Instruct-v0.1"
-PRL_MODEL_PATH="/home/paslab504llm/m822_parallel/intra-ep"
-DESIGN_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/partitioners/designs/ep.json"
+PRL_MODEL_PATH="/home/paslab504llm/m822_parallel/intra-tp-experts"
+DESIGN_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/partitioners/designs/experts-tp.json"
 PROMPT_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json"
 
 # mkdir $PRL_MODEL_PATH
@@ -18,11 +18,11 @@ PROMPT_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.j
 #     --output-path $PRL_MODEL_PATH
 
 # echo "[`date`] started partitioning weights"
-# CMD="python /home/paslab504llm/ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py \
+# python /home/paslab504llm/ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py \
 #     --model-path $OG_MODEL_PATH \
 #     --design-path $DESIGN_PATH \
 #     --output-path $PRL_MODEL_PATH \
-#     --n-part 2"
+#     --n-part 2
 
 N_PROMPTS=32
 BATCH_SIZE=1

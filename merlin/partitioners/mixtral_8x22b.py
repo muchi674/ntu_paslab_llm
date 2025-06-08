@@ -229,13 +229,55 @@ class Partitioner:
 
         return ws
 
+    def remap_weights(
+        self, ws: dict[str, torch.Tensor], pi: int
+    ) -> dict[str, torch.Tensor]:
+
+        def remap(org_k: str, new_k: str):
+            ws[new_k] = ws.pop(org_k)
+
+        for li in range(self.offsets[pi], self.offsets[pi + 1]):
+            remap(
+                f"model.layers.{li}.self_attn.q_proj.weight",
+                f"layers.{li}.attention.wq.weight",
+            )
+            remap(
+                f"model.layers.{li}.self_attn.k_proj.weight",
+                f"layers.{li}.attention.wk.weight",
+            )
+            remap(
+                f"model.layers.{li}.self_attn.v_proj.weight",
+                f"layers.{li}.attention.wv.weight",
+            )
+            remap(
+                f"model.layers.{li}.self_attn.o_proj.weight",
+                f"layers.{li}.attention.wo.weight",
+            )
+            remap(
+                f"model.layers.{li}.input_layernorm.weight",
+                f"layers.{li}.attention_norm.weight",
+            )
+            remap(
+                f"model.layers.{li}.post_attention_layernorm.weight",
+                f"layers.{li}.ffn_norm.weight",
+            )
+            remap(
+                f"model.layers.{li}.block_sparse_moe.gate.weight",
+                f"layers.{li}.feed_forward.gate.weight",
+            )
+
+            if li == 0:
+                remap("model.embed_tokens.weight", "tok_embeddings.weight")
+            elif li == self.n_layers - 1:
+                remap("model.norm.weight", "norm.weight")
+                remap("lm_head.weight", "output.weight")
+
+        return ws
+
     def partition_non_expert_weights(
         self, ws: dict[str, torch.Tensor], pi: int
     ) -> dict[str, torch.Tensor]:
-        for li in range(self.offsets[pi], self.offsets[pi + 1]):
-            ws[f"layers.{li}.feed_forward.gate.weight"] = ws.pop(
-                f"model.layers.{li}.block_sparse_moe.gate.weight"
-            )
+        ws = self.remap_weights(ws, pi)
 
         if not self.attn_tp_map and not self.non_expert_pp_map:
             self.save_weights(ws, self.output_path / f"non-experts.pt")
@@ -252,12 +294,12 @@ class Partitioner:
             wq, wk, wv, wo, attn_norm, ffn_norm, gate = [
                 ws.pop(wi)
                 for wi in [
-                    f"model.layers.{li}.self_attn.q_proj.weight",
-                    f"model.layers.{li}.self_attn.k_proj.weight",
-                    f"model.layers.{li}.self_attn.v_proj.weight",
-                    f"model.layers.{li}.self_attn.o_proj.weight",
-                    f"model.layers.{li}.input_layernorm.weight",
-                    f"model.layers.{li}.post_attention_layernorm.weight",
+                    f"layers.{li}.attention.wq.weight",
+                    f"layers.{li}.attention.wk.weight",
+                    f"layers.{li}.attention.wv.weight",
+                    f"layers.{li}.attention.wo.weight",
+                    f"layers.{li}.attention_norm.weight",
+                    f"layers.{li}.ffn_norm.weight",
                     f"layers.{li}.feed_forward.gate.weight",
                 ]
             ]
@@ -295,12 +337,12 @@ class Partitioner:
                 partitions[di][f"layers.{li}.feed_forward.gate.weight"] = gate
 
             if li == 0:
-                w_embed = ws.pop("model.embed_tokens.weight")
+                w_embed = ws.pop("tok_embeddings.weight")
                 for di in non_attn_dest:
                     partitions[di]["tok_embeddings.weight"] = w_embed
             elif li == self.n_layers - 1:
-                w_norm = ws.pop("model.norm.weight")
-                w_output = ws.pop("lm_head.weight")
+                w_norm = ws.pop("norm.weight")
+                w_output = ws.pop("output.weight")
                 for di in non_attn_dest:
                     partitions[di]["norm.weight"] = w_norm
                     partitions[di]["output.weight"] = w_output

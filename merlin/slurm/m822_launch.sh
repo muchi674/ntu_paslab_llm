@@ -5,9 +5,9 @@
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
-#SBATCH --cpus-per-task=96
+#SBATCH --cpus-per-task=72
 #SBATCH --mem=200G
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=6
 #SBATCH --time=02:00:00                 # total run time limit (HH:MM:SS)
 
 # net
