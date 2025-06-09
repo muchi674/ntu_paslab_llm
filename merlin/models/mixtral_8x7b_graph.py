@@ -1,19 +1,18 @@
-from dataclasses import dataclass
-from pathlib import Path
-from statistics import mean
 import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
 
-from torch import nn
+import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch
-
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from torch import nn
 
 # Environment variables set by torch.distributed.launch
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
@@ -88,7 +87,8 @@ class ModelArgs:
     last_layer: int = None
     has_pp: bool = False
     parallel_experts: bool = False
-    parallel_attn: bool = False
+    inter_parallel_attn: bool = False
+    intra_parallel_attn: bool = False
 
     @classmethod
     def from_hf_config(cls, params: dict):
@@ -349,7 +349,6 @@ class TransformerBlock(nn.Module):
 
     def first_prefill_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
-        # WARNING: assumes attention is intra-node TP
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
         return self.get_routings(x, r, next_h)
 
@@ -365,6 +364,21 @@ class TransformerBlock(nn.Module):
     ):
         return self.first_prefill_graphable_intra_attn(
             self.moe_intra_allreduce(h, r), next_h
+        )
+
+    # --------------------------------------------------
+    # PREFILL, INTER-TP-ATTN
+
+    def first_prefill_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
+        r = self.prefill_attn(x)
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return self.get_routings(x, r, next_h)
+
+    def subseq_prefill_graphable_inter_attn_inter_moe(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_prefill_graphable_inter_attn(
+            self.moe_inter_allreduce(h, r), next_h
         )
 
     # ==================================================
@@ -393,7 +407,6 @@ class TransformerBlock(nn.Module):
 
     def first_decode_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
-        # WARNING: assumes attention is intra-node TP
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
         return self.get_routings(x, r, next_h)
 
@@ -409,6 +422,21 @@ class TransformerBlock(nn.Module):
     ):
         return self.first_decode_graphable_intra_attn(
             self.moe_intra_allreduce(h, r), next_h
+        )
+
+    # --------------------------------------------------
+    # DECODE, INTER-TP-ATTN
+
+    def first_decode_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
+        r = self.decode_attn(x)
+        dist.all_reduce(r, op=dist.ReduceOp.SUM)
+        return self.get_routings(x, r, next_h)
+
+    def subseq_decode_graphable_inter_attn_inter_moe(
+        self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
+    ):
+        return self.first_decode_graphable_inter_attn(
+            self.moe_inter_allreduce(h, r), next_h
         )
 
     # ****************************************************************************************************
@@ -535,16 +563,20 @@ class Transformer(nn.Module):
             idx = 0
             if not prefill:
                 idx += len(options) // 2
-            if self.args.parallel_attn:
+            if self.args.inter_parallel_attn:
                 idx += 1
+            elif self.args.intra_parallel_attn:
+                idx += 2
             return options[idx]
 
         def select_subseq_graphable(prefill: bool, options: tuple):
             idx = 0
             if not prefill:
                 idx += len(options) // 2
-            if self.args.parallel_attn:
+            if self.args.inter_parallel_attn:
                 idx += 3
+            elif self.args.intra_parallel_attn:
+                idx += 4
             elif self.args.parallel_experts:
                 idx += 1
             else:
@@ -607,8 +639,10 @@ class Transformer(nn.Module):
             prefill,
             (
                 self.layers[k].first_prefill_graphable,
+                self.layers[k].first_prefill_graphable_inter_attn,
                 self.layers[k].first_prefill_graphable_intra_attn,
                 self.layers[k].first_decode_graphable,
+                self.layers[k].first_decode_graphable_inter_attn,
                 self.layers[k].first_decode_graphable_intra_attn,
             ),
         )
@@ -631,11 +665,13 @@ class Transformer(nn.Module):
                     self.layers[k].subseq_prefill_graphable,
                     self.layers[k].subseq_prefill_graphable_inter_moe,
                     self.layers[k].subseq_prefill_graphable_intra_moe,
+                    self.layers[k].subseq_prefill_graphable_inter_attn_inter_moe,
                     self.layers[k].subseq_prefill_graphable_intra_attn_inter_moe,
                     self.layers[k].subseq_prefill_graphable_intra_attn_intra_moe,
                     self.layers[k].subseq_decode_graphable,
                     self.layers[k].subseq_decode_graphable_inter_moe,
                     self.layers[k].subseq_decode_graphable_intra_moe,
+                    self.layers[k].subseq_decode_graphable_inter_attn_inter_moe,
                     self.layers[k].subseq_decode_graphable_intra_attn_inter_moe,
                     self.layers[k].subseq_decode_graphable_intra_attn_intra_moe,
                 ),
@@ -721,9 +757,14 @@ class Mixtral8x7B:
     @staticmethod
     def build(model_path: str, node_id: int, device: torch.device) -> "Mixtral8x7B":
         model_path = Path(model_path)
-        non_experts_filename = "non-experts.pt"
-        if not (model_path / non_experts_filename).is_file():
-            non_experts_filename = f"non-experts-{node_id}-{LOCAL_RANK}.pt"
+        non_experts_filename: str
+        for filename in [
+            "non-experts.pt",
+            f"non-experts-{WORLD_RANK}.pt",
+            f"non-experts-{node_id}-{LOCAL_RANK}.pt",
+        ]:
+            if (model_path / filename).is_file():
+                non_experts_filename = filename
         experts_filename = f"experts-{WORLD_RANK}.pt"
         if not (model_path / experts_filename).is_file():
             experts_filename = f"experts-{node_id}-{LOCAL_RANK}.pt"
@@ -778,21 +819,23 @@ class Mixtral8x7B:
         ):
             model_args.parallel_experts = True
 
-        # check if intra-node TP is applied on attention
-        if (
-            non_experts[f"layers.{model_args.first_layer}.attention.wq.weight"].shape[0]
-            < model_args.n_heads * model_args.head_dim
-        ):
-            assert model_args.n_heads % LOCAL_WORLD_SIZE == 0
-            assert model_args.n_kv_heads % LOCAL_WORLD_SIZE == 0
-            model_args.n_heads //= LOCAL_WORLD_SIZE
-            model_args.n_kv_heads //= LOCAL_WORLD_SIZE
-            model_args.parallel_attn = True
+        # check if TP is applied on attention
+        org_wq_out_dim = model_args.n_heads * model_args.head_dim
+        loc_wq_out_dim = non_experts[
+            f"layers.{model_args.first_layer}.attention.wq.weight"
+        ].shape[0]
+        attn_tp_size = org_wq_out_dim // loc_wq_out_dim
+        model_args.n_heads //= attn_tp_size
+        model_args.n_kv_heads //= attn_tp_size
+        if attn_tp_size == WORLD_SIZE:
+            model_args.inter_parallel_attn = True
+        elif attn_tp_size == LOCAL_WORLD_SIZE:
+            model_args.intra_parallel_attn = True
 
         comms: list
         if (
             model_args.has_pp and model_args.parallel_experts
-        ) or model_args.parallel_attn:
+        ) or model_args.intra_parallel_attn:
             global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
             local_map = torch.tensor(
                 [node_id, WORLD_RANK], dtype=torch.int64, device=device
@@ -831,7 +874,12 @@ class Mixtral8x7B:
         with torch.device("meta"):
             model = Transformer(model_args, Experts(experts), comms)
         model.load_state_dict(non_experts, assign=True, strict=True)
-        tokenizer = MistralTokenizer.v1()
+
+        # TODO: refactor
+        if model_args.dim == 4096:
+            tokenizer = MistralTokenizer.v1()
+        elif model_args.dim == 6144:
+            tokenizer = MistralTokenizer.v3()
 
         return Mixtral8x7B(model, tokenizer)
 
