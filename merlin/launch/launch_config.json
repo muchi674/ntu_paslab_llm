@@ -18,7 +18,7 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/llm_team/merlin_mixtral_weights/ep-experts-attn-tp",
+      "model_path": "/mnt/llm_team/merlin_mixtral_weights/pp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 0,
       "profile": false,
@@ -31,22 +31,9 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/ep-experts-attn-tp",
+      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/pp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 1,
-      "profile": false,
-      "profiling_output": ""
-    },
-    "10.10.10.3": {
-      "ssh_port": 9036,
-      "node_rank": 2,
-      "ngpus": 2,
-      "proj_dir": "/mnt/data1/muchichen/ntu_paslab_llm/merlin",
-      "launcher": "launch/run_node.py",
-      "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/data1/llm_team/merlin_mixtral_weights/experts-attn-inter-tp",
-      "prompt_path": "/mnt/data1/muchichen/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
-      "node_id": 2,
       "profile": false,
       "profiling_output": ""
     }
