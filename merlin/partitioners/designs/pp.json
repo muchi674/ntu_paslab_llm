@@ -2,8 +2,8 @@
     "nodes": [
         {
             "node_id": 0,
-            "n_layers": 32,
-            "pp_size": 2
+            "n_layers": 56,
+            "pp_size": 6
         }
     ]
 }
