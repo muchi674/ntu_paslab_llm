@@ -13,6 +13,7 @@ import torch
 
 
 def ceildiv(a, b):
+    # TODO: this does not distribute elements evenly
     # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
     return -(a // -b)
 
@@ -52,6 +53,7 @@ class Partitioner:
         non_expert_pp_map = {}
         next_layer, next_expert = 0, 0
         glob_experts_tp_size = design.get("glob_experts_tp_size", None)
+        glob_attn_tp_size = design.get("glob_attn_tp_size", None)
 
         for d in design.get("nodes", [{}]):
             (
@@ -79,7 +81,10 @@ class Partitioner:
                 glob_experts_tp_size or experts_tp_size or ep_size or pp_size,
                 None if glob_experts_tp_size else node_id,
             )
-            attn_devices = get_devices(attn_tp_size, node_id)
+            attn_devices = get_devices(
+                glob_attn_tp_size or attn_tp_size,
+                None if glob_attn_tp_size else node_id,
+            )
             pp_bin_size = ceildiv(
                 n_layers or model_config["num_hidden_layers"], pp_size or 1
             )
