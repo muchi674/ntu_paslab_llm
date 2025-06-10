@@ -265,6 +265,20 @@ def run_tests(model_config: dict, test_func, test_cases: dict):
 
     return result
 
+def test_computations(model_config:dict, test_cases):
+    results = {}
+    print("testing expert_matmul...")
+    results["expert_matmul"] = run_tests(model_config, test_expert, test_cases)
+    print("testing router...")
+    results["router"] = run_tests(model_config, test_router, test_cases)
+    print("testing qkvo...")
+    results["qkvo"] = run_tests(model_config, test_qkvo, test_cases)
+    print("testing repeat_kv...")
+    results["repeat_kv"] = run_tests(model_config, test_repeat_kv, test_cases)
+    print("testing attn_score")
+    results["attn_score"] = run_tests(model_config, test_attn_score, test_cases)
+
+    return results
 
 if __name__ == "__main__":
     # parser = argparse.ArgumentParser()
