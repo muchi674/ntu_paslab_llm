@@ -11,7 +11,7 @@ PROMPT_PATH="/home/u3114747/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json"
 
 N_PROMPTS=32
 BATCH_SIZE=1
-
+ echo "started running mixtral_8x7b_graph.py"
 while [[ $N_PROMPTS -le 1024 && $BATCH_SIZE -le 32 ]]; do
     echo "N_PROMPTS: $N_PROMPTS, BATCH_SIZE: $BATCH_SIZE"
 
