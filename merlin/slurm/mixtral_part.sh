@@ -19,7 +19,7 @@ cp $OG_MODEL_PATH/*token* $PRL_MODEL_PATH
 #     --design-path $DESIGN_PATH \
 #     --output-path $PRL_MODEL_PATH
 
-echo "[`date`] started partitioning weights"
+echo "[`date`] started partitioning mixtral weights"
 $SINGULARITY python /home/u3114747/ntu_paslab_llm/merlin/partitioners/mixtral_8x22b.py \
     --model-path $OG_MODEL_PATH \
     --design-path $DESIGN_PATH \
