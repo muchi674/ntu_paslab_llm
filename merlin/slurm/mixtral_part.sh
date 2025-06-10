@@ -6,8 +6,8 @@ SIF=/home/u3114747/paslab_llm.sif
 SINGULARITY="singularity run --nv $SIF"
 
 OG_MODEL_PATH="/home/u3114747/Mixtral-8x22B-Instruct-v0.1"
-PRL_MODEL_PATH="/home/u3114747/m822_parallel/pp-ep"
-DESIGN_PATH="/home/u3114747/ntu_paslab_llm/merlin/partitioners/designs/8x22b-pp-ep.json"
+PRL_MODEL_PATH="/home/u3114747/m822_parallel/pp-expert-tp"
+DESIGN_PATH="/home/u3114747/ntu_paslab_llm/merlin/partitioners/designs/8x22b-pp-expert-tp.json"
 
 mkdir $PRL_MODEL_PATH
 cp $OG_MODEL_PATH/config.json $PRL_MODEL_PATH
