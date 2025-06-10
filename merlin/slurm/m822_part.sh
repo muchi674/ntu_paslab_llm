@@ -3,11 +3,10 @@
 #Batch Job Paremeters
 #SBATCH --account=GOV113121
 #SBATCH --partition=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
 #SBATCH --cpus-per-task=36
 #SBATCH --mem=200G
-#SBATCH --gpus-per-node=4
 #SBATCH --time=02:00:00                 # total run time limit (HH:MM:SS)
 
 # net
@@ -31,7 +30,7 @@ export RDZV_ID=$RANDOM
 #cd /home/u3114747/ntu_paslab_llm/merlin
 #source .venv/bin/activate
 
-CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_run.sh"
+CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_part.sh"
 
 # https://discuss.pytorch.org/t/distributed-training-on-slurm-cluster/150417/8
 echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
