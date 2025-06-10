@@ -31,8 +31,8 @@ export RDZV_ID=$RANDOM
 #cd /home/u3114747/ntu_paslab_llm/merlin
 #source .venv/bin/activate
 
-CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_run.sh"
-# CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_part_run.sh"
+# CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_run.sh"
+CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_part_run.sh"
 
 # https://discuss.pytorch.org/t/distributed-training-on-slurm-cluster/150417/8
 echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
