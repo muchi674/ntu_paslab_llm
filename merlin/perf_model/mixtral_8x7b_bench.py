@@ -85,11 +85,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         ep_node_experts.append(sum(ep_gpu_experts[i:j]))
         i = j
 
-    # strategies["naive PP"] = {
-    #     "batch_size": batch_size,
-    #     "prompt_len": prompt_len,
-    #     "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
-    # }
+    strategies["naive PP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    }
     # strategies["inter-attn-inter-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -102,11 +102,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
     #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
     # }
-    strategies["inter-experts TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
-    }
+    # strategies["inter-experts TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "experts_strategy": {"experts_are_intra": False, "experts_parallelism": "tp"},
+    # }
     # strategies["inter EP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -180,30 +180,6 @@ def ceildiv(a, b):
     return -(a // -b)
 
 
-def lookup_latency(table: dict, data_size: int):
-    # NOTE: comm latencies are measured in ms
-    ks = sorted([int(k) for k in table.keys()])
-    lower_k, upper_k = None, None
-    for k in ks:
-        if data_size == k:
-            return table[str(k)] / 1000
-        if data_size < k:
-            upper_k = k
-            break
-        lower_k = k
-
-    if lower_k is None:
-        return table[str(upper_k)] / 1000
-    if upper_k is None:
-        return data_size / ks[-1] * table[str(ks[-1])] / 1000
-    return (
-        table[str(lower_k)]
-        + (data_size - lower_k)
-        / (upper_k - lower_k)
-        * (table[str(upper_k)] - table[str(lower_k)])
-    ) / 1000
-
-
 def estimate_lower_bound_exec_time(
     bench_res: dict,
     batch_size: int,
@@ -229,127 +205,93 @@ def estimate_lower_bound_exec_time(
     )  # should follow the same ordering as SETUP
     attn_is_intra = attn_strategy.get("attn_is_intra")
     attn_parallelism = attn_strategy.get("attn_parallelism")
-    attn_param_bytes = attn_specs["param_bytes"]
-    attn_flops = attn_specs["flops"] * batch_size * prompt_len
     experts_are_intra = experts_strategy.get("experts_are_intra")
     experts_parallelism = experts_strategy.get("experts_parallelism")
     experts_allocation = experts_strategy.get("experts_allocation")
-    expert_param_bytes = expert_specs["param_bytes"]
-    expert_flops = expert_specs["flops"]
     n_experts = expert_specs["n_experts"]
     top_k = expert_specs["top_k"]
 
-    model_comm_size = precision_bytes * batch_size * prompt_len * model_d
-
+    comm_k = f"{batch_size}-{prompt_len}-{model_d}"
+    stage = "decode" if prompt_len == 1 else "prefill"
     exec_time_by_node = []
     for node_idx, node in enumerate(SETUP):
         exec_time = []
         n_local_gpus = node["n_gpus"]
-        gpu_mem_bw = HW_SPECS[node["gpu_id"]]["mem_bw"]
-        gpu_flops = HW_SPECS[node["gpu_id"]]["bf16_flops"]
 
         if attn_parallelism is None:
-            compute_time = max(attn_param_bytes / gpu_mem_bw, attn_flops / gpu_flops)
-            exec_time.extend([compute_time, 0.0])
+            parallel_size = 1
+            comm_time = 0
+
         elif attn_parallelism == "tp":  # partitions weights
             # or attn_parallelism == "dp"  # partitions input
             # or attn_parallelism == "cp"  # partitions input
             parallel_size = n_local_gpus if attn_is_intra else total_n_gpus
-            compute_time = max(
-                attn_param_bytes / parallel_size / gpu_mem_bw,
-                attn_flops / parallel_size / gpu_flops,
-            )
             if attn_is_intra:
-                comm_time = lookup_latency(
-                    bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
-                )
+                comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
             else:
-                comm_time = lookup_latency(
-                    bench_res["inter_coll_comm"], model_comm_size
-                )
-            exec_time.extend([compute_time, comm_time])
+                comm_time = bench_res["inter_coll_comm"][comm_k]
+
+        compute_time = (
+            bench_res["qkvo"][stage][str(parallel_size)][str(batch_size)]
+            + bench_res["repeat_kv"][stage][str(parallel_size)][str(batch_size)]
+            + bench_res["attn_score"][stage][str(parallel_size)][str(batch_size)]
+        ) / 1000
+        exec_time.extend([compute_time, comm_time])
 
         # TODO: for now, we are assuming that expert selection follows an uniform dist
         n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
-        intra_node_comm_time = lookup_latency(
-            bench_res[str(node_idx)]["intra_coll_comm"], model_comm_size
-        )
-        inter_node_comm_time = lookup_latency(
-            bench_res["inter_coll_comm"], model_comm_size
-        )
+        intra_node_comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
+        inter_node_comm_time = bench_res["inter_coll_comm"][comm_k]
         if experts_parallelism is None:
-            compute_time = max(
-                n_act_experts * expert_param_bytes / gpu_mem_bw,
-                batch_size * prompt_len * top_k * expert_flops / gpu_flops,
-            )
-            exec_time.extend([compute_time, 0.0])
+            parallel_size = 1
+            n_local_experts = n_experts
+            comm_time = 0
+
         elif experts_parallelism == "tp":
-            # we care only about per GPU stats
             parallel_size = n_local_gpus if experts_are_intra else total_n_gpus
-            compute_time = max(
-                n_act_experts * expert_param_bytes / parallel_size / gpu_mem_bw,
-                batch_size
-                * prompt_len
-                * top_k
-                * expert_flops
-                / parallel_size
-                / gpu_flops,
-            )
+            n_local_experts = n_experts
             comm_time = (
                 intra_node_comm_time if experts_are_intra else inter_node_comm_time
             )
-            exec_time.extend([compute_time, comm_time])
+
         elif experts_parallelism == "ep":
-            n_experts_per_local_gpu = (
+            parallel_size = 1
+            n_local_experts = (
                 n_experts if experts_are_intra else experts_allocation[node_idx]
             ) // n_local_gpus
-            compute_time = max(
-                ceildiv(n_act_experts * n_experts_per_local_gpu, n_experts)
-                * expert_param_bytes
-                / gpu_mem_bw,
-                ceildiv(
-                    batch_size * prompt_len * top_k * n_experts_per_local_gpu, n_experts
-                )
-                * expert_flops
-                / gpu_flops,
-            )
             comm_time = (
                 intra_node_comm_time if experts_are_intra else inter_node_comm_time
             )
-            exec_time.extend([compute_time, comm_time])
+
         elif experts_parallelism == "ep+tp":
             assert not experts_are_intra
+            parallel_size = n_local_gpus
             n_local_experts = experts_allocation[node_idx]
-            compute_time = max(
-                ceildiv(n_act_experts * n_local_experts, n_experts)
-                * expert_param_bytes
-                / n_local_gpus
-                / gpu_mem_bw,
-                ceildiv(batch_size * prompt_len * top_k * n_local_experts, n_experts)
-                * expert_flops
-                / n_local_gpus
-                / gpu_flops,
-            )
-            exec_time.extend([compute_time, inter_node_comm_time])
+            comm_time = inter_node_comm_time
+
+        compute_time = (
+            bench_res["expert_matmul"][stage][str(parallel_size)][str(batch_size)]
+            * min(n_act_experts, n_local_experts)
+            + bench_res["router"][stage]["1"][str(batch_size)]
+        ) / 1000
+        exec_time.extend([compute_time, comm_time])
 
         constant = pp_node_layers[node_idx] if pp_strategy else n_layers
         exec_time = [val * constant for val in exec_time]
 
         extra_comm_time = 0.0
         if pp_is_naive:
-            extra_comm_time += lookup_latency(
-                bench_res[str(node_idx)]["intra_p2p_comm"], model_comm_size
-            ) * (n_local_gpus - 1)
+            c = n_local_gpus - 1
+            extra_comm_time += bench_res[str(node_idx)]["intra_p2p_comm"][comm_k] * c
         if pp_strategy:
             if node_idx < len(SETUP) - 1:
-                extra_comm_time += lookup_latency(
-                    bench_res["inter_p2p_comm"], model_comm_size
-                )
+                extra_comm_time += bench_res["inter_p2p_comm"][comm_k]
             else:
-                out_size = precision_bytes * batch_size * prompt_len * vocab_d
-                extra_comm_time += lookup_latency(
-                    bench_res["inter_coll_comm"], out_size
-                )
+                # TODO: this approximation might be inaccurate
+                # NOTE: this could error out with too big of a batch size
+                c = ceildiv(vocab_d, model_d)
+                k = f"{batch_size * c}-{prompt_len}-{model_d}"
+                extra_comm_time += bench_res["inter_coll_comm"][k]
 
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
