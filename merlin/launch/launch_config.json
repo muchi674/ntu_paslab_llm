@@ -5,8 +5,8 @@
   "username": "muchichen",
   "branch_name": "merlin",
   "shared_exec_args": {
-    "n_prompts": 128,
-    "batch_size": 4,
+    "n_prompts": 32,
+    "batch_size": 1,
     "max_tokens": 128,
     "hide_resp": true
   },

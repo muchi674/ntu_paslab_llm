@@ -1,7 +1,7 @@
 #!/bin/bash
 
-n_prompts=64
-batch_size=2
+n_prompts=32
+batch_size=1
 
 while [[ "${n_prompts}" -le 256 && "${batch_size}" -le 8 ]]; do
 

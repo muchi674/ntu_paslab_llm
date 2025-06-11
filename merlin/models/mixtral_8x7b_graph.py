@@ -1027,7 +1027,7 @@ class Mixtral8x7B:
             )
 
             if prev_pos == 0:
-                self.system_sync()
+                torch.cuda.synchronize()
                 prefill_time = time.time() - tic
                 tic = time.time()
             if temperature > 0:
