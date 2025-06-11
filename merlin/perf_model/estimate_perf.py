@@ -36,13 +36,7 @@ MODEL_SPECS = {
         "flops": 3 * 2 * 4096 * 14336,
     },
 }
-HW_SPECS = {
-    # TODO: write micro-benchmark programs to test this
-    "4090": {
-        "bf16_flops": 165.2 * (10**12),
-        "mem_bw": 1008 * (10**9),
-    },
-}
+
 SETUP = [
     {
         "gpu_id": "4090",
@@ -52,10 +46,10 @@ SETUP = [
         "gpu_id": "4090",
         "n_gpus": 4,
     },
-    # {
-    #     "gpu_id": "4090",
-    #     "n_gpus": 2,
-    # },
+    {
+        "gpu_id": "4090",
+        "n_gpus": 2,
+    },
 ]
 
 
@@ -148,7 +142,7 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "experts_strategy": {
     #         "experts_are_intra": False,
     #         "experts_parallelism": "ep+tp",
-    #         "experts_allocation": ep_node_experts,
+    #         "experts_allocation": [2, 4, 2],
     #     },
     # }
     # strategies["inter EP + intra-attn-intra-experts TP"] = {
@@ -211,10 +205,10 @@ def estimate_lower_bound_exec_time(
     n_experts = expert_specs["n_experts"]
     top_k = expert_specs["top_k"]
 
-    comm_k = f"{batch_size}-{prompt_len}-{model_d}"
-    stage = "decode" if prompt_len == 1 else "prefill"
+    input_shape = f"{batch_size}-{prompt_len}"
     exec_time_by_node = []
     for node_idx, node in enumerate(SETUP):
+        bench_res_node = bench_res[f"node{node_idx}"]
         exec_time = []
         n_local_gpus = node["n_gpus"]
 
@@ -227,21 +221,21 @@ def estimate_lower_bound_exec_time(
             # or attn_parallelism == "cp"  # partitions input
             parallel_size = n_local_gpus if attn_is_intra else total_n_gpus
             if attn_is_intra:
-                comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
+                comm_time = bench_res_node["intra_allreduce"][input_shape]
             else:
-                comm_time = bench_res["inter_coll_comm"][comm_k]
+                comm_time = bench_res["inter_allreduce"][input_shape]
 
         compute_time = (
-            bench_res["qkvo"][stage][str(parallel_size)][str(batch_size)]
-            + bench_res["repeat_kv"][stage][str(parallel_size)][str(batch_size)]
-            + bench_res["attn_score"][stage][str(parallel_size)][str(batch_size)]
-        ) / 1000
+            bench_res_node["qkvo"][f"tp{parallel_size}"][input_shape]
+            + bench_res_node["repeat_kv"][f"tp{parallel_size}"][input_shape]
+            + bench_res_node["attn_score"][f"tp{parallel_size}"][input_shape]
+        )
         exec_time.extend([compute_time, comm_time])
 
         # TODO: for now, we are assuming that expert selection follows an uniform dist
         n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
-        intra_node_comm_time = bench_res[str(node_idx)]["intra_coll_comm"][comm_k]
-        inter_node_comm_time = bench_res["inter_coll_comm"][comm_k]
+        intra_node_comm_time = bench_res_node["intra_allreduce"][input_shape]
+        inter_node_comm_time = bench_res["inter_allreduce"][input_shape]
         if experts_parallelism is None:
             parallel_size = 1
             n_local_experts = n_experts
@@ -256,8 +250,11 @@ def estimate_lower_bound_exec_time(
 
         elif experts_parallelism == "ep":
             parallel_size = 1
+            # NOTE: consider maximum number of local expert
             n_local_experts = (
-                n_experts if experts_are_intra else experts_allocation[node_idx]
+                n_local_gpus
+                - 1
+                + (n_experts if experts_are_intra else experts_allocation[node_idx])
             ) // n_local_gpus
             comm_time = (
                 intra_node_comm_time if experts_are_intra else inter_node_comm_time
@@ -270,10 +267,10 @@ def estimate_lower_bound_exec_time(
             comm_time = inter_node_comm_time
 
         compute_time = (
-            bench_res["expert_matmul"][stage][str(parallel_size)][str(batch_size)]
+            bench_res_node["expert_matmul"][f"tp{parallel_size}"][input_shape]
             * min(n_act_experts, n_local_experts)
-            + bench_res["router"][stage]["1"][str(batch_size)]
-        ) / 1000
+            + bench_res_node["router"][f"tp{parallel_size}"][input_shape]
+        )
         exec_time.extend([compute_time, comm_time])
 
         constant = pp_node_layers[node_idx] if pp_strategy else n_layers
@@ -281,17 +278,19 @@ def estimate_lower_bound_exec_time(
 
         extra_comm_time = 0.0
         if pp_is_naive:
-            c = n_local_gpus - 1
-            extra_comm_time += bench_res[str(node_idx)]["intra_p2p_comm"][comm_k] * c
+            for i in range(node["n_gpus"]-1):
+                extra_comm_time += bench_res_node["intra_p2p"][f"rank{i}_to_rank{i+1}"][input_shape]
+
         if pp_strategy:
             if node_idx < len(SETUP) - 1:
-                extra_comm_time += bench_res["inter_p2p_comm"][comm_k]
+                extra_comm_time += bench_res["inter_p2p"][
+                    f"node{node_idx}_to_node{node_idx+1}"
+                ][input_shape]
             else:
-                # TODO: this approximation might be inaccurate
-                # NOTE: this could error out with too big of a batch size
+                # last node broadcasts output to other nodes
                 c = ceildiv(vocab_d, model_d)
-                k = f"{batch_size * c}-{prompt_len}-{model_d}"
-                extra_comm_time += bench_res["inter_coll_comm"][k]
+                k = f"{batch_size}-{prompt_len}"
+                extra_comm_time += bench_res["inter_p2p"]["node0_to_node1"][k] * c * node["n_gpus"]
 
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
@@ -303,10 +302,10 @@ def estimate_lower_bound_exec_time(
     else:
         breakdown = torch.max(exec_time_by_node, dim=0)[0]
     total_exec_time = torch.sum(breakdown).item()
-    throughput = batch_size * prompt_len / total_exec_time
+    throughput = batch_size * prompt_len * 1000 / total_exec_time
 
-    # convert to ms for easier reading, throughput in t/s
-    return (breakdown * 1000).tolist(), total_exec_time * 1000, throughput
+    # breakdown in ms, throughput in t/s
+    return breakdown.tolist(), total_exec_time, throughput
 
 
 def run_perf_model(bench_res: dict, batch_size: int, prompt_len: int, sort: bool):

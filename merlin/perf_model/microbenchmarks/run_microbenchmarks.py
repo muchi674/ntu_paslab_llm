@@ -37,7 +37,7 @@ def print_msg(msg):
         print(msg)
 
 
-def run_microbenchmarks():
+def run_microbenchmarks(model_path):
     # init processes
     device = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
@@ -67,7 +67,7 @@ def run_microbenchmarks():
             local_group = node_group
 
     # get model config
-    model_config_path = "/mnt/disk2/llm_team/Mixtral-8x7B-Instruct-v0.1/config.json"
+    model_config_path = f"/{model_path}/config.json"
 
     with open(model_config_path) as f:
         model_config = json.load(f)
@@ -82,7 +82,7 @@ def run_microbenchmarks():
         # --- testing inter node all-reduce ---
         print_msg("testing inter node all-reduce...")
         result = run_tests(model_config, 1, test_allreduce, world_ranks, global_group)
-        print_msg(f"result: {result}")
+        print_msg(f"result: {result}\n")
         benchmark_results["inter_allreduce"] = result
 
         # --- testing inter node p2p ---
@@ -181,5 +181,8 @@ def run_microbenchmarks():
 
 
 if __name__ == "__main__":
-    run_microbenchmarks()
-    # torchrun --nnodes=2 --node-rank=1 --nproc-per-node=4 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str)
+    args = parser.parse_args()
+    run_microbenchmarks(args.model_path)
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
