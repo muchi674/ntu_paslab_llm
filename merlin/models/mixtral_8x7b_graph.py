@@ -925,6 +925,10 @@ class Mixtral8x7B:
         mask = torch.triu(mask, diagonal=1)
         return mask
 
+    def system_sync(self) -> None:
+        torch.cuda.synchronize()
+        dist.barrier()
+
     @torch.inference_mode()
     def generate(
         self,
@@ -979,7 +983,7 @@ class Mixtral8x7B:
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
         )
-        dist.barrier()
+        self.system_sync()
         model.reset_graph_data(prefill_data)
         model.reset_graph_data(decode_data)
 
@@ -992,7 +996,7 @@ class Mixtral8x7B:
             model.reset_graph_data(decode_data)
         self.clear_cache(cache)
 
-        dist.barrier()
+        self.system_sync()
         tic = time.time()
         prefill_time: float  # in sec
         decode_time: float  # in sec
@@ -1006,7 +1010,6 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            # dist.barrier()
             if prev_pos == 0:
                 graphs, data = prefill_graphs, prefill_data
             else:
@@ -1024,6 +1027,7 @@ class Mixtral8x7B:
             )
 
             if prev_pos == 0:
+                self.system_sync()
                 prefill_time = time.time() - tic
                 tic = time.time()
             if temperature > 0:
@@ -1063,6 +1067,7 @@ class Mixtral8x7B:
         n_p_tkns = min_p_len * bsz
         n_gen_tkns = (cur_pos - min_p_len) * bsz
 
+        self.system_sync()
         decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
