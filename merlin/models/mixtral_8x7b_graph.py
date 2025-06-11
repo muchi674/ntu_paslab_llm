@@ -1026,10 +1026,6 @@ class Mixtral8x7B:
                 prev_pos == 0,
             )
 
-            if prev_pos == 0:
-                torch.cuda.synchronize()
-                prefill_time = time.time() - tic
-                tic = time.time()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, 0.8)
@@ -1045,8 +1041,14 @@ class Mixtral8x7B:
             tokens[:, cur_pos] = next_token
             eos_reached |= ~input_text_mask[:, cur_pos] & (next_token == eos_id)
 
+            # This should cause an implicit host to device sync point that make profiling results accurate
+            is_done = all(eos_reached)
+            if prev_pos == 0:
+                prefill_time = time.time() - tic
+                tic = time.time()
+
             prev_pos = cur_pos
-            if all(eos_reached):
+            if is_done:
                 break
 
         # this part is from here:
