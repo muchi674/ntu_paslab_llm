@@ -3,12 +3,13 @@
 #Batch Job Paremeters
 #SBATCH --account=GOV113121
 #SBATCH --partition=normal
-#SBATCH --nodes=4
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # one torchrun per node https://stackoverflow.com/a/65897194
-#SBATCH --cpus-per-gpu=1
-#SBATCH --mail-type=END,BEGIN           # Send the mail when the job starts and finishes.
-#SBATCH --mail-user=kyle355469@gmail.com
-#SBATCH --time=00:10:00                 # total run time limit (HH:MM:SS)
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
+#SBATCH --gpus-per-node=2
+#SBATCH --time=06:00:00                 # total run time limit (HH:MM:SS)
+
 # net
 export UCX_NET_DEVICES=mlx5_0:1
 export UCX_IB_GPU_DIRECT_RDMA=1
@@ -24,24 +25,13 @@ nodes_array=($nodes)
 head_node=${nodes_array[0]}
 export MASTER_ADDR=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export OMP_NUM_THREADS=8
+export RDZV_ID=$RANDOM
 
-CMD="nsys profile \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end=stop \
-    torchrun \
-    --nnodes=$SLURM_JOB_NUM_NODES \
-    --nproc-per-node=$SLURM_GPUS_PER_NODE \
-    --rdzv_id $RANDOM \
-    --rdzv_backend c10d \
-    --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
-    ../models/mixtral_8x7b_v0_h100.py \
-    --model-path /home/paslab504llm/v0 \
-    --prompt-path /home/paslab504llm/ntu_paslab_llm/mixtral/prompts/diverse_short.json \
-    --n-prompts 4 \
-    --batch-size 1 \
-    --max-tokens 16"
+cd /home/paslab504llm/ntu_paslab_llm/merlin
+source .venv/bin/activate
 
-# SRUN_CMD="$SINGULARITY $CMD"
+CMD="bash /home/paslab504llm/ntu_paslab_llm/merlin/slurm/mixtral_run.sh"
 
 # https://discuss.pytorch.org/t/distributed-training-on-slurm-cluster/150417/8
 echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
