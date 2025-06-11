@@ -34,7 +34,7 @@ def format_result(avg_latencies: list[float]):
     data = {}
     for s, l in zip(shapes, avg_latencies):
         data[s] = round(l, 3)
-        
+    
     return data
 
 

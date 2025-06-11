@@ -180,6 +180,14 @@ def run_microbenchmarks():
     dist.destroy_process_group()
 
 
+<<<<<<< HEAD
 if __name__ == "__main__":
     run_microbenchmarks()
     # torchrun --nnodes=2 --node-rank=1 --nproc-per-node=4 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
+=======
+
+
+if __name__ == "__main__":
+    run_microbenchmarks()
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
+>>>>>>> 2881f93301b8dcf77ea46498b727a0daed8763ac
