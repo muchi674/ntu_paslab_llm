@@ -5,8 +5,8 @@ which python
 SIF=/home/u3114747/paslab_llm.sif
 SINGULARITY="singularity run --nv $SIF"
 
-PRL_MODEL_PATH="/home/u3114747/m822_parallel/pp-expert-tp"
-DESIGN_PATH="/home/u3114747/ntu_paslab_llm/merlin/partitioners/designs/8x22b-pp-expert-tp.json"
+PRL_MODEL_PATH="/home/u3114747/m822_parallel/pp-expert-attn-tp"
+DESIGN_PATH="/home/u3114747/ntu_paslab_llm/merlin/partitioners/designs/8x22b-pp-expert-attn-tp.json"
 PROMPT_PATH="/home/u3114747/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json"
 
 N_PROMPTS=32
