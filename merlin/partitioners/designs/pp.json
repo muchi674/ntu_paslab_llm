@@ -2,8 +2,18 @@
     "nodes": [
         {
             "node_id": 0,
-            "n_layers": 56,
-            "pp_size": 6
+            "n_layers": 8,
+            "pp_size": 2
+        },
+        {
+            "node_id": 1,
+            "n_layers": 16,
+            "pp_size": 4
+        },
+        {
+            "node_id": 2,
+            "n_layers": 8,
+            "pp_size": 2
         }
     ]
 }
