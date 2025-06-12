@@ -925,6 +925,10 @@ class Mixtral8x7B:
         mask = torch.triu(mask, diagonal=1)
         return mask
 
+    def system_sync(self) -> None:
+        torch.cuda.synchronize()
+        dist.barrier()
+
     @torch.inference_mode()
     def generate(
         self,
@@ -979,7 +983,7 @@ class Mixtral8x7B:
         prefill_graphs, prefill_data, decode_graphs, decode_data = model.draw_graphs(
             bsz, min_p_len
         )
-        dist.barrier()
+        self.system_sync()
         model.reset_graph_data(prefill_data)
         model.reset_graph_data(decode_data)
 
@@ -992,7 +996,7 @@ class Mixtral8x7B:
             model.reset_graph_data(decode_data)
         self.clear_cache(cache)
 
-        dist.barrier()
+        self.system_sync()
         tic = time.time()
         prefill_time: float  # in sec
         decode_time: float  # in sec
@@ -1006,7 +1010,6 @@ class Mixtral8x7B:
         # will be processed in parallel. Longer prompts' remaining tokens are
         # evaluated one-by-one with the min prompt's token generation
         for cur_pos in range(min_p_len, max_seq_len):
-            # dist.barrier()
             if prev_pos == 0:
                 graphs, data = prefill_graphs, prefill_data
             else:
@@ -1023,9 +1026,6 @@ class Mixtral8x7B:
                 prev_pos == 0,
             )
 
-            if prev_pos == 0:
-                prefill_time = time.time() - tic
-                tic = time.time()
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, 0.8)
@@ -1041,8 +1041,14 @@ class Mixtral8x7B:
             tokens[:, cur_pos] = next_token
             eos_reached |= ~input_text_mask[:, cur_pos] & (next_token == eos_id)
 
+            # This should cause an implicit host to device sync point that make profiling results accurate
+            is_done = all(eos_reached)
+            if prev_pos == 0:
+                prefill_time = time.time() - tic
+                tic = time.time()
+
             prev_pos = cur_pos
-            if all(eos_reached):
+            if is_done:
                 break
 
         # this part is from here:
@@ -1063,6 +1069,7 @@ class Mixtral8x7B:
         n_p_tkns = min_p_len * bsz
         n_gen_tkns = (cur_pos - min_p_len) * bsz
 
+        self.system_sync()
         decode_time = time.time() - tic
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
@@ -1114,7 +1121,7 @@ def main(
         if WORLD_RANK == 0:
             prefill_tp = n_p_tkns / prefill_time
             decode_tp = n_gen_tkns / decode_time
-            if n_gen_tkns / bsz > max_gen_len * 0.9:
+            if n_gen_tkns / bsz > max_gen_len * 0.75:
                 prefill_tps.append(prefill_tp)
                 decode_tps.append(decode_tp)
 
