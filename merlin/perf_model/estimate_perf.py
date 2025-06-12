@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse
 import json
 import logging
-
+import random
 import torch
 
 MODEL_SPECS = {
@@ -46,10 +46,10 @@ SETUP = [
         "gpu_id": "4090",
         "n_gpus": 4,
     },
-    {
-        "gpu_id": "4090",
-        "n_gpus": 2,
-    },
+    # {
+    #     "gpu_id": "4090",
+    #     "n_gpus": 2,
+    # },
 ]
 
 
@@ -79,11 +79,11 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
         ep_node_experts.append(sum(ep_gpu_experts[i:j]))
         i = j
 
-    strategies["naive PP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
-    }
+    # strategies["naive PP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "pp_strategy": {"is_naive": True, "pp_node_layers": pp_node_layers},
+    # }
     # strategies["inter-attn-inter-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -107,7 +107,7 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "experts_strategy": {
     #         "experts_are_intra": False,
     #         "experts_parallelism": "ep",
-    #         "experts_allocation": ep_node_experts,
+    #         "experts_allocation": [3, 5],
     #     },
     # }
     # strategies["inter PP + intra-experts TP"] = {
@@ -129,20 +129,20 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
     #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     # }
-    # strategies["inter PP + intra EP + intra-attn TP"] = {
-    #     "batch_size": batch_size,
-    #     "prompt_len": prompt_len,
-    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
-    # }
+    strategies["inter PP + intra EP + intra-attn TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
+    }
     # strategies["inter EP + intra-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
     #     "experts_strategy": {
     #         "experts_are_intra": False,
     #         "experts_parallelism": "ep+tp",
-    #         "experts_allocation": [2, 4, 2],
+    #         "experts_allocation": [3, 5],
     #     },
     # }
     # strategies["inter EP + intra-attn-intra-experts TP"] = {
@@ -152,7 +152,17 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "experts_strategy": {
     #         "experts_are_intra": False,
     #         "experts_parallelism": "ep+tp",
-    #         "experts_allocation": ep_node_experts,
+    #         "experts_allocation": [3, 5],
+    #     },
+    # }
+    # strategies["inter EP + intra-attn TP"] = {
+    #     "batch_size": batch_size,
+    #     "prompt_len": prompt_len,
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {
+    #         "experts_are_intra": False,
+    #         "experts_parallelism": "ep",
+    #         "experts_allocation": [3, 5],
     #     },
     # }
     # strategies["inter EP + inter-attn-intra-experts TP"] = {
@@ -162,7 +172,7 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "experts_strategy": {
     #         "experts_are_intra": False,
     #         "experts_parallelism": "ep+tp",
-    #         "experts_allocation": ep_node_experts,
+    #         "experts_allocation": [3, 5],
     #     },
     # }
 
@@ -233,7 +243,19 @@ def estimate_lower_bound_exec_time(
         exec_time.extend([compute_time, comm_time])
 
         # TODO: for now, we are assuming that expert selection follows an uniform dist
-        n_act_experts = min(batch_size * prompt_len * top_k, n_experts)
+        # expert selection sampling
+        n_sampling = 100
+        n_tokens = batch_size * prompt_len
+        n_activations = []
+        for _ in range(n_sampling):
+            n_activation = [0 for _ in range(n_experts)]
+            for i in range(n_tokens):
+                activated_experts = random.sample(range(n_experts), top_k)
+                for e in activated_experts:
+                    n_activation[e] += 1
+            
+            n_activations.append(n_activation)
+
         intra_node_comm_time = bench_res_node["intra_allreduce"][input_shape]
         inter_node_comm_time = bench_res["inter_allreduce"][input_shape]
         if experts_parallelism is None:
@@ -265,12 +287,14 @@ def estimate_lower_bound_exec_time(
             parallel_size = n_local_gpus
             n_local_experts = experts_allocation[node_idx]
             comm_time = inter_node_comm_time
-
-        compute_time = (
-            bench_res_node["expert_matmul"][f"tp{parallel_size}"][input_shape]
-            * min(n_act_experts, n_local_experts)
-            + bench_res_node["router"][f"tp{parallel_size}"][input_shape]
-        )
+        
+        total_comp_time = 0
+        for n_activation in n_activations:
+            for ei in range(n_local_experts):
+                if n_activation[ei] > 0:
+                    total_comp_time += bench_res_node["expert_matmul"][f"tp{parallel_size}"][str(n_activation[ei])]
+            
+        compute_time = total_comp_time / len(n_activations) + bench_res_node["router"]["tp1"][input_shape]
         exec_time.extend([compute_time, comm_time])
 
         constant = pp_node_layers[node_idx] if pp_strategy else n_layers
@@ -283,15 +307,13 @@ def estimate_lower_bound_exec_time(
 
         if pp_strategy:
             if node_idx < len(SETUP) - 1:
-                extra_comm_time += bench_res["inter_p2p"][
-                    f"node{node_idx}_to_node{node_idx+1}"
-                ][input_shape]
+                extra_comm_time += bench_res["inter_p2p"][f"node{node_idx}_to_node{node_idx+1}"][input_shape]
             else:
                 # last node broadcasts output to other nodes
                 c = ceildiv(vocab_d, model_d)
-                k = f"{batch_size}-{prompt_len}"
-                extra_comm_time += bench_res["inter_p2p"]["node0_to_node1"][k] * c * node["n_gpus"]
-
+                k = f"{batch_size}-{1}"
+                extra_comm_time += bench_res["inter_p2p"]["node0_to_node1"][k] * c * (node["n_gpus"]-1)
+        
         exec_time.append(extra_comm_time)
         exec_time_by_node.append(exec_time)
 

@@ -15,25 +15,31 @@ WORLD_RANK = int(os.environ["RANK"])
 
 # general settings
 DTYPE = torch.bfloat16
-N_WARMUPS = 100
-N_TESTS = 100
+N_WARMUPS = 1000
+N_TESTS = 3000
 START_BSZ = 1
-END_BSZ = 32
+END_BSZ = 16
 MAX_SEQ_LEN = 256
+PROMPT_LEN = 128
 DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
 
 
 def format_result(avg_latencies: list[float]):
     shapes = []
-    for seq_len in [1, 128]:
+    for seq_len in [1, PROMPT_LEN]:
         batch_size = START_BSZ
         while batch_size <= END_BSZ:
             shapes.append(f"{batch_size}-{seq_len}")
             batch_size *= 2
 
     data = {}
-    for s, l in zip(shapes, avg_latencies):
-        data[s] = round(l, 3)
+    
+    if len(avg_latencies) == len(shapes):
+        for s, l in zip(shapes, avg_latencies):
+            data[s] = round(l, 3)
+    else:
+        for i in range(len(avg_latencies)):
+            data[str(i+1)] = round(avg_latencies[i], 3)
 
     return data
 
@@ -111,18 +117,19 @@ def test_p2p(model_config: dict, batch_size: int, seq_len: int, target_ranks, gr
     return latency
 
 
-def test_expert(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
+def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     """
     measure the latency of (x @ w1 + x @ w3) @ w2
     """
     model_d = model_config["hidden_size"]
     interm_d = ceildiv(model_config["intermediate_size"], tp_size)
     n_layers = model_config["num_hidden_layers"]
-    n_experts = model_config["num_local_experts"]
-    top_k = model_config["num_experts_per_tok"]
+
+    n_warmups, n_tests = 100, 300
+    if n_tokens > 100:
+        n_warmups, n_tests = 1, 5
 
     # prepare inputs
-    n_tokens = max(batch_size * seq_len * top_k // n_experts, 1)
     n_copies = n_layers  # TODO: how many copies do we need?
     x = torch.rand((n_tokens, model_d), dtype=DTYPE, device=DEVICE)
     w1s = [
@@ -139,19 +146,19 @@ def test_expert(model_config: dict, tp_size: int, batch_size: int, seq_len: int)
     ]
 
     # warm up
-    for _ in range(N_WARMUPS):
-        for i in range(n_copies):
-            y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
+    for iter in range(n_warmups):
+        i = iter % n_copies
+        y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
 
     # real measurement
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        for i in range(n_copies):
-            y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
+    for iter in range(n_tests):
+        i = iter % n_copies
+        y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
 
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / (N_TESTS * n_copies)
+    latency = (time.time() - tic) * 1000 / n_tests
 
     return latency
 
@@ -186,24 +193,24 @@ def test_qkvo(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
     ]
 
     # warm up
-    for _ in range(N_WARMUPS):
-        for i in range(n_copies):
-            output = x @ wqs[i].T
-            y = x @ wks[i].T
-            y = x @ wvs[i].T
-            y = output @ wos[i].T
+    for iter in range(N_WARMUPS):
+        i = iter % n_copies
+        output = x @ wqs[i].T
+        y = x @ wks[i].T
+        y = x @ wvs[i].T
+        y = output @ wos[i].T
 
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        for i in range(n_copies):
-            output = x @ wqs[i].T
-            y = x @ wks[i].T
-            y = x @ wvs[i].T
-            y = output @ wos[i].T
+    for iter in range(N_TESTS):
+        i = iter % n_copies
+        output = x @ wqs[i].T
+        y = x @ wks[i].T
+        y = x @ wvs[i].T
+        y = output @ wos[i].T
 
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / (N_TESTS * n_copies)
+    latency = (time.time() - tic) * 1000 / N_TESTS
 
     return latency
 
@@ -228,23 +235,25 @@ def test_repeat_kv(model_config: dict, tp_size: int, batch_size: int, seq_len: i
     ]
 
     # warm up
-    for _ in range(N_WARMUPS):
-        for k in ks:
-            k = k[:, :, None, :, :].expand(
-                batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
-            )
-            k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
+    for iter in range(N_WARMUPS):
+        i = iter % n_copies
+        k = ks[i]
+        k = k[:, :, None, :, :].expand(
+            batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
+        )
+        k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
 
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        for k in ks:
-            k = k[:, :, None, :, :].expand(
-                batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
-            )
-            k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
+    for iter in range(N_TESTS):
+        i = iter % n_copies
+        k = ks[i]
+        k = k[:, :, None, :, :].expand(
+            batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
+        )
+        k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 2 * 1000 / (N_TESTS * n_copies)
+    latency = (time.time() - tic) * 2 * 1000 / N_TESTS
 
     return latency
 
@@ -284,17 +293,17 @@ def test_attn_score(model_config: dict, tp_size: int, batch_size: int, seq_len: 
     ]
 
     # warm up
-    for _ in range(N_WARMUPS):
-        for i in range(n_copies):
-            s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
+    for iter in range(N_WARMUPS):
+        i = iter % n_copies
+        s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
 
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        for i in range(n_copies):
-            s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
+    for iter in range(N_TESTS):
+        i = iter % n_copies
+        s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / (N_TESTS * n_copies)
+    latency = (time.time() - tic) * 1000 / N_TESTS
 
     return latency
 
@@ -316,42 +325,53 @@ def test_router(model_config: dict, tp_size: int, batch_size: int, seq_len: int)
     ]  # transpose to match the performance of nn.Linear
 
     # warm up
-    for _ in range(N_WARMUPS):
-        for w in ws:
-            y = x @ w.T
+    for iter in range(N_WARMUPS):
+        i = iter % n_copies
+        y = x @ ws[i].T
 
     # real measurement
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        for w in ws:
-            y = x @ w.T
+    for iter in range(N_TESTS):
+        i = iter % n_copies
+        y = x @ ws[i].T
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / (N_TESTS * n_copies)
+    latency = (time.time() - tic) * 1000 / N_TESTS
 
     return latency
 
 
 def run_tests(model_config: dict, tp_size, test_func, target_ranks, group):
-    # run microbenchmarks only on target ranks
     avg_latencies = []
-    for seq_len in [1, 128]:
-        batch_size = START_BSZ
-        while batch_size <= END_BSZ:
+    if test_func == test_expert:
+        for n_tokens in range(1, END_BSZ*PROMPT_LEN+1):
+            # run microbenchmarks only on target ranks
             if WORLD_RANK in target_ranks:
-                if test_func == test_allreduce:
-                    latency = test_func(model_config, batch_size, seq_len, group)
-                elif test_func == test_p2p:
-                    latency = test_func(
-                        model_config, batch_size, seq_len, target_ranks, group
-                    )
-                else:
-                    latency = test_func(model_config, tp_size, batch_size, seq_len)
+                latency = test_func(model_config, tp_size, n_tokens)
             else:
                 latency = 0.0
+        
+            avg_latencies.append(latency)
+    
+    else:
+        for seq_len in [1, PROMPT_LEN]:
+            batch_size = START_BSZ
+            while batch_size <= END_BSZ:
+                # run microbenchmarks only on target ranks
+                if WORLD_RANK in target_ranks:
+                    if test_func == test_allreduce:
+                        latency = test_func(model_config, batch_size, seq_len, group)
+                    elif test_func == test_p2p:
+                        latency = test_func(
+                            model_config, batch_size, seq_len, target_ranks, group
+                        )
+                    else:
+                        latency = test_func(model_config, tp_size, batch_size, seq_len)
+                else:
+                    latency = 0.0
 
-            avg_latencies.append(latency)  # latency is in ms
-            batch_size *= 2
+                avg_latencies.append(latency)  # latency is in ms
+                batch_size *= 2
 
     dist.barrier()
 
