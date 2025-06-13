@@ -1153,6 +1153,7 @@ def main(
         print("RUN STATISTICS")
         print(f"avg prefill throughput: {mean(prefill_tps[1:]):.2f} t/s")
         print(f"avg decode throughput: {mean(decode_tps[1:]):.2f} t/s")
+        print(f"bs: {batch_size}")
 
     dist.barrier()
     # dist.destroy_process_group()

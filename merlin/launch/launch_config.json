@@ -1,14 +1,14 @@
 {
-  "world_size": 3,
+  "world_size": 2,
   "master_addr": "10.10.10.1",
   "master_port": "9091",
   "username": "gaven",
   "branch_name": "merlin-gaven",
   "shared_exec_args": {
-    "n_prompts": 512,
-    "batch_size": 16,
+    "n_prompts": 1024,
+    "batch_size": 32,
     "max_tokens": 128,
-    "hide_resp": true
+    "hide_resp": false
   },
   "nodes": {
     "10.10.10.1": {
@@ -18,7 +18,7 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/llm_team/merlin_mixtral_weights/pp",
+      "model_path": "/mnt/llm_team/merlin_mixtral_weights/pp-ep-attn-tp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 0,
       "profile": false,
@@ -31,7 +31,7 @@
       "proj_dir": "/home/gaven/ntu_paslab_llm/merlin",
       "launcher": "launch/run_node.py",
       "script": "models/mixtral_8x7b_graph.py",
-      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/pp",
+      "model_path": "/mnt/disk2/llm_team/merlin_mixtral_weights/pp-ep-attn-tp",
       "prompt_path": "/home/gaven/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json",
       "node_id": 1,
       "profile": false,
