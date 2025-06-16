@@ -52,6 +52,7 @@ SETUP = [
     # },
 ]
 
+random.seed(1234)
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -129,22 +130,22 @@ def find_parallel_strategies(batch_size: int, prompt_len: int):
     #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
     #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     # }
-    strategies["inter PP + intra EP + intra-attn TP"] = {
-        "batch_size": batch_size,
-        "prompt_len": prompt_len,
-        "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
-        "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
-        "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
-    }
-    # strategies["inter EP + intra-experts TP"] = {
+    # strategies["inter PP + intra EP + intra-attn TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
-    #     "experts_strategy": {
-    #         "experts_are_intra": False,
-    #         "experts_parallelism": "ep+tp",
-    #         "experts_allocation": [3, 5],
-    #     },
+    #     "pp_strategy": {"is_naive": False, "pp_node_layers": pp_node_layers},
+    #     "attn_strategy": {"attn_is_intra": True, "attn_parallelism": "tp"},
+    #     "experts_strategy": {"experts_are_intra": True, "experts_parallelism": "ep"},
     # }
+    strategies["inter EP + intra-experts TP"] = {
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "experts_strategy": {
+            "experts_are_intra": False,
+            "experts_parallelism": "ep+tp",
+            "experts_allocation": [3, 5],
+        },
+    }
     # strategies["inter EP + intra-attn-intra-experts TP"] = {
     #     "batch_size": batch_size,
     #     "prompt_len": prompt_len,
@@ -260,24 +261,29 @@ def estimate_lower_bound_exec_time(
         inter_node_comm_time = bench_res["inter_allreduce"][input_shape]
         if experts_parallelism is None:
             parallel_size = 1
-            n_local_experts = n_experts
+            local_expert_ids = [list(range(n_experts)) for _ in range(node["n_gpus"])]
             comm_time = 0
 
         elif experts_parallelism == "tp":
             parallel_size = n_local_gpus if experts_are_intra else total_n_gpus
-            n_local_experts = n_experts
+            local_expert_ids = [list(range(n_experts)) for _ in range(node["n_gpus"])]
             comm_time = (
                 intra_node_comm_time if experts_are_intra else inter_node_comm_time
             )
 
         elif experts_parallelism == "ep":
             parallel_size = 1
-            # NOTE: consider maximum number of local expert
-            n_local_experts = (
-                n_local_gpus
-                - 1
-                + (n_experts if experts_are_intra else experts_allocation[node_idx])
-            ) // n_local_gpus
+            n_experts_on_node = n_experts if experts_are_intra else experts_allocation[node_idx]
+            n_local_experts = [n_experts_on_node // n_local_gpus for _ in range(node["n_gpus"])]
+            expert_remainder = n_experts_on_node % n_local_gpus
+            for i in range(expert_remainder):
+                n_local_experts[-1-i] += 1
+            local_expert_ids = []
+            expert_id = 0
+            for n in n_local_experts:
+                local_expert_ids.append(list(range(expert_id, expert_id+n)))
+                expert_id += n
+
             comm_time = (
                 intra_node_comm_time if experts_are_intra else inter_node_comm_time
             )
@@ -285,16 +291,23 @@ def estimate_lower_bound_exec_time(
         elif experts_parallelism == "ep+tp":
             assert not experts_are_intra
             parallel_size = n_local_gpus
-            n_local_experts = experts_allocation[node_idx]
+            local_expert_ids = [list(range(experts_allocation[node_idx])) for _ in range(node["n_gpus"])]
             comm_time = inter_node_comm_time
-        
+        # print(local_expert_ids)
         total_comp_time = 0
         for n_activation in n_activations:
-            for ei in range(n_local_experts):
-                if n_activation[ei] > 0:
-                    total_comp_time += bench_res_node["expert_matmul"][f"tp{parallel_size}"][str(n_activation[ei])]
+            max_gpu_compute_time = 0
+            for ids in local_expert_ids:
+                gpu_compute_time = 0
+                for ei in ids:
+                    if n_activation[ei] > 0:
+                        gpu_compute_time += bench_res_node["expert_matmul"][f"tp{parallel_size}"][str(n_activation[ei])]
+                max_gpu_compute_time = max(max_gpu_compute_time, gpu_compute_time)
+
+            total_comp_time += max_gpu_compute_time
             
         compute_time = total_comp_time / len(n_activations) + bench_res_node["router"]["tp1"][input_shape]
+        # print("node id:", node_idx, "compute time:", compute_time)
         exec_time.extend([compute_time, comm_time])
 
         constant = pp_node_layers[node_idx] if pp_strategy else n_layers
