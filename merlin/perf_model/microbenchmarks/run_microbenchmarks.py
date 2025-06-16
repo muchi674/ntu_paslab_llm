@@ -23,7 +23,7 @@ LOCAL_RANK = int(os.environ["LOCAL_RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 WORLD_RANK = int(os.environ["RANK"])
 
-MAX_TP_SIZE = 8
+TP_TEST_CASE = [1, 2, 4, 6]
 
 def get_global_map(device):
     global_map = torch.zeros((WORLD_SIZE, 2), dtype=torch.int64, device=device)
@@ -37,7 +37,7 @@ def print_msg(msg):
         print(msg)
 
 
-def run_microbenchmarks(model_path):
+def run_microbenchmarks(model_path, output_path):
     # init processes
     device = torch.device(f"cuda:{LOCAL_RANK}")
     dist.init_process_group(
@@ -156,14 +156,11 @@ def run_microbenchmarks(model_path):
         for name, test_func in comp_tests:
             print_msg(f"testing single device {name}...")
             tp_results = {}
-            tp_size = 1
-            # note: number of ranks of a node should be 2^i
-            while tp_size <= MAX_TP_SIZE:
+            for tp_size in TP_TEST_CASE:
                 result = run_tests(
                     model_config, tp_size, test_func, [ranks_on_node[0]], local_group
                 )
                 tp_results[f"tp{tp_size}"] = result
-                tp_size *= 2
 
             print_msg(f"result: {tp_results}\n")
             node_results[name] = tp_results
@@ -172,8 +169,7 @@ def run_microbenchmarks(model_path):
         benchmark_results[f"node{node_rank}"] = node_results
 
     if WORLD_RANK == 0:
-        filename = "results/test.json"
-        with open(filename, "w", encoding="utf-8") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(benchmark_results, f, ensure_ascii=False, indent=4)
 
     dist.barrier()
@@ -183,6 +179,7 @@ def run_microbenchmarks(model_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str)
+    parser.add_argument("--output-path", type=str)
     args = parser.parse_args()
-    run_microbenchmarks(args.model_path)
+    run_microbenchmarks(args.model_path, args.output_path)
     # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
