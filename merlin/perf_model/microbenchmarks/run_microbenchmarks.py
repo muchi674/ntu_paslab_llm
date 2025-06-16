@@ -182,4 +182,4 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", type=str)
     args = parser.parse_args()
     run_microbenchmarks(args.model_path, args.output_path)
-    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py
+    # torchrun --nnodes=2 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 run_microbenchmarks.py --model-path /mnt/llm_team/Mixtral-8x7B-Instruct-v0.1/ --output-path results/4090-2-4.json

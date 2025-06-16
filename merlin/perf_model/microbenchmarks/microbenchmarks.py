@@ -124,7 +124,7 @@ def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     interm_d = ceildiv(model_config["intermediate_size"], tp_size)
     n_layers = model_config["num_hidden_layers"]
 
-    n_warmups, n_tests = 100,300
+    n_warmups, n_tests = 100, 300
     if n_tokens > 100:
         n_warmups, n_tests = 1, 5
 
