@@ -133,7 +133,7 @@ def test_p2p(model_config: dict, batch_size: int, seq_len: int, target_ranks, gr
 
 def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     """
-    measure the latency of (x @ w1 + x @ w3) @ w2
+    measure the latency of (silu(x @ w1) * x @ w3) @ w2
     """
     model_d = model_config["hidden_size"]
     interm_d = ceildiv(model_config["intermediate_size"], tp_size)
@@ -146,35 +146,40 @@ def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     # prepare inputs
     n_copies = n_layers  # TODO: how many copies do we need?
     x = torch.rand((n_tokens, model_d), dtype=DTYPE, device=DEVICE)
-    w1s = [
-        torch.rand((interm_d, model_d), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]  # transpose to match the performance of nn.Linear
-    w2s = [
-        torch.rand((model_d, interm_d), dtype=DTYPE, device=DEVICE)
+    w_gate_ups = [
+        torch.rand((interm_d*2, model_d), dtype=DTYPE, device=DEVICE)
         for _ in range(n_copies)
     ]
-    w3s = [
-        torch.rand((interm_d, model_d), dtype=DTYPE, device=DEVICE)
+    w_downs = [
+        torch.rand((model_d, interm_d), dtype=DTYPE, device=DEVICE)
         for _ in range(n_copies)
     ]
 
     # warm up
     for iter in range(n_warmups):
         i = iter % n_copies
-        y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
+        w_gate_up = w_gate_ups[i].T
+        w_down = w_downs[i].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = torch.nn.functional.silu(gate_states) * up_states
+        y = hidden_states @ w_down
 
     # real measurement
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
     for iter in range(n_tests):
         i = iter % n_copies
-        y = (x @ w1s[i].T + x @ w3s[i].T) @ w2s[i].T
+        w_gate_up = w_gate_ups[i].T
+        w_down = w_downs[i].T
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = torch.nn.functional.silu(gate_states) * up_states
+        y = hidden_states @ w_down
 
     torch.cuda.synchronize(device=DEVICE)
     latency = (time.time() - tic) * 1000 / n_tests
 
     return latency
+
 
 
 def test_qkvo(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
