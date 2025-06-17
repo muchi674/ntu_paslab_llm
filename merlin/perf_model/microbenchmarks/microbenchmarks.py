@@ -68,12 +68,11 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
         device=DEVICE,
     )
 
-    # record graph
+    # capture graph
     with torch.cuda.device(device=DEVICE):
         graphed_allreduce = torch.cuda.make_graphed_callables(
             all_reduce_func, (x,), num_warmup_iters=3
         )
-
 
     # warmup
     for _ in range(N_WARMUPS // n_allreduce):
