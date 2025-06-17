@@ -180,6 +180,7 @@ def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     return latency
 
 
+
 def test_qkvo(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
     """
     measure the latency of x @ wq, x @ wk, x @ wv, output @ wo
