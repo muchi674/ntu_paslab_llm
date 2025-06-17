@@ -53,6 +53,15 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
     """
     measure the latency of all-reduce in group
     """
+    n_allreduce = 10
+
+    # all-reduce function for cuda graph
+    def all_reduce_func(inputs):
+        for _ in range(n_allreduce):
+            dist.all_reduce(inputs, op=dist.ReduceOp.SUM, group=group)
+
+        return inputs
+
     # prepare inputs
     x = torch.rand(
         (batch_size, seq_len, model_config["hidden_size"]),
@@ -60,16 +69,22 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
         device=DEVICE,
     )
 
+    # graph capture
+    with torch.cuda.device(device=DEVICE):
+        graphed_allreduce = torch.cuda.make_graphed_callables(
+            all_reduce_func, (x,), num_warmup_iters=3
+        )
+
     # warmup
-    for _ in range(N_WARMUPS):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+    for _ in range(N_WARMUPS // n_allreduce):
+        graphed_allreduce(x)
 
     # real test
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
-        torch.cuda.synchronize(device=DEVICE)
+    for _ in range(N_TESTS // n_allreduce):
+        graphed_allreduce(x)
+    torch.cuda.synchronize(device=DEVICE)
     latency = (time.time() - tic) * 1000 / N_TESTS  # in ms
 
     return latency
