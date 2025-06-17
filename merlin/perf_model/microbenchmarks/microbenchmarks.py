@@ -16,7 +16,7 @@ WORLD_RANK = int(os.environ["RANK"])
 # general settings
 DTYPE = torch.bfloat16
 N_WARMUPS = 1000
-N_TESTS = 3000
+N_TESTS = 3000    
 START_BSZ = 1
 END_BSZ = 16
 MAX_SEQ_LEN = 256
@@ -33,13 +33,13 @@ def format_result(avg_latencies: list[float]):
             batch_size *= 2
 
     data = {}
-    
+
     if len(avg_latencies) == len(shapes):
         for s, l in zip(shapes, avg_latencies):
             data[s] = round(l, 3)
     else:
         for i in range(len(avg_latencies)):
-            data[str(i+1)] = round(avg_latencies[i], 3)
+            data[str(i + 1)] = round(avg_latencies[i], 3)
 
     return data
 
@@ -53,6 +53,14 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
     """
     measure the latency of all-reduce in group
     """
+    n_allreduce = 10
+
+    # all-reduce function for cuda graph
+    def all_reduce_func(inputs):
+        for _ in range(n_allreduce):
+            dist.all_reduce(inputs, op=dist.ReduceOp.SUM, group=group)
+        return inputs
+
     # prepare inputs
     x = torch.rand(
         (batch_size, seq_len, model_config["hidden_size"]),
@@ -60,16 +68,22 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
         device=DEVICE,
     )
 
+    # record graph
+    with torch.cuda.device(device=DEVICE):
+        graphed_allreduce = torch.cuda.make_graphed_callables(
+            all_reduce_func, (x,), num_warmup_iters=3
+        )
+
+
     # warmup
-    for _ in range(N_WARMUPS):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+    for _ in range(N_WARMUPS // n_allreduce):
+        graphed_allreduce(x)
 
     # real test
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for _ in range(N_TESTS):
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
-
+    for _ in range(N_TESTS // n_allreduce):
+        graphed_allreduce(x)
     torch.cuda.synchronize(device=DEVICE)
     latency = (time.time() - tic) * 1000 / N_TESTS  # in ms
 
@@ -344,15 +358,15 @@ def test_router(model_config: dict, tp_size: int, batch_size: int, seq_len: int)
 def run_tests(model_config: dict, tp_size, test_func, target_ranks, group):
     avg_latencies = []
     if test_func == test_expert:
-        for n_tokens in range(1, END_BSZ*PROMPT_LEN+1):
+        for n_tokens in range(1, END_BSZ * PROMPT_LEN + 1):
             # run microbenchmarks only on target ranks
             if WORLD_RANK in target_ranks:
                 latency = test_func(model_config, tp_size, n_tokens)
             else:
                 latency = 0.0
-        
+
             avg_latencies.append(latency)
-    
+
     else:
         for seq_len in [1, PROMPT_LEN]:
             batch_size = START_BSZ
