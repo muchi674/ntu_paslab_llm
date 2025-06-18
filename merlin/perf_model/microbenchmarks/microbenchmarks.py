@@ -16,7 +16,7 @@ WORLD_RANK = int(os.environ["RANK"])
 # general settings
 DTYPE = torch.bfloat16
 N_WARMUPS = 1000
-N_TESTS = 3000    
+N_TESTS = 3000
 START_BSZ = 1
 END_BSZ = 16
 MAX_SEQ_LEN = 256
@@ -44,6 +44,12 @@ def format_result(avg_latencies: list[float]):
     return data
 
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = x.shape
+    x = x[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return x.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
 def ceildiv(a, b):
     # from: https://stackoverflow.com/questions/14822184/is-there-a-ceiling-equivalent-of-operator-in-python
     return -(a // -b)
@@ -59,20 +65,23 @@ def test_allreduce(model_config: dict, batch_size: int, seq_len: int, group):
     def all_reduce_func(inputs):
         for _ in range(n_allreduce):
             dist.all_reduce(inputs, op=dist.ReduceOp.SUM, group=group)
+
         return inputs
 
     # prepare inputs
-    x = torch.rand(
+    x = torch.zeros(
         (batch_size, seq_len, model_config["hidden_size"]),
         dtype=torch.bfloat16,
         device=DEVICE,
     )
+    dist.barrier(group=group)
 
-    # capture graph
+    # graph capture
     with torch.cuda.device(device=DEVICE):
         graphed_allreduce = torch.cuda.make_graphed_callables(
             all_reduce_func, (x,), num_warmup_iters=3
         )
+    torch.cuda.synchronize(device=DEVICE)
 
     # warmup
     for _ in range(N_WARMUPS // n_allreduce):
@@ -146,7 +155,7 @@ def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     n_copies = n_layers  # TODO: how many copies do we need?
     x = torch.rand((n_tokens, model_d), dtype=DTYPE, device=DEVICE)
     w_gate_ups = [
-        torch.rand((interm_d*2, model_d), dtype=DTYPE, device=DEVICE)
+        torch.rand((interm_d * 2, model_d), dtype=DTYPE, device=DEVICE)
         for _ in range(n_copies)
     ]
     w_downs = [
@@ -180,181 +189,82 @@ def test_expert(model_config: dict, tp_size: int, n_tokens: int):
     return latency
 
 
-
-def test_qkvo(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
-    """
-    measure the latency of x @ wq, x @ wk, x @ wv, output @ wo
-    """
+def test_attn_router(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
     model_d = model_config["hidden_size"]
     head_dim = model_d // model_config["num_attention_heads"]
-    n_heads = ceildiv(model_config["num_attention_heads"], tp_size)
-    n_kv_heads = ceildiv(model_config["num_key_value_heads"], batch_size)
-    n_layers = model_config["num_hidden_layers"]
-
-    n_copies = n_layers
-    x = torch.rand((batch_size * seq_len, model_d), dtype=DTYPE, device=DEVICE)
-    wqs = [
-        torch.rand((n_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]
-    wks = [
-        torch.rand((n_kv_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]
-    wvs = [
-        torch.rand((n_kv_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]
-    wos = [
-        torch.rand((model_d, n_heads * head_dim), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]
-
-    # warm up
-    for iter in range(N_WARMUPS):
-        i = iter % n_copies
-        output = x @ wqs[i].T
-        y = x @ wks[i].T
-        y = x @ wvs[i].T
-        y = output @ wos[i].T
-
-    torch.cuda.synchronize(device=DEVICE)
-    tic = time.time()
-    for iter in range(N_TESTS):
-        i = iter % n_copies
-        output = x @ wqs[i].T
-        y = x @ wks[i].T
-        y = x @ wvs[i].T
-        y = output @ wos[i].T
-
-    torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / N_TESTS
-
-    return latency
-
-
-def test_repeat_kv(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
-    """
-    measure the latency of repeat_kv
-    """
-    head_dim = model_config["hidden_size"] // model_config["num_attention_heads"]
-    n_layers = model_config["num_hidden_layers"]
     n_kv_heads = ceildiv(model_config["num_key_value_heads"], tp_size)
     n_rep = model_config["num_attention_heads"] // model_config["num_key_value_heads"]
-
-    n_copies = n_layers
-    ks = [
-        torch.rand(
-            (batch_size, n_kv_heads, MAX_SEQ_LEN, head_dim),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-        for _ in range(n_copies)
-    ]
-
-    # warm up
-    for iter in range(N_WARMUPS):
-        i = iter % n_copies
-        k = ks[i]
-        k = k[:, :, None, :, :].expand(
-            batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
-        )
-        k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
-
-    torch.cuda.synchronize(device=DEVICE)
-    tic = time.time()
-    for iter in range(N_TESTS):
-        i = iter % n_copies
-        k = ks[i]
-        k = k[:, :, None, :, :].expand(
-            batch_size, n_kv_heads, n_rep, MAX_SEQ_LEN, head_dim
-        )
-        k = k.reshape(batch_size, n_kv_heads * n_rep, MAX_SEQ_LEN, head_dim)
-    torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 2 * 1000 / N_TESTS
-
-    return latency
-
-
-def test_attn_score(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
-    """
-    measure the latency of Q @ K.T @ V
-    """
-    n_layers = model_config["num_hidden_layers"]
-    n_heads = ceildiv(model_config["num_attention_heads"], tp_size)
-    head_dim = model_config["hidden_size"] // model_config["num_attention_heads"]
-
-    n_copies = n_layers
-    qs = [
-        torch.rand(
-            (batch_size, n_heads, seq_len, head_dim),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-        for _ in range(n_copies)
-    ]
-    ks = [
-        torch.rand(
-            (batch_size, n_heads, MAX_SEQ_LEN, head_dim),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-        for _ in range(n_copies)
-    ]
-    vs = [
-        torch.rand(
-            (batch_size, n_heads, MAX_SEQ_LEN, head_dim),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-        for _ in range(n_copies)
-    ]
-
-    # warm up
-    for iter in range(N_WARMUPS):
-        i = iter % n_copies
-        s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
-
-    torch.cuda.synchronize(device=DEVICE)
-    tic = time.time()
-    for iter in range(N_TESTS):
-        i = iter % n_copies
-        s = qs[i] @ ks[i].transpose(2, 3) @ vs[i]
-    torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / N_TESTS
-
-    return latency
-
-
-def test_router(model_config: dict, tp_size: int, batch_size: int, seq_len: int):
-    """
-    measure the latency of router
-    """
-    model_d = model_config["hidden_size"]
-    n_layers = model_config["num_hidden_layers"]
+    n_heads = n_kv_heads * n_rep
     n_experts = model_config["num_local_experts"]
 
-    n_tokens = batch_size * seq_len
-    n_copies = n_layers
-    x = torch.rand((n_tokens, model_d), dtype=DTYPE, device=DEVICE)
-    ws = [
-        torch.rand((n_experts, model_d), dtype=DTYPE, device=DEVICE)
-        for _ in range(n_copies)
-    ]  # transpose to match the performance of nn.Linear
+    wq = torch.rand((n_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
+    wk = torch.rand((n_kv_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
+    wv = torch.rand((n_kv_heads * head_dim, model_d), dtype=DTYPE, device=DEVICE)
+    wo = torch.rand((model_d, n_heads * head_dim), dtype=DTYPE, device=DEVICE)
+    ks = torch.rand(
+        (batch_size, n_kv_heads, MAX_SEQ_LEN, head_dim),
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    vs = torch.rand(
+        (batch_size, n_kv_heads, MAX_SEQ_LEN, head_dim),
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    wr = torch.rand((n_experts, model_d), dtype=DTYPE, device=DEVICE)
 
-    # warm up
-    for iter in range(N_WARMUPS):
-        i = iter % n_copies
-        y = x @ ws[i].T
+    mask = torch.full(
+        (MAX_SEQ_LEN, MAX_SEQ_LEN), float("-inf"), dtype=DTYPE, device=DEVICE
+    )
+    mask = torch.triu(mask, diagonal=1)
+    storage_idx = torch.arange(seq_len, dtype=torch.long, device=DEVICE)
 
-    # real measurement
+    # graph function
+    def attn_func(inputs):
+        xq = inputs @ wq.T
+        xk = inputs @ wk.T
+        xv = inputs @ wv.T
+
+        xq = xq.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        xk = xk.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        xv = xv.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(ks, n_rep)
+        values = repeat_kv(vs, n_rep)
+
+        output = torch.nn.functional.scaled_dot_product_attention(
+            xq,
+            keys,
+            values,
+            attn_mask=mask[storage_idx],
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+        output = output @ wo.T
+        output = output @ wr.T
+        return output
+
+    x = torch.rand((batch_size * seq_len, model_d), dtype=DTYPE, device=DEVICE)
+
+    # capture graph
+    with torch.cuda.device(device=DEVICE):
+        graphed_attn = torch.cuda.make_graphed_callables(
+            attn_func, (x,), num_warmup_iters=3
+        )
+
+    # warmup
+    for _ in range(N_WARMUPS):
+        graphed_attn(x)
+
+    # real test
     torch.cuda.synchronize(device=DEVICE)
     tic = time.time()
-    for iter in range(N_TESTS):
-        i = iter % n_copies
-        y = x @ ws[i].T
+    for _ in range(N_TESTS):
+        graphed_attn(x)
     torch.cuda.synchronize(device=DEVICE)
-    latency = (time.time() - tic) * 1000 / N_TESTS
+    latency = (time.time() - tic) * 1000 / N_TESTS  # in ms
 
     return latency
 

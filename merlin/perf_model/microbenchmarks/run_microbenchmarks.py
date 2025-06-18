@@ -8,12 +8,9 @@ import torch.distributed as dist
 from microbenchmarks import (
     run_tests,
     test_allreduce,
-    test_attn_score,
     test_expert,
     test_p2p,
-    test_qkvo,
-    test_repeat_kv,
-    test_router,
+    test_attn_router,
 )
 
 # Environment variables set by torch.distributed.launch
@@ -67,7 +64,7 @@ def run_microbenchmarks(model_path, output_path):
             local_group = node_group
 
     # get model config
-    model_config_path = f"/{model_path}/config.json"
+    model_config_path = f"{model_path}/config.json"
 
     with open(model_config_path) as f:
         model_config = json.load(f)
@@ -148,10 +145,7 @@ def run_microbenchmarks(model_path, output_path):
         # --- testing single device computation ---
         comp_tests = [
             ["expert_matmul", test_expert],
-            ["router", test_router],
-            ["qkvo", test_qkvo],
-            ["repeat_kv", test_repeat_kv],
-            ["attn_score", test_attn_score],
+            ["attn_router", test_attn_router],
         ]
         for name, test_func in comp_tests:
             print_msg(f"testing single device {name}...")
