@@ -10,6 +10,7 @@ DESIGN_PATH="/home/u3114747/ntu_paslab_llm/merlin/partitioners/designs/8x22b-int
 PROMPT_PATH="/home/u3114747/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json"
 
 echo $PRL_MODEL_PATH
+echo "LOCAL_RANK: $LOCAL_RANK"
 
 N_PROMPTS=512
 BATCH_SIZE=16
