@@ -1,4 +1,4 @@
-mistral_common==1.5.1
+# mistral_common==1.5.1
 
 # use CUDA 12.1 for following packages
 --extra-index-url https://download.pytorch.org/whl/cu121

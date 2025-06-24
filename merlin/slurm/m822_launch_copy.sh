@@ -28,8 +28,8 @@ export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 export OMP_NUM_THREADS=8
 export RDZV_ID=$RANDOM
 
-#cd /home/u3114747/ntu_paslab_llm/merlin
-#source .venv/bin/activate
+cd /home/u3114747/ntu_paslab_llm/merlin
+source .venv/bin/activate
 
 # CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_run.sh"
 CMD="bash /home/u3114747/ntu_paslab_llm/merlin/slurm/mixtral_part_run_copy.sh"
