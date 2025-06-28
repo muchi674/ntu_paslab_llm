@@ -23,6 +23,9 @@ WORLD_RANK = int(os.environ["RANK"])
 
 DEFAULT_SEED = 7
 
+# This is for Mistral style RoPE
+# ==================================================
+
 
 def precompute_freqs_cis(
     dim: int, end: int, theta: float, device: torch.device
@@ -46,6 +49,48 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# This is for HuggingFace style RoPE
+# ==================================================
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# ==================================================
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -89,6 +134,8 @@ class ModelArgs:
     parallel_experts: bool = False
     inter_parallel_attn: bool = False
     intra_parallel_attn: bool = False
+    device: torch.device = None
+    rope_style: str = None
 
     @classmethod
     def from_hf_config(cls, params: dict):
@@ -109,7 +156,43 @@ class ModelArgs:
         )
 
 
-class Attention(nn.Module):
+# This is for HuggingFace style RoPE
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=8192, base=1000000.0, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_seqlen = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.dim, 2, dtype=torch.float, device=device)
+                / self.dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+
+    def _set_cos_sin_cache(self, device, dtype):
+        t = torch.arange(self.max_seqlen, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, dtype):
+        return (
+            self.cos_cached[: self.max_seqlen].to(dtype=dtype),
+            self.sin_cached[: self.max_seqlen].to(dtype=dtype),
+        )
+
+
+class MistralAttention(nn.Module):
     def __init__(self, args: ModelArgs, li: int):
         super().__init__()
         self.args = args
@@ -180,6 +263,82 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
+class HFAttention(nn.Module):
+    def __init__(self, args: ModelArgs, li: int):
+        super().__init__()
+        self.args = args
+        self.li = li
+        self.cache: torch.Tensor
+        self.mask: torch.Tensor
+        self.prefill_storage_idx: torch.Tensor
+        self.decode_storage_idx: torch.Tensor
+
+        self.n_heads: int = args.n_heads
+        self.head_dim: int = args.head_dim
+        self.sqrt_head_dim = self.head_dim**0.5
+        self.n_kv_heads: int = args.n_kv_heads
+        self.repeats = self.n_heads // self.n_kv_heads
+
+        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+
+        self.rotary_emb = RotaryEmbedding(
+            args.head_dim,
+            base=args.rope_theta,
+            device=args.device,
+        )
+
+    def set_batch_level_args(
+        self,
+        freqs_cis: torch.Tensor,  # ignored
+        cache: torch.Tensor,
+        mask: torch.Tensor,
+        prefill_storage_idx: torch.Tensor,
+        decode_storage_idx: torch.Tensor,
+    ):
+        self.cache = cache
+        self.mask = mask
+        self.prefill_storage_idx = prefill_storage_idx
+        self.decode_storage_idx = decode_storage_idx
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        storage_idx: torch.Tensor,
+    ):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        cos, sin = self.rotary_emb(xv.dtype)
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin, storage_idx.unsqueeze(0))
+
+        # assumes bsz matches that of cache
+        self.cache[0, self.li].index_copy_(dim=-2, index=storage_idx, source=xk)
+        self.cache[1, self.li].index_copy_(dim=-2, index=storage_idx, source=xv)
+        keys = self.cache[0, self.li]
+        values = self.cache[1, self.li]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+
+        output = F.scaled_dot_product_attention(
+            xq,
+            keys,
+            values,
+            attn_mask=self.mask[storage_idx],
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
+        return self.wo(output)
+
+
 class Experts:
 
     def __init__(self, ws: dict):
@@ -203,9 +362,7 @@ class MoeLayer(nn.Module):
         self.glob_li = li + args.first_layer
         self.gate = gate
         self.experts = experts
-        self.dummy_zero = torch.zeros(
-            (1,), dtype=torch.int64, device=next(iter(experts.ws.values())).device
-        )
+        self.dummy_zero = torch.zeros((1,), dtype=torch.int64, device=args.device)
         self.pinned_offsets = torch.zeros(
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
@@ -277,7 +434,10 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.li = li  # local layer number if PP is applied
         self.local_group = local_group
-        self.attention = Attention(args, li)
+        if args.rope_style == "mistral":
+            self.attention = MistralAttention(args, li)
+        elif args.rope_style == "hf":
+            self.attention = HFAttention(args, li)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.feed_forward = MoeLayer(
@@ -489,7 +649,6 @@ class Transformer(nn.Module):
             self.is_first_stage,
             self.is_last_stage,
         ) = comms
-        self._precomputed_freqs_cis: torch.Tensor = None
         if self.is_first_stage:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         if self.is_last_stage:
@@ -770,6 +929,7 @@ class Mixtral8x7B:
             experts_filename = f"experts-{node_id}-{LOCAL_RANK}.pt"
 
         model_args = ModelArgs.from_hf_config(get_json(model_path / "config.json"))
+        model_args.device = device
         non_experts = torch.load(
             model_path / non_experts_filename,
             map_location=device,
@@ -871,16 +1031,17 @@ class Mixtral8x7B:
         comms.append(is_first_stage)
         comms.append(is_last_stage)
 
+        # TODO: refactor
+        if model_args.dim == 4096:
+            model_args.rope_style = "mistral"
+            tokenizer = MistralTokenizer.v1()
+        elif model_args.dim == 6144:
+            model_args.rope_style = "hf"
+            tokenizer = MistralTokenizer.v3()
+
         with torch.device("meta"):
             model = Transformer(model_args, Experts(experts), comms)
         model.load_state_dict(non_experts, assign=True, strict=True)
-
-        # TODO: refactor
-        if model_args.dim == 4096:
-            tokenizer = MistralTokenizer.v1()
-        elif model_args.dim == 6144:
-            tokenizer = MistralTokenizer.v3()
-
         return Mixtral8x7B(model, tokenizer)
 
     def __init__(
@@ -949,12 +1110,14 @@ class Mixtral8x7B:
         eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
 
         model = self.model.eval()
-        freqs_cis = precompute_freqs_cis(
-            dim=self.model.args.head_dim,
-            end=8192,
-            theta=self.model.args.rope_theta,
-            device=device,
-        )
+        freqs_cis = None
+        if model.args.rope_style == "mistral":
+            freqs_cis = precompute_freqs_cis(
+                dim=self.model.args.head_dim,
+                end=8192,
+                theta=self.model.args.rope_theta,
+                device=device,
+            )
         cache = self.get_cache(bsz, max_seq_len, device)
         mask = self.get_mask(max_seq_len, model.dtype, device)
         p_store_idx = torch.arange(min_p_len, dtype=torch.long, device=device)
