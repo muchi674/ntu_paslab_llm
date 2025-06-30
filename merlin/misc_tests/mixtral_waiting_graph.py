@@ -432,10 +432,28 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, li: int, experts: Experts, local_group):
+    def __init__(
+        self,
+        args: ModelArgs,
+        li: int,
+        experts: Experts,
+        local_group,
+        stream_args: tuple[
+            torch.cuda.Stream,
+            torch.cuda.Stream,
+            list[torch.cuda.Event],
+            list[torch.cuda.Event],
+        ],
+    ):
         super().__init__()
         self.li = li  # local layer number if PP is applied
         self.local_group = local_group
+        (
+            self.graph_stream,
+            self.experts_stream,
+            self.graph_events,
+            self.experts_events,
+        ) = stream_args
         if args.rope_style == "mistral":
             self.attention = MistralAttention(args, li)
         elif args.rope_style == "hf":
@@ -614,10 +632,16 @@ class TransformerBlock(nn.Module):
         # (h, r, res_r, topk_weight, offsets, adj_idxs)
         next_r = data[self.li + 1][1]
         h.copy_(x)
-        graphs[self.li].replay()
+
+        self.graph_stream.wait_stream(self.experts_stream)
+        with torch.cuda.stream(self.graph_stream):
+            graphs[self.li].replay()
+            self.graph_events[self.li].record()
 
         # h.shape = (batch_size * seq_len, model_dim)
+        self.graph_events[self.li].wait()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
+        self.experts_events[self.li].record()
 
     def middle_forward(
         self,
@@ -627,8 +651,15 @@ class TransformerBlock(nn.Module):
         _h, _r, res_r, topk_weight, offsets, adj_idxs = data[self.li]
         # (h, r, res_r, topk_weight, offsets, adj_idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
-        graphs[self.li].replay()
+
+        with torch.cuda.stream(self.graph_stream):
+            self.experts_events[self.li - 1].wait()
+            graphs[self.li].replay()
+            self.graph_events[self.li].record()
+
+        self.graph_events[self.li].wait()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
+        self.experts_events[self.li].record()
 
     def last_forward(
         self,
@@ -636,11 +667,26 @@ class TransformerBlock(nn.Module):
         data: list[tuple[torch.Tensor]],
     ) -> torch.Tensor:
         self.middle_forward(graphs, data)
-        graphs[-1].replay()  # last moe-allreduce
+
+        with torch.cuda.stream(self.graph_stream):
+            self.experts_events[self.li].wait()
+            graphs[-1].replay()  # last moe-allreduce
+        self.experts_stream.wait_stream(self.graph_stream)
 
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs, experts: Experts, comms: list):
+    def __init__(
+        self,
+        args: ModelArgs,
+        experts: Experts,
+        comms: list,
+        stream_args: tuple[
+            torch.cuda.Stream,
+            torch.cuda.Stream,
+            list[torch.cuda.Event],
+            list[torch.cuda.Event],
+        ],
+    ):
         super().__init__()
         self.args: ModelArgs = args
         (
@@ -663,6 +709,7 @@ class Transformer(nn.Module):
                     li=li - args.first_layer,
                     experts=experts,
                     local_group=self.local_group,
+                    stream_args=stream_args,
                 )
                 for li in range(args.first_layer, args.last_layer + 1)
             }
@@ -1033,6 +1080,14 @@ class Mixtral8x7B:
         comms.append(is_first_stage)
         comms.append(is_last_stage)
 
+        n_loc_layers = model_args.last_layer - model_args.first_layer + 1
+        stream_args = (
+            torch.cuda.Stream(),
+            torch.cuda.default_stream(device=device),
+            [torch.cuda.Event() for _ in range(n_loc_layers)],
+            [torch.cuda.Event() for _ in range(n_loc_layers)],
+        )
+
         # TODO: refactor
         if model_args.dim == 4096:
             model_args.rope_style = "mistral"
@@ -1042,7 +1097,7 @@ class Mixtral8x7B:
             tokenizer = MistralTokenizer.v3()
 
         with torch.device("meta"):
-            model = Transformer(model_args, Experts(experts), comms)
+            model = Transformer(model_args, Experts(experts), comms, stream_args)
         model.load_state_dict(non_experts, assign=True, strict=True)
         return Mixtral8x7B(model, tokenizer)
 

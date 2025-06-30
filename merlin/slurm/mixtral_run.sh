@@ -3,7 +3,7 @@
 which python
 
 OG_MODEL_PATH="/home/paslab504llm/Mixtral-8x22B-Instruct-v0.1"
-PRL_MODEL_PATH="/home/paslab504llm/m822_parallel/ep-experts-attn-tp"
+PRL_MODEL_PATH="/home/paslab504llm/m822_parallel/experts-attn-tp"
 DESIGN_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/partitioners/designs/ep-experts-attn-tp.json"
 PROMPT_PATH="/home/paslab504llm/ntu_paslab_llm/merlin/prompts/mixtral_8x7b_128.json"
 
@@ -54,6 +54,7 @@ echo $PRL_MODEL_PATH
 #     --capture-range=cudaProfilerApi \
 #     --capture-range-end=stop \
 #     --cuda-graph-trace=node \
+#     -o m822_waiting_graph \
 #     torchrun \
 #         --nnodes=$SLURM_JOB_NUM_NODES \
 #         --nproc-per-node=$SLURM_GPUS_PER_NODE \
@@ -76,6 +77,6 @@ torchrun \
     /home/paslab504llm/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py \
     --model-path $PRL_MODEL_PATH \
     --prompt-path $PROMPT_PATH \
-    --n-prompts 16 \
+    --n-prompts 4 \
     --batch-size 1 \
     --max-tokens 128 \
