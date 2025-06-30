@@ -54,6 +54,7 @@ echo $PRL_MODEL_PATH
 #     --capture-range=cudaProfilerApi \
 #     --capture-range-end=stop \
 #     --cuda-graph-trace=node \
+#     --force-overwrite true \
 #     -o m822_waiting_graph \
 #     torchrun \
 #         --nnodes=$SLURM_JOB_NUM_NODES \
@@ -77,6 +78,6 @@ torchrun \
     /home/paslab504llm/ntu_paslab_llm/merlin/models/mixtral_8x7b_graph.py \
     --model-path $PRL_MODEL_PATH \
     --prompt-path $PROMPT_PATH \
-    --n-prompts 4 \
+    --n-prompts 32 \
     --batch-size 1 \
     --max-tokens 128 \
