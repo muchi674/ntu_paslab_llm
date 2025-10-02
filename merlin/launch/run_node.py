@@ -4,7 +4,7 @@ import argparse
 import subprocess
 import sys
 import time
-
+import os
 
 """terminal color"""
 TC = SimpleNamespace(
@@ -136,7 +136,8 @@ def main():
             + "--cuda-graph-trace=node "
         )
         if args.profiling_output:
-            prof_cmd += f"-o {args.profiling_output} "
+            os.makedirs("nsight", exist_ok=True)
+            prof_cmd += f"-o nsight/{args.profiling_output} "
         header = prof_cmd + header
     exec_target = (
         f"{args.script} "
@@ -156,6 +157,7 @@ def main():
         exec_target += "--hide-resp "
 
     # only for benchmarking
+    os.makedirs("output", exist_ok=True)
     out_filename = "output/" + datetime.now().strftime("%m-%d-%Y_%H:%M") + ".txt"
 
     Cmd("tmux set-option -g mouse on")
