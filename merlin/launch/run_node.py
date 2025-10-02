@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 
+
 """terminal color"""
 TC = SimpleNamespace(
     **{
@@ -155,7 +156,7 @@ def main():
         exec_target += "--hide-resp "
 
     # only for benchmarking
-    out_filename = datetime.now().strftime("%m-%d-%Y_%H:%M") + ".txt"
+    out_filename = "output/" + datetime.now().strftime("%m-%d-%Y_%H:%M") + ".txt"
 
     Cmd("tmux set-option -g mouse on")
     Cmd("tmux send-keys -t 0 'clear' Enter \;")
