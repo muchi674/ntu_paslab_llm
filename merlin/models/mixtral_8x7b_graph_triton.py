@@ -14,6 +14,11 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from torch import nn
 
+import triton
+import triton.language as tl
+
+from math import ceil
+
 # Environment variables set by torch.distributed.launch
 LOCAL_WORLD_SIZE = int(os.environ["LOCAL_WORLD_SIZE"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
@@ -22,6 +27,101 @@ GROUP_RANK = int(os.environ["GROUP_RANK"])
 WORLD_RANK = int(os.environ["RANK"])
 
 DEFAULT_SEED = 7
+
+
+def precompute_rope_cos_sin(dim: int, end: int, theta: float, device):
+    
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
+    )  # [D/2]
+    t = torch.arange(end, device=device, dtype=torch.float32)  # [T]
+    ang = torch.outer(t, freqs).float()  # [T, D/2]
+    cos, sin = ang.cos(), ang.sin()
+    return cos, sin
+
+
+
+@triton.jit
+def rope_single_kernel(
+    X_ptr, O_ptr,              # 输入/输出: [B,H,T,D]
+    COS_ptr, SIN_ptr,          # [T, D/2]
+    B, H, T, D,
+    stride_x_b, stride_x_h, stride_x_t, stride_x_d,
+    stride_o_b, stride_o_h, stride_o_t, stride_o_d,
+    stride_cs_t, stride_cs_dh, # cos/sin 的 stride
+    BLOCK_D: tl.constexpr,
+):
+    # 程序网格： (B*H, T, D_blocks)
+    bh = tl.program_id(0)         # 0..B*H-1
+    t_idx = tl.program_id(1)      # 0..T-1
+    d_blk = tl.program_id(2)
+
+    h_idx = bh % H
+    b_idx = bh // H
+
+    d_start = d_blk * BLOCK_D
+    offs_d = d_start + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    # pair 索引 & 偶/奇
+    i_pair = offs_d // 2
+    is_even = (offs_d % 2) == 0
+    mask_pair = (i_pair < (D // 2)) & mask_d
+
+    # 行指针
+    x_row_ptr = X_ptr + b_idx*stride_x_b + h_idx*stride_x_h + t_idx*stride_x_t
+    o_row_ptr = O_ptr + b_idx*stride_o_b + h_idx*stride_o_h + t_idx*stride_o_t
+
+    # 取 cos/sin[t, i_pair]
+    cos_ptr = COS_ptr + t_idx*stride_cs_t + i_pair*stride_cs_dh
+    sin_ptr = SIN_ptr + t_idx*stride_cs_t + i_pair*stride_cs_dh
+    cos = tl.load(cos_ptr, mask=mask_pair, other=1.0).to(tl.float32)
+    sin = tl.load(sin_ptr, mask=mask_pair, other=0.0).to(tl.float32)
+
+    # 读 even/odd
+    x_even = tl.load(x_row_ptr + (i_pair*2)   * stride_x_d, mask=mask_pair, other=0.0).to(tl.float32)
+    x_odd  = tl.load(x_row_ptr + (i_pair*2+1) * stride_x_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
+
+    # 旋转
+    even_p =  x_even * cos - x_odd * sin
+    odd_p  =  x_even * sin + x_odd * cos
+
+    out = tl.where(is_even, even_p, odd_p)
+    tl.store(o_row_ptr + offs_d*stride_o_d, out, mask=mask_pair)
+
+
+def rope_triton_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_d: int = 128):
+    """
+    x   : [B, H, T, D] (fp16/bf16/fp32), 建议 contiguous
+    cos : [T, D/2]
+    sin : [T, D/2]
+    return: same shape & dtype as x
+    """
+    assert x.ndim == 4
+    B, H, T, D = x.shape
+    assert D % 2 == 0
+    assert cos.shape == (T, D//2) and sin.shape == (T, D//2)
+
+    x = x.contiguous()
+    out = torch.empty_like(x)
+
+    sx_b, sx_h, sx_t, sx_d = x.stride()
+    so_b, so_h, so_t, so_d = out.stride()
+    sc_t, sc_dh = cos.stride()
+
+    grid = (B * H, T, ceil(D / block_d))
+    rope_single_kernel[grid](
+        x, out, cos, sin,
+        B, H, T, D,
+        sx_b, sx_h, sx_t, sx_d,
+        so_b, so_h, so_t, so_d,
+        sc_t, sc_dh,
+        BLOCK_D=block_d,
+        num_warps=4 if block_d <= 128 else 8,
+        num_stages=2,
+    )
+    return out
+
 
 
 def precompute_freqs_cis(
@@ -34,18 +134,6 @@ def precompute_freqs_cis(
     freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[None, None, :, :]
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -114,7 +202,8 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
         self.li = li
-        self.freqs_cis: torch.Tensor
+        self.rope_cos: torch.Tensor
+        self.rope_sin: torch.Tensor
         self.cache: torch.Tensor
         self.mask: torch.Tensor
         self.prefill_storage_idx: torch.Tensor
@@ -133,13 +222,15 @@ class Attention(nn.Module):
 
     def set_batch_level_args(
         self,
-        freqs_cis: torch.Tensor,
+        rope_cos: torch.Tensor,        # [max_len, D/2], float
+        rope_sin: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
         prefill_storage_idx: torch.Tensor,
         decode_storage_idx: torch.Tensor,
     ):
-        self.freqs_cis = freqs_cis
+        self.rope_cos = rope_cos
+        self.rope_sin = rope_sin
         self.cache = cache
         self.mask = mask
         self.prefill_storage_idx = prefill_storage_idx
@@ -157,11 +248,16 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_push("apply_rotary_emb")
-        xq, xk = apply_rotary_emb(xq, xk, self.freqs_cis[storage_idx])
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
+        # fuse rope
+        cos_t = self.rope_cos[storage_idx]    # [T, D/2]
+        sin_t = self.rope_sin[storage_idx]
+
+        xq = xq.contiguous()   # [B, n_heads,    T, D]
+        xk = xk.contiguous()   # [B, n_kv_heads, T, D]
+
+        xq = rope_triton_single(xq, cos_t, sin_t)
+        xk = rope_triton_single(xk, cos_t, sin_t)
+        
 
         # assumes bsz matches that of cache
         self.cache[0, self.li].index_copy_(dim=-2, index=storage_idx, source=xk)
@@ -169,13 +265,9 @@ class Attention(nn.Module):
         keys = self.cache[0, self.li]
         values = self.cache[1, self.li]
 
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_push("repeat_kv")
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
         values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
 
         output = F.scaled_dot_product_attention(
             xq,
@@ -502,7 +594,6 @@ class Transformer(nn.Module):
             self.is_first_stage,
             self.is_last_stage,
         ) = comms
-        self._precomputed_freqs_cis: torch.Tensor = None
         if self.is_first_stage:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         if self.is_last_stage:
@@ -536,7 +627,8 @@ class Transformer(nn.Module):
         self,
         bsz: int,
         seqlen: int,
-        freqs_cis: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
         cache: torch.Tensor,
         mask: torch.Tensor,
         prefill_storage_idx: torch.Tensor,
@@ -544,7 +636,7 @@ class Transformer(nn.Module):
     ):
         for li in range(self.args.first_layer, self.args.last_layer + 1):
             self.layers[str(li)].attention.set_batch_level_args(
-                freqs_cis, cache, mask, prefill_storage_idx, decode_storage_idx
+                rope_cos, rope_sin, cache, mask, prefill_storage_idx, decode_storage_idx
             )
         if self.args.has_pp and not self.is_first_stage:
             self.prefill_in_buffer = torch.zeros(
@@ -962,7 +1054,7 @@ class Mixtral8x7B:
         eos_id = self.tokenizer.instruct_tokenizer.tokenizer.eos_id
 
         model = self.model.eval()
-        freqs_cis = precompute_freqs_cis(
+        cos, sin = precompute_rope_cos_sin(
             dim=self.model.args.head_dim,
             end=8192,
             theta=self.model.args.rope_theta,
@@ -975,7 +1067,8 @@ class Mixtral8x7B:
         model.set_batch_level_args(
             bsz,
             min_p_len,
-            freqs_cis,
+            cos,      
+            sin, 
             cache,
             mask,
             p_store_idx,
