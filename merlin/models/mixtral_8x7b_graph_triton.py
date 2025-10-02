@@ -369,11 +369,7 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_push("RMSNorm")
         output = self._norm(x.float()).type_as(x)
-        torch.cuda.synchronize()
-        torch.cuda.nvtx.range_pop()
         return output * self.weight
 
 
