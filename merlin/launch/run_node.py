@@ -134,6 +134,7 @@ def main():
             + "--capture-range=cudaProfilerApi "
             + "--capture-range-end=stop "
             + "--cuda-graph-trace=node "
+            + "--force-overwrite=true "
         )
         if args.profiling_output:
             os.makedirs("nsight", exist_ok=True)

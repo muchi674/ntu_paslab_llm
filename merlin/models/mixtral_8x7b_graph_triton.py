@@ -46,7 +46,7 @@ def rope_fused_kernel(
     Q_ptr, K_ptr,        # [B, Hq/Hk, T, D]
     OQ_ptr, OK_ptr,      # 输出
     COS_ptr, SIN_ptr,    # [T, D/2]
-    B, Hq, Hk, T, D,
+    B, Hq, Hk, T, D, Hmax,
     stride_q_b, stride_q_h, stride_q_t, stride_q_d,
     stride_k_b, stride_k_h, stride_k_t, stride_k_d,
     stride_oq_b, stride_oq_h, stride_oq_t, stride_oq_d,
@@ -59,7 +59,6 @@ def rope_fused_kernel(
     t_ix = tl.program_id(1)      # 0 .. T-1
     db   = tl.program_id(2)      # D block
 
-    Hmax = tl.max(Hq, Hk)
     h_ix = bh % Hmax
     b_ix = bh // Hmax
 
@@ -82,33 +81,27 @@ def rope_fused_kernel(
     cos = tl.load(cos_ptr, mask=mask_pair, other=1.0).to(tl.float32)
     sin = tl.load(sin_ptr, mask=mask_pair, other=0.0).to(tl.float32)
 
-    # ---- Q path ----
-    if active_q:
-        q_row = Q_ptr  + b_ix*stride_q_b  + h_ix*stride_q_h  + t_ix*stride_q_t
-        oq_row= OQ_ptr + b_ix*stride_oq_b + h_ix*stride_oq_h + t_ix*stride_oq_t
+    # ---- Q path (masked) ----
+    q_row = Q_ptr  + b_ix*stride_q_b  + h_ix*stride_q_h  + t_ix*stride_q_t
+    oq_row= OQ_ptr + b_ix*stride_oq_b + h_ix*stride_oq_h + t_ix*stride_oq_t
+    mask_q = mask_pair & active_q
+    q_even = tl.load(q_row + (i_pair*2)   * stride_q_d, mask=mask_q, other=0.0).to(tl.float32)
+    q_odd  = tl.load(q_row + (i_pair*2+1) * stride_q_d, mask=mask_q & (offs_d+1 < D), other=0.0).to(tl.float32)
+    q_even_p = q_even * cos - q_odd * sin
+    q_odd_p  = q_even * sin + q_odd * cos
+    q_out    = tl.where(is_even, q_even_p, q_odd_p)
+    tl.store(oq_row + offs_d * stride_oq_d, q_out, mask=mask_q)
 
-        q_even = tl.load(q_row + (i_pair*2)   * stride_q_d, mask=mask_pair, other=0.0).to(tl.float32)
-        q_odd  = tl.load(q_row + (i_pair*2+1) * stride_q_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
-
-        q_even_p = q_even * cos - q_odd * sin
-        q_odd_p  = q_even * sin + q_odd * cos
-        q_out    = tl.where(is_even, q_even_p, q_odd_p)
-
-        tl.store(oq_row + offs_d * stride_oq_d, q_out, mask=mask_pair)
-
-    # ---- K path ----
-    if active_k:
-        k_row = K_ptr  + b_ix*stride_k_b  + h_ix*stride_k_h  + t_ix*stride_k_t
-        ok_row= OK_ptr + b_ix*stride_ok_b + h_ix*stride_ok_h + t_ix*stride_ok_t
-
-        k_even = tl.load(k_row + (i_pair*2)   * stride_k_d, mask=mask_pair, other=0.0).to(tl.float32)
-        k_odd  = tl.load(k_row + (i_pair*2+1) * stride_k_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
-
-        k_even_p = k_even * cos - k_odd * sin
-        k_odd_p  = k_even * sin + k_odd * cos
-        k_out    = tl.where(is_even, k_even_p, k_odd_p)
-
-        tl.store(ok_row + offs_d * stride_ok_d, k_out, mask=mask_pair)
+    # ---- K path (masked) ----
+    k_row = K_ptr  + b_ix*stride_k_b  + h_ix*stride_k_h  + t_ix*stride_k_t
+    ok_row= OK_ptr + b_ix*stride_ok_b + h_ix*stride_ok_h + t_ix*stride_ok_t
+    mask_k = mask_pair & active_k
+    k_even = tl.load(k_row + (i_pair*2)   * stride_k_d, mask=mask_k, other=0.0).to(tl.float32)
+    k_odd  = tl.load(k_row + (i_pair*2+1) * stride_k_d, mask=mask_k & (offs_d+1 < D), other=0.0).to(tl.float32)
+    k_even_p = k_even * cos - k_odd * sin
+    k_odd_p  = k_even * sin + k_odd * cos
+    k_out    = tl.where(is_even, k_even_p, k_odd_p)
+    tl.store(ok_row + offs_d * stride_ok_d, k_out, mask=mask_k)
 
 
 def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_d: int = 128):
@@ -140,7 +133,7 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
 
     rope_fused_kernel[grid](
         xq, xk, oq, ok, cos, sin,
-        B, Hq, Hk, T, D,
+        B, Hq, Hk, T, D, Hmax,
         sq_b, sq_h, sq_t, sq_d,
         sk_b, sk_h, sk_t, sk_d,
         soq_b, soq_h, soq_t, soq_d,
