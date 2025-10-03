@@ -42,97 +42,116 @@ def precompute_rope_cos_sin(dim: int, end: int, theta: float, device):
 
 
 @triton.jit
-def rope_single_kernel(
-    X_ptr, O_ptr,              # 输入/输出: [B,H,T,D]
-    COS_ptr, SIN_ptr,          # [T, D/2]
-    B, H, T, D,
-    stride_x_b, stride_x_h, stride_x_t, stride_x_d,
-    stride_o_b, stride_o_h, stride_o_t, stride_o_d,
-    stride_cs_t, stride_cs_dh, # cos/sin 的 stride
+def rope_fused_kernel(
+    Q_ptr, K_ptr,        # [B, Hq/Hk, T, D]
+    OQ_ptr, OK_ptr,      # 输出
+    COS_ptr, SIN_ptr,    # [T, D/2]
+    B, Hq, Hk, T, D,
+    stride_q_b, stride_q_h, stride_q_t, stride_q_d,
+    stride_k_b, stride_k_h, stride_k_t, stride_k_d,
+    stride_oq_b, stride_oq_h, stride_oq_t, stride_oq_d,
+    stride_ok_b, stride_ok_h, stride_ok_t, stride_ok_d,
+    stride_cs_t, stride_cs_dh,
     BLOCK_D: tl.constexpr,
 ):
-    # 程序网格： (B*H, T, D_blocks)
-    bh = tl.program_id(0)         # 0..B*H-1
-    t_idx = tl.program_id(1)      # 0..T-1
-    d_blk = tl.program_id(2)
+    # program ids
+    bh   = tl.program_id(0)      # 0 .. B*Hmax-1
+    t_ix = tl.program_id(1)      # 0 .. T-1
+    db   = tl.program_id(2)      # D block
 
-    h_idx = bh % H
-    b_idx = bh // H
+    Hmax = tl.max(Hq, Hk)
+    h_ix = bh % Hmax
+    b_ix = bh // Hmax
 
-    d_start = d_blk * BLOCK_D
-    offs_d = d_start + tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
+    d_start = db * BLOCK_D
+    offs_d  = d_start + tl.arange(0, BLOCK_D)
+    mask_d  = offs_d < D
 
-    # pair 索引 & 偶/奇
-    i_pair = offs_d // 2
-    is_even = (offs_d % 2) == 0
+    # pair index + even/odd
+    i_pair   = offs_d // 2
+    is_even  = (offs_d % 2) == 0
     mask_pair = (i_pair < (D // 2)) & mask_d
 
-    # 行指针
-    x_row_ptr = X_ptr + b_idx*stride_x_b + h_idx*stride_x_h + t_idx*stride_x_t
-    o_row_ptr = O_ptr + b_idx*stride_o_b + h_idx*stride_o_h + t_idx*stride_o_t
+    # active heads
+    active_q = h_ix < Hq
+    active_k = h_ix < Hk
 
-    # 取 cos/sin[t, i_pair]
-    cos_ptr = COS_ptr + t_idx*stride_cs_t + i_pair*stride_cs_dh
-    sin_ptr = SIN_ptr + t_idx*stride_cs_t + i_pair*stride_cs_dh
+    # cos/sin[t, i_pair]
+    cos_ptr = COS_ptr + t_ix * stride_cs_t + i_pair * stride_cs_dh
+    sin_ptr = SIN_ptr + t_ix * stride_cs_t + i_pair * stride_cs_dh
     cos = tl.load(cos_ptr, mask=mask_pair, other=1.0).to(tl.float32)
     sin = tl.load(sin_ptr, mask=mask_pair, other=0.0).to(tl.float32)
 
-    # 读 even/odd
-    x_even = tl.load(x_row_ptr + (i_pair*2)   * stride_x_d, mask=mask_pair, other=0.0).to(tl.float32)
-    x_odd  = tl.load(x_row_ptr + (i_pair*2+1) * stride_x_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
+    # ---- Q path ----
+    if active_q:
+        q_row = Q_ptr  + b_ix*stride_q_b  + h_ix*stride_q_h  + t_ix*stride_q_t
+        oq_row= OQ_ptr + b_ix*stride_oq_b + h_ix*stride_oq_h + t_ix*stride_oq_t
 
-    # 旋转
-    even_p =  x_even * cos - x_odd * sin
-    odd_p  =  x_even * sin + x_odd * cos
+        q_even = tl.load(q_row + (i_pair*2)   * stride_q_d, mask=mask_pair, other=0.0).to(tl.float32)
+        q_odd  = tl.load(q_row + (i_pair*2+1) * stride_q_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
 
-    out = tl.where(is_even, even_p, odd_p)
-    tl.store(o_row_ptr + offs_d*stride_o_d, out, mask=mask_pair)
+        q_even_p = q_even * cos - q_odd * sin
+        q_odd_p  = q_even * sin + q_odd * cos
+        q_out    = tl.where(is_even, q_even_p, q_odd_p)
+
+        tl.store(oq_row + offs_d * stride_oq_d, q_out, mask=mask_pair)
+
+    # ---- K path ----
+    if active_k:
+        k_row = K_ptr  + b_ix*stride_k_b  + h_ix*stride_k_h  + t_ix*stride_k_t
+        ok_row= OK_ptr + b_ix*stride_ok_b + h_ix*stride_ok_h + t_ix*stride_ok_t
+
+        k_even = tl.load(k_row + (i_pair*2)   * stride_k_d, mask=mask_pair, other=0.0).to(tl.float32)
+        k_odd  = tl.load(k_row + (i_pair*2+1) * stride_k_d, mask=mask_pair & (offs_d+1 < D), other=0.0).to(tl.float32)
+
+        k_even_p = k_even * cos - k_odd * sin
+        k_odd_p  = k_even * sin + k_odd * cos
+        k_out    = tl.where(is_even, k_even_p, k_odd_p)
+
+        tl.store(ok_row + offs_d * stride_ok_d, k_out, mask=mask_pair)
 
 
-def rope_triton_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_d: int = 128):
+def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_d: int = 128):
     """
-    x   : [B, H, T, D] (fp16/bf16/fp32), 建议 contiguous
-    cos : [T, D/2]
-    sin : [T, D/2]
-    return: same shape & dtype as x
+    xq: [B, Hq, T, D], xk: [B, Hk, T, D]  (fp16/bf16/fp32, 建议 contiguous)
+    cos/sin: [T, D/2]
+    return: (xq', xk') 与输入 dtype/shape 相同
     """
-    assert x.ndim == 4
-    B, H, T, D = x.shape
+    assert xq.ndim == 4 and xk.ndim == 4
+    B, Hq, T, D  = xq.shape
+    Bk, Hk, Tk, Dk = xk.shape
+    assert B == Bk and T == Tk and D == Dk
     assert D % 2 == 0
-    assert cos.shape == (T, D//2) and sin.shape == (T, D//2)
+    assert cos.shape == (T, D // 2) and sin.shape == (T, D // 2)
 
-    x = x.contiguous()
-    out = torch.empty_like(x)
+    xq = xq.contiguous()
+    xk = xk.contiguous()
+    oq = torch.empty_like(xq)
+    ok = torch.empty_like(xk)
 
-    sx_b, sx_h, sx_t, sx_d = x.stride()
-    so_b, so_h, so_t, so_d = out.stride()
+    sq_b, sq_h, sq_t, sq_d   = xq.stride()
+    sk_b, sk_h, sk_t, sk_d   = xk.stride()
+    soq_b, soq_h, soq_t, soq_d = oq.stride()
+    sok_b, sok_h, sok_t, sok_d = ok.stride()
     sc_t, sc_dh = cos.stride()
 
-    grid = (B * H, T, ceil(D / block_d))
-    rope_single_kernel[grid](
-        x, out, cos, sin,
-        B, H, T, D,
-        sx_b, sx_h, sx_t, sx_d,
-        so_b, so_h, so_t, so_d,
+    Hmax = max(Hq, Hk)
+    grid = (B * Hmax, T, ceil(D / block_d))
+
+    rope_fused_kernel[grid](
+        xq, xk, oq, ok, cos, sin,
+        B, Hq, Hk, T, D,
+        sq_b, sq_h, sq_t, sq_d,
+        sk_b, sk_h, sk_t, sk_d,
+        soq_b, soq_h, soq_t, soq_d,
+        sok_b, sok_h, sok_t, sok_d,
         sc_t, sc_dh,
         BLOCK_D=block_d,
         num_warps=4 if block_d <= 128 else 8,
         num_stages=2,
     )
-    return out
+    return oq, ok
 
-
-
-def precompute_freqs_cis(
-    dim: int, end: int, theta: float, device: torch.device
-) -> torch.Tensor:
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
-    )
-    t = torch.arange(end, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
 
 
@@ -255,8 +274,7 @@ class Attention(nn.Module):
         xq = xq.contiguous()   # [B, n_heads,    T, D]
         xk = xk.contiguous()   # [B, n_kv_heads, T, D]
 
-        xq = rope_triton_single(xq, cos_t, sin_t)
-        xk = rope_triton_single(xk, cos_t, sin_t)
+        xq, xk = rope_fused(xq, xk, cos_t, sin_t)
         
 
         # assumes bsz matches that of cache
