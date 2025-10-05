@@ -184,39 +184,42 @@ def rmsnorm_fused_kernel(
 
 
 def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: int = 256):
-    """
-    x: (..., D)
-    weight: (D,)
-    return: same shape/dtype as x
-    """
+    # --- 设备与基本检查 ---
+    assert x.is_cuda, "RMSNorm input must be on CUDA"
+    assert weight.is_cuda, "RMSNorm weight must be on CUDA"
     assert x.shape[-1] == weight.shape[0], "RMSNorm: weight size must equal last dim"
+
     D = x.shape[-1]
     M = x.numel() // D
 
+    # 保证同一设备与连续
+    dev = x.device
     x_2d = x.contiguous().view(M, D)
-    y_2d = torch.empty_like(x_2d)
     w = weight.contiguous()
+    y_2d = torch.empty_like(x_2d)
 
     sx_m, sx_d = x_2d.stride()
     sy_m, sy_d = y_2d.stride()
-    sw_d, = w.stride()
+    (sw_d,) = w.stride()
 
     grid = (M,)
     inv_D = float(1.0 / D)
 
-    rmsnorm_fused_kernel[grid](
-        x_2d, w, y_2d,
-        eps,
-        M, D,
-        sx_m, sx_d,
-        sy_m, sy_d,
-        sw_d,
-        inv_D,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 256 else 8,
-        num_stages=2,
-    )
+    with torch.cuda.device(dev):
+        rmsnorm_fused_kernel[grid](
+            x_2d, w, y_2d,
+            eps,
+            M, D,
+            sx_m, sx_d,
+            sy_m, sy_d,
+            sw_d,
+            inv_D,                   
+            BLOCK_D=block_d,
+            num_warps=4 if block_d <= 256 else 8,
+            num_stages=2,
+        )
     return y_2d.view_as(x)
+
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
