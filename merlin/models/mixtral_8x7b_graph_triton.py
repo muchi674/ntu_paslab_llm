@@ -225,8 +225,8 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
 @triton.jit
 def repeat_kv_fused_kernel(
     K_in, V_in,           # [B, Hk, T, D]
-    K_out, V_out,         # [B, Hq, T, D]，其中 Hq = Hk * n_rep
-    B, Hk, Hq, T, D,
+    K_out, V_out,         # [B, Hq, T, D]，Hq = Hk * n_rep
+    B, Hk, Hq, T, D, n_rep,
     stride_ki_b, stride_ki_h, stride_ki_t, stride_ki_d,
     stride_vi_b, stride_vi_h, stride_vi_t, stride_vi_d,
     stride_ko_b, stride_ko_h, stride_ko_t, stride_ko_d,
@@ -238,18 +238,16 @@ def repeat_kv_fused_kernel(
     t_ix = tl.program_id(1)     # 0 .. T-1
     db   = tl.program_id(2)     # D block
 
-    hq_ix = bh % Hq           
+    hq_ix = bh % Hq            
     b_ix  = bh // Hq
-    hk_ix = hq_ix % Hk        
+    hk_ix = hq_ix // n_rep
 
     d_start = db * BLOCK_D
     offs_d  = d_start + tl.arange(0, BLOCK_D)
     m_d     = offs_d < D
 
-    # 源行指针
     k_src = K_in + b_ix*stride_ki_b + hk_ix*stride_ki_h + t_ix*stride_ki_t
     v_src = V_in + b_ix*stride_vi_b + hk_ix*stride_vi_h + t_ix*stride_vi_t
-    # 目标行指针
     k_dst = K_out + b_ix*stride_ko_b + hq_ix*stride_ko_h + t_ix*stride_ko_t
     v_dst = V_out + b_ix*stride_vo_b + hq_ix*stride_vo_h + t_ix*stride_vo_t
 
@@ -264,14 +262,12 @@ def repeat_kv_fused(keys: torch.Tensor,
                     values: torch.Tensor,
                     n_rep: int,
                     block_d: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
-    assert keys.ndim == 4 and values.ndim == 4
-    assert keys.shape == values.shape
+    assert keys.ndim == 4 and values.ndim == 4 and keys.shape == values.shape
     B, Hk, T, D = keys.shape
     if n_rep == 1:
         return keys, values
-
     Hq = Hk * n_rep
-    # 保证 layout/stride 可预测
+
     k_in = keys.contiguous()
     v_in = values.contiguous()
     k_out = torch.empty((B, Hq, T, D), device=k_in.device, dtype=k_in.dtype)
@@ -284,9 +280,8 @@ def repeat_kv_fused(keys: torch.Tensor,
 
     grid = (B * Hq, T, (D + block_d - 1) // block_d)
     repeat_kv_fused_kernel[grid](
-        k_in, v_in,
-        k_out, v_out,
-        B, Hk, Hq, T, D,
+        k_in, v_in, k_out, v_out,
+        B, Hk, Hq, T, D, n_rep,
         ski_b, ski_h, ski_t, ski_d,
         svi_b, svi_h, svi_t, svi_d,
         sko_b, sko_h, sko_t, sko_d,
@@ -296,6 +291,7 @@ def repeat_kv_fused(keys: torch.Tensor,
         num_stages=2,
     )
     return k_out, v_out
+
 
 
 
