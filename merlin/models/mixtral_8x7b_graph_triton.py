@@ -141,16 +141,16 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
     return oq, ok
 
 
-###########################
+################################
 # 下面是 RMSNorm 的 kernel fuse
-###########################
+################################
 @triton.jit
 def rmsnorm_fused_kernel(
-    X_ptr,            # *float{16,32}  [M, D]
-    W_ptr,            # *float{16,32}  [D]
-    Y_ptr,            # *float{16,32}  [M, D]
-    eps,              # float32 标量
-    M, D,             # 行数 / 归一化维度
+    X_ptr,            
+    W_ptr,            
+    Y_ptr,            
+    eps,              
+    M, D,             
     stride_xm, stride_xd,
     stride_ym, stride_yd,
     stride_wd,
@@ -184,7 +184,6 @@ def rmsnorm_fused_kernel(
 
 
 def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: int = 256):
-    # --- 设备与基本检查 ---
     assert x.is_cuda, "RMSNorm input must be on CUDA"
     assert weight.is_cuda, "RMSNorm weight must be on CUDA"
     assert x.shape[-1] == weight.shape[0], "RMSNorm: weight size must equal last dim"
@@ -192,7 +191,6 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
     D = x.shape[-1]
     M = x.numel() // D
 
-    # 保证同一设备与连续
     dev = x.device
     x_2d = x.contiguous().view(M, D)
     w = weight.contiguous()
@@ -221,11 +219,84 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
     return y_2d.view_as(x)
 
 
+################################
+# 下面是 repeat_kv 的 kernel fuse
+################################
+@triton.jit
+def repeat_kv_fused_kernel(
+    K_in, V_in,           # [B, Hk, T, D]
+    K_out, V_out,         # [B, Hq, T, D]，其中 Hq = Hk * n_rep
+    B, Hk, Hq, T, D,
+    stride_ki_b, stride_ki_h, stride_ki_t, stride_ki_d,
+    stride_vi_b, stride_vi_h, stride_vi_t, stride_vi_d,
+    stride_ko_b, stride_ko_h, stride_ko_t, stride_ko_d,
+    stride_vo_b, stride_vo_h, stride_vo_t, stride_vo_d,
+    BLOCK_D: tl.constexpr,
+):
+    # grid: (B*Hq, T, ceil(D/BLOCK_D))
+    bh   = tl.program_id(0)     # 0 .. B*Hq-1
+    t_ix = tl.program_id(1)     # 0 .. T-1
+    db   = tl.program_id(2)     # D block
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = x.shape
-    x = x[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return x.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hq_ix = bh % Hq           
+    b_ix  = bh // Hq
+    hk_ix = hq_ix % Hk        
+
+    d_start = db * BLOCK_D
+    offs_d  = d_start + tl.arange(0, BLOCK_D)
+    m_d     = offs_d < D
+
+    # 源行指针
+    k_src = K_in + b_ix*stride_ki_b + hk_ix*stride_ki_h + t_ix*stride_ki_t
+    v_src = V_in + b_ix*stride_vi_b + hk_ix*stride_vi_h + t_ix*stride_vi_t
+    # 目标行指针
+    k_dst = K_out + b_ix*stride_ko_b + hq_ix*stride_ko_h + t_ix*stride_ko_t
+    v_dst = V_out + b_ix*stride_vo_b + hq_ix*stride_vo_h + t_ix*stride_vo_t
+
+    k_val = tl.load(k_src + offs_d*stride_ki_d, mask=m_d, other=0.0)
+    v_val = tl.load(v_src + offs_d*stride_vi_d, mask=m_d, other=0.0)
+
+    tl.store(k_dst + offs_d*stride_ko_d, k_val, mask=m_d)
+    tl.store(v_dst + offs_d*stride_vo_d, v_val, mask=m_d)
+
+
+def repeat_kv_fused(keys: torch.Tensor,
+                    values: torch.Tensor,
+                    n_rep: int,
+                    block_d: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    assert keys.ndim == 4 and values.ndim == 4
+    assert keys.shape == values.shape
+    B, Hk, T, D = keys.shape
+    if n_rep == 1:
+        return keys, values
+
+    Hq = Hk * n_rep
+    # 保证 layout/stride 可预测
+    k_in = keys.contiguous()
+    v_in = values.contiguous()
+    k_out = torch.empty((B, Hq, T, D), device=k_in.device, dtype=k_in.dtype)
+    v_out = torch.empty((B, Hq, T, D), device=v_in.device, dtype=v_in.dtype)
+
+    ski_b, ski_h, ski_t, ski_d = k_in.stride()
+    svi_b, svi_h, svi_t, svi_d = v_in.stride()
+    sko_b, sko_h, sko_t, sko_d = k_out.stride()
+    svo_b, svo_h, svo_t, svo_d = v_out.stride()
+
+    grid = (B * Hq, T, (D + block_d - 1) // block_d)
+    repeat_kv_fused_kernel[grid](
+        k_in, v_in,
+        k_out, v_out,
+        B, Hk, Hq, T, D,
+        ski_b, ski_h, ski_t, ski_d,
+        svi_b, svi_h, svi_t, svi_d,
+        sko_b, sko_h, sko_t, sko_d,
+        svo_b, svo_h, svo_t, svo_d,
+        BLOCK_D=block_d,
+        num_warps=4 if block_d <= 128 else 8,
+        num_stages=2,
+    )
+    return k_out, v_out
+
 
 
 def get_json(file_path: Path) -> dict:
@@ -351,8 +422,8 @@ class Attention(nn.Module):
         values = self.cache[1, self.li]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
-        values = repeat_kv(values, self.repeats)  # (bs, max_seq_len, n_heads, head_dim)
+        keys, values = repeat_kv_fused(keys, values, self.repeats)
+
 
         output = F.scaled_dot_product_attention(
             xq,
