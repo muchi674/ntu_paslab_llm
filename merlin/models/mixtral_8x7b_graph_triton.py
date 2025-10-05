@@ -105,11 +105,6 @@ def rope_fused_kernel(
 
 
 def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_d: int = 128):
-    """
-    xq: [B, Hq, T, D], xk: [B, Hk, T, D]  (fp16/bf16/fp32, 建议 contiguous)
-    cos/sin: [T, D/2]
-    return: (xq', xk') 与输入 dtype/shape 相同
-    """
     assert xq.ndim == 4 and xk.ndim == 4
     B, Hq, T, D  = xq.shape
     Bk, Hk, Tk, Dk = xk.shape
@@ -159,6 +154,7 @@ def rmsnorm_fused_kernel(
     stride_xm, stride_xd,
     stride_ym, stride_yd,
     stride_wd,
+    inv_D,
     BLOCK_D: tl.constexpr,
 ):
     m = tl.program_id(0)              # 0..M-1
@@ -174,7 +170,7 @@ def rmsnorm_fused_kernel(
         x = x.to(tl.float32)
         acc += x * x
     ss = tl.sum(acc, axis=0)
-    mean = ss / tl.float32(D)
+    mean = ss * inv_D 
     inv_rms = tl.math.rsqrt(mean + eps)
 
     # --- pass 2: write normalized * weight ---
@@ -206,6 +202,8 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
     sw_d, = w.stride()
 
     grid = (M,)
+    inv_D = float(1.0 / D)
+
     rmsnorm_fused_kernel[grid](
         x_2d, w, y_2d,
         eps,
@@ -213,6 +211,7 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
         sx_m, sx_d,
         sy_m, sy_d,
         sw_d,
+        inv_D,
         BLOCK_D=block_d,
         num_warps=4 if block_d <= 256 else 8,
         num_stages=2,
@@ -1082,7 +1081,7 @@ class Mixtral8x7B:
             cos_w, sin_w = precompute_rope_cos_sin(
                 dim=D_h, end=T_w, theta=model_args.rope_theta, device=device
             )
-            
+
             _ = rope_fused(xq_w, xk_w, cos_w, sin_w)
 
             x_w = torch.randn(1, T_w, model_args.dim, device=device, dtype=dtype)
