@@ -146,6 +146,78 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
     return oq, ok
 
 
+###########################
+# 下面是 RMSNorm 的 kernel fuse
+###########################
+@triton.jit
+def rmsnorm_fused_kernel(
+    X_ptr,            # *float{16,32}  [M, D]
+    W_ptr,            # *float{16,32}  [D]
+    Y_ptr,            # *float{16,32}  [M, D]
+    eps,              # float32 标量
+    M, D,             # 行数 / 归一化维度
+    stride_xm, stride_xd,
+    stride_ym, stride_yd,
+    stride_wd,
+    BLOCK_D: tl.constexpr,
+):
+    m = tl.program_id(0)              # 0..M-1
+    x_row = X_ptr + m * stride_xm
+    y_row = Y_ptr + m * stride_ym
+
+    # --- pass 1: sum of squares along D ---
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for off in range(0, D, BLOCK_D):
+        d = off + tl.arange(0, BLOCK_D)
+        mask = d < D
+        x = tl.load(x_row + d * stride_xd, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        acc += x * x
+    ss = tl.sum(acc, axis=0)
+    mean = ss / tl.float32(D)
+    inv_rms = tl.math.rsqrt(mean + eps)
+
+    # --- pass 2: write normalized * weight ---
+    for off in range(0, D, BLOCK_D):
+        d = off + tl.arange(0, BLOCK_D)
+        mask = d < D
+        x = tl.load(x_row + d * stride_xd, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + d * stride_wd, mask=mask, other=1.0).to(tl.float32)
+        y = x * inv_rms * w
+        tl.store(y_row + d * stride_yd, y.to(Y_ptr.dtype.element_ty), mask=mask)
+
+
+def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: int = 256):
+    """
+    x: (..., D)
+    weight: (D,)
+    return: same shape/dtype as x
+    """
+    assert x.shape[-1] == weight.shape[0], "RMSNorm: weight size must equal last dim"
+    D = x.shape[-1]
+    M = x.numel() // D
+
+    x_2d = x.contiguous().view(M, D)
+    y_2d = torch.empty_like(x_2d)
+    w = weight.contiguous()
+
+    sx_m, sx_d = x_2d.stride()
+    sy_m, sy_d = y_2d.stride()
+    sw_d, = w.stride()
+
+    grid = (M,)
+    rmsnorm_fused_kernel[grid](
+        x_2d, w, y_2d,
+        eps,
+        M, D,
+        sx_m, sx_d,
+        sy_m, sy_d,
+        sw_d,
+        BLOCK_D=block_d,
+        num_warps=4 if block_d <= 256 else 8,
+        num_stages=2,
+    )
+    return y_2d.view_as(x)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -380,8 +452,7 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return rmsnorm_fused(x, self.weight, self.eps)
 
 
 class TransformerBlock(nn.Module):
@@ -993,6 +1064,39 @@ class Mixtral8x7B:
         elif model_args.dim == 6144:
             tokenizer = MistralTokenizer.v3()
 
+        # ----------------------------
+        # Triton kernels warmup (JIT)
+        # ----------------------------
+        with torch.cuda.device(device):
+            dtype = next(model.parameters()).dtype
+
+            # 1) 预热 rope_fused
+            T_w = 4
+            B_w = 1
+            Hq_w = model_args.n_heads
+            Hk_w = model_args.n_kv_heads
+            D_h = model_args.head_dim
+
+            xq_w = torch.randn(B_w, Hq_w, T_w, D_h, device=device, dtype=dtype)
+            xk_w = torch.randn(B_w, Hk_w, T_w, D_h, device=device, dtype=dtype)
+            cos_w, sin_w = precompute_rope_cos_sin(
+                dim=D_h, end=T_w, theta=model_args.rope_theta, device=device
+            )
+            
+            _ = rope_fused(xq_w, xk_w, cos_w, sin_w)
+
+            x_w = torch.randn(1, T_w, model_args.dim, device=device, dtype=dtype)
+
+       
+            any_block = next(iter(model.layers.values()))
+            _ = any_block.attention_norm(x_w)
+            _ = any_block.ffn_norm(x_w)
+
+            
+            if model.is_last_stage:
+                _ = model.norm(x_w)
+
+            torch.cuda.synchronize()
         return Mixtral8x7B(model, tokenizer)
 
     def __init__(
