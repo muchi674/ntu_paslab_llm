@@ -295,170 +295,151 @@ def repeat_kv_fused(keys: torch.Tensor,
 
 # =============== MoE Group GEMM Triton Kernel ===============
 @triton.jit
-def moe_group_kernel(
-    X_ptr,            # [N*k, D]  (packed by expert, contiguous)
-    WGU_ptr,          # [E, D, 2H]
-    WD_ptr,           # [E, H, D]
-    TOPKW_ptr,        # [N*k, 1]
-    OFF_ptr,          # [E+1] int64
-    ADJ_ptr,          # [N*k] int64
-    OUT_ptr,          # [N, D]  (accumulator)
-    N_total, E, D, H,
+def moe_single_expert_kernel(
+    X_ptr,            # float16/bf16 [N*k, D]  (全局 packed by expert)
+    WGU_ptr,          # float16/bf16 [D, 2H]   (本专家，转置视图即可)
+    WD_ptr,           # float16/bf16 [H, D]    (本专家，转置视图即可)
+    TOPKW_ptr,        # float32/float16 [N*k, 1]
+    ADJ_ptr,          # int32/int64 [N*k]
+    OUT_ptr,          # float32 [N, D] 累加缓冲
+    # shapes / meta
+    N_total, D, H,
+    OFF0,             # 全局起点 offsets[e]
+    N_TOK_E,          # 本专家 token 数 offsets[e+1] - offsets[e]
+    # strides
     stride_xn, stride_xd,
-    stride_wgu_e, stride_wgu_d, stride_wgu_2h,
-    stride_wd_e, stride_wd_h, stride_wd_d,
+    stride_wgu_d, stride_wgu_2h,
+    stride_wd_h,  stride_wd_d,
     stride_outn, stride_outd,
-    BLOCK_M: tl.constexpr,     # tokens per block
-    BLOCK_K: tl.constexpr,     # tile along D/H
-    BLOCK_2H: tl.constexpr,    # tile along 2H
+    stride_topkw_n, stride_topkw_c,
+    # tuning
+    BLOCK_M: tl.constexpr,   # tokens per block
+    BLOCK_K: tl.constexpr,   # tile along D/H
+    BLOCK_2H: tl.constexpr,  # tile along 2H
 ):
-    pid_e = tl.program_id(0)  # expert id
-    pid_b = tl.program_id(1)  # block id within expert
-
-    # expert token range
-    off_e   = tl.load(OFF_ptr + pid_e, mask=pid_e < E, other=0)
-    off_ep1 = tl.load(OFF_ptr + pid_e + 1, mask=(pid_e + 1) <= E, other=off_e)
-    n_tok_e = off_ep1 - off_e
-    if n_tok_e <= 0:
-        return
-
-    start = off_e + pid_b * BLOCK_M
-    rem   = n_tok_e - pid_b * BLOCK_M
+    pid_b = tl.program_id(0)          # 本专家的 token block id
+    start_local = pid_b * BLOCK_M
+    rem = N_TOK_E - start_local
     if rem <= 0:
         return
     M = tl.minimum(rem, BLOCK_M)
-
-    # strides / pointers
-    X_blk = X_ptr + start * stride_xn
-    Wgu_e = WGU_ptr + pid_e * stride_wgu_e
-    Wd_e  = WD_ptr  + pid_e * stride_wd_e
-
-    # indices
-    offs_m  = tl.arange(0, BLOCK_M)         # [M]
-    offs_k  = tl.arange(0, BLOCK_K)         # [K]
-    offs_2h = tl.arange(0, BLOCK_2H)        # [2H]
-
+    offs_m = tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
 
-    # ---------- GEMM1: [M,D] @ [D,2H]  (一次性算 2H，然后再 split) ----------
-    acc2H = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
-    k_iter = (D + BLOCK_K - 1) // BLOCK_K
-    twoH_iter = (2 * H + BLOCK_2H - 1) // BLOCK_2H
+    global_start = OFF0 + start_local
+
+    # GEMM1: [M,D] @ [D,2H] 分片累加到 acc2H
+    offs_k  = tl.arange(0, BLOCK_K)
+    offs_2h = tl.arange(0, BLOCK_2H)
+
+    k_iter     = (D     + BLOCK_K  - 1) // BLOCK_K
+    twoH_iter  = (2 * H + BLOCK_2H - 1) // BLOCK_2H
 
     for t in range(0, twoH_iter):
         t0    = t * BLOCK_2H
         tmask = (t0 + offs_2h) < (2 * H)
 
-        # 每个 2H 切片都要累加完整的 K 维
         acc2H = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
+
         for k in range(0, k_iter):
             k0    = k * BLOCK_K
             kmask = (k0 + offs_k) < D
 
             # X_tile: [M, K]
             X_tile = tl.load(
-                X_blk + (offs_m[:, None] * stride_xn + (k0 + offs_k)[None, :] * stride_xd),
+                X_ptr + (global_start + offs_m)[:, None] * stride_xn
+                       + (k0 + offs_k)[None, :] * stride_xd,
                 mask=mask_m[:, None] & kmask[None, :],
                 other=0.0
             )
 
-            # Wgu_tile: [K, 2H_tile]
+            # Wgu_tile: [K, 2H_slice]
             Wgu_tile = tl.load(
-                Wgu_e + (k0 + offs_k)[:, None] * stride_wgu_d + (t0 + offs_2h)[None, :] * stride_wgu_2h,
+                WGU_ptr + (k0 + offs_k)[:, None] * stride_wgu_d
+                        + (t0 + offs_2h)[None, :] * stride_wgu_2h,
                 mask=kmask[:, None] & tmask[None, :],
                 other=0.0
             )
             acc2H += tl.dot(X_tile.to(tl.float32), Wgu_tile.to(tl.float32))
 
-        # now acc2H: [M, min(BLOCK_2H, 2H-t0)]
-        # split into G and U parts where overlap exists
-        # indices relative to current 2H tile
-        offs_h = tl.arange(0, BLOCK_K)  # reuse BLOCK_K for H-slice while writing out
-
-        # ----- GEMM2: (SiLU(G)*U) @ Wd  → 直接在 D 维块循环下做原子写回 -----
+        # ===== GEMM2: (SiLU(G)*U) @ Wd → 累加到 OUT =====
+        offs_h = tl.arange(0, BLOCK_K)            # 复用 BLOCK_K 作为 H/D 切片
         d_iter = (D + BLOCK_K - 1) // BLOCK_K
-        for d in range(0, d_iter):
-            d0 = d * BLOCK_K
-            dmask = (d0 + offs_h) < D
 
-            # 从 acc2H 中取出 G, U 子片：需要保证 t0..t0+BLOCK_2H 与 [0,H), [H,2H) 的交集
-            # 计算当前 tile 中 G/U 的局部起点和有效长度
-            g_lo = tl.maximum(0, 0     - t0)
-            g_hi = tl.minimum(BLOCK_2H, H     - t0)
-            u_lo = tl.maximum(0, H     - t0)
-            u_hi = tl.minimum(BLOCK_2H, 2*H   - t0)
+        # 与 [0,H) / [H,2H) 的交集
+        g_lo = tl.maximum(0, 0   - t0)
+        g_hi = tl.minimum(BLOCK_2H, H   - t0)
+        u_lo = tl.maximum(0, H   - t0)
+        u_hi = tl.minimum(BLOCK_2H, 2*H - t0)
+        H_slice = tl.minimum(g_hi - g_lo, u_hi - u_lo)
 
-            # 初始化输出子块累加
-            accD = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        if (g_lo < g_hi) & (u_lo < u_hi) & (H_slice > 0):
+            G = acc2H[:, g_lo:g_hi]                    # [M, H_slice]
+            U = acc2H[:, u_lo:u_hi]                    # [M, H_slice]
+            Hact = U[:, :H_slice] * (G[:, :H_slice] * tl.sigmoid(G[:, :H_slice]))
 
-            if g_lo < g_hi and u_lo < u_hi:
-                # 取出 G/U 子片
-                G = acc2H[:, g_lo:g_hi]     # [M, g_len]
-                U = acc2H[:, u_lo:u_hi]     # [M, u_len]
-                # 将两段沿 H 维对齐（g_len 或 u_len 可能比 H 小）
-                # 对齐后 H_slice = min(g_len, u_len, H_left_in_tile)
-                H_slice = tl.minimum(g_hi - g_lo, u_hi - u_lo)
-                if H_slice > 0:
-                    # SiLU(G) * U
-                    Hact = U[:, :H_slice] * (G[:, :H_slice] * tl.sigmoid(G[:, :H_slice]))
+            for d in range(0, d_iter):
+                d0    = d * BLOCK_K
+                dmask = (d0 + offs_h) < D
 
-                    # 读 Wd 的对应 H_slice × D 子片
-                    Wd_tile = tl.load(
-                        Wd_e + (t0 + g_lo)[:, None] * stride_wd_h + (d0 + offs_h)[None, :] * stride_wd_d,
-                        mask=((t0 + g_lo)[:, None] < H) & dmask[None, :],
-                        other=0.0
-                    )
-                    accD += tl.dot(Hact, Wd_tile.to(tl.float32))
+                Wd_tile = tl.load(
+                    WD_ptr + (t0 + g_lo)[:, None] * stride_wd_h
+                           + (d0 + offs_h)[None, :] * stride_wd_d,
+                    mask=((t0 + g_lo)[:, None] < H) & dmask[None, :],
+                    other=0.0
+                )
+                accD = tl.dot(Hact, Wd_tile.to(tl.float32))  # [M, min(BLOCK_K, D-d0)]
 
-            # 读权重 topk_w，并缩放（逐行）
-            topkw = tl.load(TOPKW_ptr + (start + offs_m) * 1, mask=mask_m, other=0.0).to(tl.float32)
-            accD = accD * topkw[:, None]
+                # 缩放 topk 权重（逐 token）
+                topkw = tl.load(
+                    TOPKW_ptr + (global_start + offs_m) * stride_topkw_n + 0 * stride_topkw_c,
+                                mask=mask_m, other=0.0).to(tl.float32)
+                accD = accD * topkw[:, None]
 
-            # 找回原 token 行索引
-            ridx = tl.load(ADJ_ptr + (start + offs_m), mask=mask_m, other=0)
-
-            # 原子加写回 OUT
-            out_ptr_blk = OUT_ptr + ridx[:, None] * stride_outn + (d0 + offs_h)[None, :] * stride_outd
-            tl.atomic_add(out_ptr_blk, accD, mask=mask_m[:, None] & dmask[None, :])
+                # 找回原 token 行索引并原子加回 OUT
+                ridx = tl.load(ADJ_ptr + (global_start + offs_m),
+                               mask=mask_m, other=0)
+                out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
+                                   + (d0 + offs_h)[None, :] * stride_outd
+                tl.atomic_add(out_ptr, accD, mask=mask_m[:, None] & dmask[None, :])
 
 
-def launch_moe_group_kernel(
-    sorted_x: torch.Tensor,     # [N*k, D] (packed)
+
+def launch_moe_single_expert(
+    sorted_x: torch.Tensor,     # [N*k, D]
     topk_w: torch.Tensor,       # [N*k, 1]
-    offsets: torch.Tensor,      # [E+1]  int64
-    adj_idxs: torch.Tensor,     # [N*k]  int64
-    W_gate_up_stack: torch.Tensor,  # [E, D, 2H]
-    W_down_stack: torch.Tensor,     # [E, H, D]
-    out_accum: torch.Tensor,    # [N, D] (预先清零/外部管理)
-    *,
-    BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128,
+    adj_idxs: torch.Tensor,     # [N*k]
+    off0: int,                  # offsets[e]
+    n_tok_e: int,               # offsets[e+1] - offsets[e]
+    w_gate_up: torch.Tensor,    # 原始 [2H, D]
+    w_down: torch.Tensor,       # 原始 [D, H]
+    out_accum: torch.Tensor,    # [N, D] (fp32 累加缓冲)
+    *, BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128
 ):
-    assert sorted_x.is_cuda and topk_w.is_cuda and offsets.is_cuda and adj_idxs.is_cuda
-    assert W_gate_up_stack.is_cuda and W_down_stack.is_cuda and out_accum.is_cuda
+    # 统一到视图 [D, 2H] / [H, D] —— 零拷贝
+    WguT = w_gate_up.transpose(0, 1)  # [D, 2H]
+    WdT  = w_down.transpose(0, 1)     # [H, D]
 
     N_total, D = sorted_x.shape
-    E = W_gate_up_stack.shape[0]
-    H = W_down_stack.shape[1]
-    assert W_gate_up_stack.shape[1] == D and W_gate_up_stack.shape[2] == 2 * H
-    assert W_down_stack.shape[2] == D
+    H = WdT.shape[0]
+    assert WguT.shape[0] == D and WguT.shape[1] == 2 * H
+    assert WdT.shape[1] == D
 
-    # grid: (experts, max_blocks_per_expert)
-    with torch.cuda.device(sorted_x.device):
-        max_ne = (offsets[1:] - offsets[:-1]).max().item()
-        grid = (E, (max_ne + BLOCK_M - 1) // BLOCK_M)
+    grid = ((n_tok_e + BLOCK_M - 1) // BLOCK_M,)
 
-        moe_group_kernel[grid](
-            sorted_x, W_gate_up_stack, W_down_stack, topk_w,
-            offsets, adj_idxs, out_accum,
-            N_total, E, D, H,
-            sorted_x.stride(0), sorted_x.stride(1),
-            W_gate_up_stack.stride(0), W_gate_up_stack.stride(1), W_gate_up_stack.stride(2),
-            W_down_stack.stride(0),   W_down_stack.stride(1),   W_down_stack.stride(2),
-            out_accum.stride(0), out_accum.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_2H=BLOCK_2H,
-            num_warps=4 if max(D, H) <= 128 else 8,
-            num_stages=2,
-        )
+    moe_single_expert_kernel[grid](
+        sorted_x, WguT, WdT, topk_w, adj_idxs, out_accum,
+        N_total, D, H, off0, n_tok_e,
+        sorted_x.stride(0), sorted_x.stride(1),
+        WguT.stride(0), WguT.stride(1),
+        WdT.stride(0),  WdT.stride(1),
+        out_accum.stride(0), out_accum.stride(1),
+        topk_w.stride(0), topk_w.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_2H=BLOCK_2H,
+        num_warps=4 if max(D, H) <= 128 else 8,
+        num_stages=2,
+    )
+
 
 
 
@@ -624,27 +605,7 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-        # —— 只堆叠【本 rank】持有的专家 —— #
-        ei_range = range(self.first_expert, self.last_expert + 1)
-        Wgu_list, Wd_list = [], []
-
-        # 判断权重原始排布，统一到 [D,2H] / [H,D]
-        sample_wgu = experts.ws[f"{self.glob_li}.{self.first_expert}.w_gate_up"]
-        sample_wd  = experts.ws[f"{self.glob_li}.{self.first_expert}.w_down"]
-        # 常见 Mixtral: w_gate_up 原始是 [2H, D]，w_down 原始是 [D, H]
-        def to_Wgu(li, e):
-            w = experts.ws[f"{li}.{e}.w_gate_up"]
-            return (w.t().contiguous() if w.shape[0] != w.shape[1] else w.contiguous())
-        def to_Wd(li, e):
-            w = experts.ws[f"{li}.{e}.w_down"]
-            return (w.t().contiguous() if w.shape[0] != w.shape[1] else w.contiguous())
-
-        for e in ei_range:
-            Wgu_list.append(to_Wgu(self.glob_li, e))   # [D, 2H]
-            Wd_list.append( to_Wd(self.glob_li, e))    # [H, D]
-
-        self.register_buffer("W_gate_up_stack", torch.stack(Wgu_list, dim=0))  # [E_local, D, 2H]
-        self.register_buffer("W_down_stack",    torch.stack(Wd_list,  dim=0))  # [E_local, H, D]
+        # 不进行专家权重堆叠，避免峰值显存放大
 
     def prep_ins(self, x: torch.Tensor):
         gate_logits = self.gate(x)  # [N, E]
@@ -668,23 +629,30 @@ class MoeLayer(nn.Module):
         topk_weight: torch.Tensor,
         offsets: torch.Tensor,
         adj_idxs: torch.Tensor,
-        next_r: torch.Tensor,
+        next_r: torch.Tensor,    # 建议 fp32
     ) -> torch.Tensor:
-        # 只取本 rank 专家对应的 offsets 子片（长度 E_local+1）
-        offsets_local = offsets[self.first_expert : self.last_expert + 2].contiguous()
-        # 计算本地的最大 tokens/block，用于 grid
-        # （也可以在 launcher 里算；此处简洁起见）
-        launch_moe_group_kernel(
-            sorted_x.contiguous(),
-            topk_weight.contiguous(),
-            offsets_local,            # 注意是子片
-            adj_idxs.contiguous(),
-            self.W_gate_up_stack,     # [E_local, D, 2H]
-            self.W_down_stack,        # [E_local, H, D]
-            next_r,                   # 建议 fp32 累加缓冲
-            BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128,
-        )
+        fe, le = self.first_expert, self.last_expert
+        for e in range(fe, le + 1):
+            off0 = int(offsets[e].item())
+            off1 = int(offsets[e + 1].item())
+            n_tok_e = off1 - off0
+            if n_tok_e <= 0:
+                continue
+            wgu = self.experts.ws[f"{self.glob_li}.{e}.w_gate_up"]  # [2H, D] (原始)
+            wd  = self.experts.ws[f"{self.glob_li}.{e}.w_down"]     # [D, H]  (原始)
+            launch_moe_single_expert(
+                sorted_x=sorted_x,
+                topk_w=topk_weight,
+                adj_idxs=adj_idxs,
+                off0=off0,
+                n_tok_e=n_tok_e,
+                w_gate_up=wgu,
+                w_down=wd,
+                out_accum=next_r,
+                BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128,
+            )
         return next_r
+
 
 
 
@@ -1312,73 +1280,25 @@ class Mixtral8x7B:
             tokenizer = MistralTokenizer.v3()
 
         # ----------------------------
-        # Triton kernels warmup (JIT)
+        # Triton kernels warmup (JIT) — 只预热 rope 与 norm，MoE 在首次运行时自然 JIT
         # ----------------------------
         with torch.cuda.device(device):
             dtype = next(model.parameters()).dtype
-
-            # 1) 预热 rope_fused
             T_w = 4
             B_w = 1
             Hq_w = model_args.n_heads
             Hk_w = model_args.n_kv_heads
             D_h = model_args.head_dim
-
             xq_w = torch.randn(B_w, Hq_w, T_w, D_h, device=device, dtype=dtype)
             xk_w = torch.randn(B_w, Hk_w, T_w, D_h, device=device, dtype=dtype)
-            cos_w, sin_w = precompute_rope_cos_sin(
-                dim=D_h, end=T_w, theta=model_args.rope_theta, device=device
-            )
-
+            cos_w, sin_w = precompute_rope_cos_sin(dim=D_h, end=T_w, theta=model_args.rope_theta, device=device)
             _ = rope_fused(xq_w, xk_w, cos_w, sin_w)
-
             x_w = torch.randn(1, T_w, model_args.dim, device=device, dtype=dtype)
-
-       
             any_block = next(iter(model.layers.values()))
-            layer0 = any_block.feed_forward
-
-            # 保险检查：如果没做堆叠，报错提示
-            assert hasattr(layer0, "W_gate_up_stack") and hasattr(layer0, "W_down_stack"), \
-                "W stacks not built. Ensure MoeLayer.__init__ stacks [E,D,2H]/[E,H,D] buffers."
-                
-            # 3) 预热 MoE Group GEMM
-            # 使用本地专家数量
-            E_local = layer0.W_gate_up_stack.shape[0]
-            D = model.args.dim
-            H = model.args.hidden_dim // 2
-            k = model.args.moe["num_experts_per_tok"]
-            N = 8
-
-            sorted_x_w = torch.randn(N*k, D, device=device, dtype=dtype)
-            topk_w_w   = torch.rand(N*k, 1, device=device, dtype=dtype)
-
-            # 构造“全局”offsets（长度是全局 E+1）
-            E_global = model.args.moe["num_experts"]
-            counts_g = torch.tensor([N*k//E_global + (1 if i < (N*k)%E_global else 0)
-                                    for i in range(E_global)], device=device, dtype=torch.long)
-            offsets_w_global = torch.cat([torch.zeros(1, device=device, dtype=torch.long),
-                                        counts_g.cumsum(0)])
-
-            # 截出本地 offsets 子片（长度 E_local+1）
-            fe = layer0.first_expert
-            le = layer0.last_expert
-            offsets_w_local = offsets_w_global[fe : le + 2].contiguous()
-
-            # 行索引（原始 token 行号）
-            adj_idxs_w = torch.randint(0, N, (N*k,), device=device, dtype=torch.long)
-
-            next_r_w = torch.zeros(N, D, device=device, dtype=torch.float32)
-            launch_moe_group_kernel(sorted_x_w, topk_w_w, offsets_w_local, adj_idxs_w,
-                                    layer0.W_gate_up_stack, layer0.W_down_stack, next_r_w)
-            torch.cuda.synchronize()
             _ = any_block.attention_norm(x_w)
             _ = any_block.ffn_norm(x_w)
-
-            
             if model.is_last_stage:
                 _ = model.norm(x_w)
-
             torch.cuda.synchronize()
         return Mixtral8x7B(model, tokenizer)
 
