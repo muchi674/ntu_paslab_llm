@@ -846,7 +846,15 @@ class TransformerBlock(nn.Module):
         next_h = data[self.li + 1][0]        # ★ 取到下一层的 h 缓冲（就是本层的输出）
 
         h.copy_(x)
-        graphs[self.li].replay()             # 只做 attn 残差（或 no-op）
+        graphs[self.li].replay()             # 写入 next_h（局部注意力）
+        # 图外：如有 TP，对注意力输出做 all_reduce，再写回 next_h = h + r_reduced
+        if self.attention.args.inter_parallel_attn or self.attention.args.intra_parallel_attn:
+            r_local = next_h.clone().sub(h)
+            if self.attention.args.inter_parallel_attn:
+                dist.all_reduce(r_local, op=dist.ReduceOp.SUM)
+            else:
+                dist.all_reduce(r_local, op=dist.ReduceOp.SUM, group=self.local_group)
+            torch.add(h, r_local, out=next_h)
 
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
@@ -866,7 +874,14 @@ class TransformerBlock(nn.Module):
         next_r = data[self.li + 1][1]
         next_h = data[self.li + 1][0]        # ★
 
-        graphs[self.li].replay()
+        graphs[self.li].replay()             # 写入 next_h（局部注意力）
+        if self.attention.args.inter_parallel_attn or self.attention.args.intra_parallel_attn:
+            r_local = next_h.clone().sub(data[self.li][0])
+            if self.attention.args.inter_parallel_attn:
+                dist.all_reduce(r_local, op=dist.ReduceOp.SUM)
+            else:
+                dist.all_reduce(r_local, op=dist.ReduceOp.SUM, group=self.local_group)
+            torch.add(data[self.li][0], r_local, out=next_h)
 
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
