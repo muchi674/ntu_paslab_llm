@@ -1052,7 +1052,7 @@ class Transformer(nn.Module):
         adj_idxs.copy_(adj)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
+            _ = func(h, next_h)
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
@@ -1080,7 +1080,7 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
+                _ = func(h, r, next_h)
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
