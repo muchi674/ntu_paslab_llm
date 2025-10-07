@@ -1097,16 +1097,10 @@ class Transformer(nn.Module):
                 self.layers[k].first_decode_graphable_intra_attn,
             ),
         )
-        # outside capture: compute r and routing, fill static buffers
-        r_flat = func(h, next_h)
-        sorted_r, topk_w, offs, adj = self.layers[k].feed_forward.prep_ins(r_flat)
-        res_r.copy_(sorted_r)
-        topk_weight.copy_(topk_w)
-        offsets.copy_(offs)
-        adj_idxs.copy_(adj)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            next_h.add_(0)
+            # 图内：只做注意力+残差，写 next_h
+            _ = func(h, next_h)
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
@@ -1135,7 +1129,7 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                next_h.add_(0)
+                _ = func(h, r, next_h)
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
