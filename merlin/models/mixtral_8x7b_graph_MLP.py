@@ -636,6 +636,11 @@ class MoeLayer(nn.Module):
         adj_idxs: torch.Tensor,
         next_r: torch.Tensor,    # 建议 fp32
     ) -> torch.Tensor:
+        # 确保参与 Triton 的张量都在同一 CUDA 设备
+        device = next_r.device
+        sorted_x = sorted_x.contiguous().to(device)
+        topk_weight = topk_weight.to(device=device, dtype=torch.float32)
+        adj_idxs = adj_idxs.to(device=device, dtype=torch.long)
         fe, le = self.first_expert, self.last_expert
         for e in range(fe, le + 1):
             off0 = int(offsets[e].item())
@@ -643,8 +648,8 @@ class MoeLayer(nn.Module):
             n_tok_e = off1 - off0
             if n_tok_e <= 0:
                 continue
-            wgu = self.experts.ws[f"{self.glob_li}.{e}.w_gate_up"]  # [2H, D] (原始)
-            wd  = self.experts.ws[f"{self.glob_li}.{e}.w_down"]     # [D, H]  (原始)
+            wgu = self.experts.ws[f"{self.glob_li}.{e}.w_gate_up"].to(device)  # [2H, D]
+            wd  = self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device)     # [D, H]
             launch_moe_single_expert(
                 sorted_x=sorted_x,
                 topk_w=topk_weight,
