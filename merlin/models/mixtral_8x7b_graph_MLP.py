@@ -850,8 +850,14 @@ class TransformerBlock(nn.Module):
         next_r = data[self.li + 1][1]
         h.copy_(x)
         graphs[self.li].replay()
-
-        # h.shape = (batch_size * seq_len, model_dim)
+        # 图外计算路由（基于 graph 写入的 next_h = data[self.li + 1][0]）
+        next_h = data[self.li + 1][0]
+        r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
+        sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
+        res_r.copy_(sorted_r)
+        topk_weight.copy_(topk_w)
+        offsets.copy_(offs)
+        adj_idxs.copy_(adj)
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
 
     def middle_forward(
@@ -863,6 +869,14 @@ class TransformerBlock(nn.Module):
         # (h, r, res_r, topk_weight, offsets, adj_idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
         graphs[self.li].replay()
+        # 图外计算路由（基于 graph 写入的 next_h = data[self.li + 1][0]）
+        next_h = data[self.li + 1][0]
+        r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
+        sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
+        res_r.copy_(sorted_r)
+        topk_weight.copy_(topk_w)
+        offsets.copy_(offs)
+        adj_idxs.copy_(adj)
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
 
     def last_forward(
@@ -1052,7 +1066,7 @@ class Transformer(nn.Module):
         adj_idxs.copy_(adj)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            _ = func(h, next_h)
+            self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
@@ -1080,7 +1094,7 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                _ = func(h, r, next_h)
+                self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
