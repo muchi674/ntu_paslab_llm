@@ -569,13 +569,14 @@ class Attention(nn.Module):
         keys, values = repeat_kv_fused(keys, values, self.repeats)
 
 
+        # 使用因果注意力以匹配自回归生成，避免不必要的显式 mask 带来的后端退化
         output = F.scaled_dot_product_attention(
             xq,
             keys,
             values,
-            attn_mask=self.mask[storage_idx],
+            attn_mask=None,
             dropout_p=0.0,
-            is_causal=False,
+            is_causal=True,
         )
         output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
         return self.wo(output)
