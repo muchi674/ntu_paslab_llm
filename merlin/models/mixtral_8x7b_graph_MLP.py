@@ -885,8 +885,8 @@ class TransformerBlock(nn.Module):
         # (h, r, res_r, topk_weight, offsets, adj_idxs)
         next_r = data[self.li + 1][1]
         h.copy_(x)
-        graphs[self.li].replay()
-        # 图外计算路由（基于 graph 写入的 next_h = data[self.li + 1][0]）
+        graphs[self.li].replay()  # 写入 next_h = data[self.li + 1][0]
+        # 图外：路由 + MoE，并把 MoE 残差并回 next_h，作为下一层输入
         next_h = data[self.li + 1][0]
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
@@ -894,7 +894,9 @@ class TransformerBlock(nn.Module):
         topk_weight.copy_(topk_w)
         offsets.copy_(offs)
         adj_idxs.copy_(adj)
+        next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
+        next_h.add_(next_r.view_as(next_h))
 
     def middle_forward(
         self,
@@ -904,8 +906,8 @@ class TransformerBlock(nn.Module):
         _h, _r, res_r, topk_weight, offsets, adj_idxs = data[self.li]
         # (h, r, res_r, topk_weight, offsets, adj_idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
-        graphs[self.li].replay()
-        # 图外计算路由（基于 graph 写入的 next_h = data[self.li + 1][0]）
+        graphs[self.li].replay()  # 写入 next_h
+        # 图外：路由 + MoE，并把 MoE 残差并回 next_h
         next_h = data[self.li + 1][0]
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
@@ -913,7 +915,9 @@ class TransformerBlock(nn.Module):
         topk_weight.copy_(topk_w)
         offsets.copy_(offs)
         adj_idxs.copy_(adj)
+        next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
+        next_h.add_(next_r.view_as(next_h))
 
     def last_forward(
         self,
