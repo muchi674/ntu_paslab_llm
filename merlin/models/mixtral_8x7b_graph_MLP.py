@@ -1068,7 +1068,8 @@ class Transformer(nn.Module):
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
             h = next_h
-            r = get_ins(False)
+            # MoE 累加缓冲使用 CUDA fp32，供上一层 first_forward/middle_forward 作为 out_accum
+            r = torch.zeros((bsz * seqlen, self.args.dim), dtype=torch.float32, device=self.device)
             next_h = get_ins()
             res_r, topk_weight, offsets, adj_idxs = get_outs()
             k = str(li)
