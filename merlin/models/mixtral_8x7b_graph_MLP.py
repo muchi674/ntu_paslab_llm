@@ -333,75 +333,80 @@ def moe_single_expert_kernel(
     offs_2h = tl.arange(0, BLOCK_2H)
 
     k_iter     = (D     + BLOCK_K  - 1) // BLOCK_K
-    twoH_iter  = (2 * H + BLOCK_2H - 1) // BLOCK_2H
+    # H 维分块：分别累加 G/U，避免动态切片
+    h_iter  = (H + BLOCK_2H - 1) // BLOCK_2H
+    offs_h  = tl.arange(0, BLOCK_2H)
+    d_iter  = (D + BLOCK_K - 1) // BLOCK_K
+    offs_d  = tl.arange(0, BLOCK_K)
 
-    for t in range(0, twoH_iter):
-        t0    = t * BLOCK_2H
-        tmask = (t0 + offs_2h) < (2 * H)
+    for h in range(0, h_iter):
+        h0    = h * BLOCK_2H
+        hmask = (h0 + offs_h) < H
 
-        acc2H = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
+        accG = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
+        accU = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
 
         for k in range(0, k_iter):
             k0    = k * BLOCK_K
             kmask = (k0 + offs_k) < D
 
-            # X_tile: [M, K]
+            # X tile: [M, K]
             X_tile = tl.load(
                 X_ptr + (global_start + offs_m)[:, None] * stride_xn
                        + (k0 + offs_k)[None, :] * stride_xd,
                 mask=mask_m[:, None] & kmask[None, :],
                 other=0.0
-            )
+            ).to(tl.float32)
 
-            # Wgu_tile: [K, 2H_slice]
-            Wgu_tile = tl.load(
+            # Wg: [K, H_blk]  (前 H)
+            Wg_tile = tl.load(
                 WGU_ptr + (k0 + offs_k)[:, None] * stride_wgu_d
-                        + (t0 + offs_2h)[None, :] * stride_wgu_2h,
-                mask=kmask[:, None] & tmask[None, :],
+                        + (0 + h0 + offs_h)[None, :] * stride_wgu_2h,
+                mask=kmask[:, None] & hmask[None, :],
                 other=0.0
-            )
-            acc2H += tl.dot(X_tile.to(tl.float32), Wgu_tile.to(tl.float32))
+            ).to(tl.float32)
 
-        # ===== GEMM2: (SiLU(G)*U) @ Wd → 累加到 OUT =====
-        offs_h = tl.arange(0, BLOCK_K)            # 复用 BLOCK_K 作为 H/D 切片
-        d_iter = (D + BLOCK_K - 1) // BLOCK_K
+            # Wu: [K, H_blk]  (后 H)
+            Wu_tile = tl.load(
+                WGU_ptr + (k0 + offs_k)[:, None] * stride_wgu_d
+                        + (H + h0 + offs_h)[None, :] * stride_wgu_2h,
+                mask=kmask[:, None] & hmask[None, :],
+                other=0.0
+            ).to(tl.float32)
 
-        # 与 [0,H) / [H,2H) 的交集
-        g_lo = tl.maximum(0, 0   - t0)
-        g_hi = tl.minimum(BLOCK_2H, H   - t0)
-        u_lo = tl.maximum(0, H   - t0)
-        u_hi = tl.minimum(BLOCK_2H, 2*H - t0)
-        H_slice = tl.minimum(g_hi - g_lo, u_hi - u_lo)
+            accG += tl.dot(X_tile, Wg_tile)
+            accU += tl.dot(X_tile, Wu_tile)
 
-        if (g_lo < g_hi) & (u_lo < u_hi) & (H_slice > 0):
-            G = acc2H[:, g_lo:g_hi]                    # [M, H_slice]
-            U = acc2H[:, u_lo:u_hi]                    # [M, H_slice]
-            Hact = U[:, :H_slice] * (G[:, :H_slice] * tl.sigmoid(G[:, :H_slice]))
+        # SiLU(G) * U
+        G = accG
+        U = accU
+        Hact = U * (G * tl.sigmoid(G))  # [M, H_blk]
 
-            for d in range(0, d_iter):
-                d0    = d * BLOCK_K
-                dmask = (d0 + offs_h) < D
+        for d in range(0, d_iter):
+            d0    = d * BLOCK_K
+            dmask = (d0 + offs_d) < D
 
-                Wd_tile = tl.load(
-                    WD_ptr + (t0 + g_lo)[:, None] * stride_wd_h
-                           + (d0 + offs_h)[None, :] * stride_wd_d,
-                    mask=((t0 + g_lo)[:, None] < H) & dmask[None, :],
-                    other=0.0
-                )
-                accD = tl.dot(Hact, Wd_tile.to(tl.float32))  # [M, min(BLOCK_K, D-d0)]
+            Wd_tile = tl.load(
+                WD_ptr + (h0 + offs_h)[:, None] * stride_wd_h
+                       + (d0 + offs_d)[None, :] * stride_wd_d,
+                mask=hmask[:, None] & dmask[None, :],
+                other=0.0
+            ).to(tl.float32)
 
-                # 缩放 topk 权重（逐 token）
-                topkw = tl.load(
-                    TOPKW_ptr + (global_start + offs_m) * stride_topkw_n + 0 * stride_topkw_c,
-                                mask=mask_m, other=0.0).to(tl.float32)
-                accD = accD * topkw[:, None]
+            accD = tl.dot(Hact, Wd_tile)  # [M, min(BLOCK_K, D-d0)]
 
-                # 找回原 token 行索引并原子加回 OUT
-                ridx = tl.load(ADJ_ptr + (global_start + offs_m),
-                               mask=mask_m, other=0)
-                out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
-                                   + (d0 + offs_h)[None, :] * stride_outd
-                tl.atomic_add(out_ptr, accD, mask=mask_m[:, None] & dmask[None, :])
+            # 缩放 topk 权重（逐 token）
+            topkw = tl.load(
+                TOPKW_ptr + (global_start + offs_m) * stride_topkw_n + 0 * stride_topkw_c,
+                mask=mask_m, other=0.0
+            ).to(tl.float32)
+            accD = accD * topkw[:, None]
+
+            # 找回原 token 行索引并原子加回 OUT
+            ridx = tl.load(ADJ_ptr + (global_start + offs_m), mask=mask_m, other=0)
+            out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
+                               + (d0 + offs_d)[None, :] * stride_outd
+            tl.atomic_add(out_ptr, accD, mask=mask_m[:, None] & dmask[None, :])
 
 
 
