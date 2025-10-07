@@ -636,6 +636,9 @@ class MoeLayer(nn.Module):
         adj_idxs: torch.Tensor,   # [N*k]  int32
         next_r: torch.Tensor,     # [N, D] fp32 累加缓冲（由调用方 zero_ 后传入）
     ):
+        # 诊断开关：设置环境变量 DISABLE_MOE=1 可快速旁路 MoE，用于定位问题
+        if os.environ.get("DISABLE_MOE", "0") == "1":
+            return next_r
         # 每个专家单独 kernel，使用指针偏移（off0, n_tok_e），不做任何拼接/concat
         fe, le = self.first_expert, self.last_expert
         for e in range(fe, le + 1):
