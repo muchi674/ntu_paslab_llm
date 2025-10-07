@@ -1005,15 +1005,15 @@ class Transformer(nn.Module):
                     idx += 1
             return options[idx]
 
-        def get_ins(for_h: bool = True):
+        def get_ins(for_h: bool = True, dtype: torch.dtype | None = None):
             shape: tuple
             if for_h:
                 shape = (bsz, seqlen, self.args.dim)
             else:
                 shape = (bsz * seqlen, self.args.dim)
-            return torch.ones(
+            return torch.zeros(
                 shape,
-                dtype=self.dtype,
+                dtype=(dtype or self.dtype),
                 device=self.device,
             )
 
@@ -1098,7 +1098,8 @@ class Transformer(nn.Module):
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
-        r = get_ins(False)
+        # MoE 累加缓冲使用 CUDA fp32（避免 bf16 原子加/launch 校验不通过）
+        r = get_ins(False, dtype=torch.float32)
         out = get_ins()
         func = select_last_graphable(
             (
