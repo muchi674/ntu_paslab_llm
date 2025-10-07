@@ -421,6 +421,31 @@ def launch_moe_single_expert(
     out_accum: torch.Tensor,    # [N, D] (fp32 累加缓冲)
     *, BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128
 ):
+    # 设备一致性 + dtype/contig 保护
+    dev = out_accum.device
+    assert dev.type == "cuda", f"out_accum on {dev}"
+    tensors = {
+        "sorted_x": sorted_x, "topk_w": topk_w, "adj_idxs": adj_idxs,
+        "w_gate_up": w_gate_up, "w_down": w_down, "out_accum": out_accum,
+    }
+    for name, t in tensors.items():
+        assert t.is_cuda, f"{name} must be CUDA tensor, got {t.device}"
+        assert t.device == dev, f"{name} device {t.device} != {dev}"
+
+    if out_accum.dtype != torch.float32:
+        out_accum = out_accum.to(torch.float32)
+    if topk_w.dtype != torch.float32:
+        topk_w = topk_w.to(torch.float32)
+    if adj_idxs.dtype != torch.int32:
+        adj_idxs = adj_idxs.to(torch.int32)
+
+    sorted_x  = sorted_x.contiguous()
+    topk_w    = topk_w.contiguous()
+    adj_idxs  = adj_idxs.contiguous()
+    w_gate_up = w_gate_up.contiguous()
+    w_down    = w_down.contiguous()
+    out_accum = out_accum.contiguous()
+
     # 统一到视图 [D, 2H] / [H, D] —— 零拷贝
     WguT = w_gate_up.transpose(0, 1)  # [D, 2H]
     WdT  = w_down.transpose(0, 1)     # [H, D]
@@ -432,18 +457,19 @@ def launch_moe_single_expert(
 
     grid = ((n_tok_e + BLOCK_M - 1) // BLOCK_M,)
 
-    moe_single_expert_kernel[grid](
-        sorted_x, WguT, WdT, topk_w, adj_idxs, out_accum,
-        N_total, D, H, off0, n_tok_e,
-        sorted_x.stride(0), sorted_x.stride(1),
-        WguT.stride(0), WguT.stride(1),
-        WdT.stride(0),  WdT.stride(1),
-        out_accum.stride(0), out_accum.stride(1),
-        topk_w.stride(0), topk_w.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_2H=BLOCK_2H,
-        num_warps=4 if max(D, H) <= 128 else 8,
-        num_stages=2,
-    )
+    with torch.cuda.device(dev):
+        moe_single_expert_kernel[grid](
+            sorted_x, WguT, WdT, topk_w, adj_idxs, out_accum,
+            N_total, D, H, off0, n_tok_e,
+            sorted_x.stride(0), sorted_x.stride(1),
+            WguT.stride(0), WguT.stride(1),
+            WdT.stride(0),  WdT.stride(1),
+            out_accum.stride(0), out_accum.stride(1),
+            topk_w.stride(0), topk_w.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_2H=BLOCK_2H,
+            num_warps=4 if max(D, H) <= 128 else 8,
+            num_stages=2,
+        )
 
 
 
