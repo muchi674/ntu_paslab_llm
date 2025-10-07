@@ -397,7 +397,7 @@ def moe_single_expert_kernel(
             ridx = tl.load(ADJ_ptr + (global_start + offs_m), mask=mask_m, other=0)
             out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
                                + (d0 + offs_d)[None, :] * stride_outd
-            tl.atomic_add(out_ptr, accD, mask=mask_m[:, None] & dmask[None, :])
+            tl.atomic_add(out_ptr, accD.to(tl.float32), mask=mask_m[:, None] & dmask[None, :])
 
 
 
