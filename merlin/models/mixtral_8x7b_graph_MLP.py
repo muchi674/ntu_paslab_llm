@@ -1116,13 +1116,8 @@ class Transformer(nn.Module):
         # MoE 累加缓冲使用 CUDA fp32（避免 bf16 原子加/launch 校验不通过）
         r = get_ins(False, dtype=torch.float32)
         out = get_ins()
-        func = select_last_graphable(
-            (
-                self.layers[k].moe_single_device,
-                self.layers[k].moe_inter_allreduce,
-                self.layers[k].moe_intra_allreduce,
-            )
-        )
+        # 最后一张图禁止 NCCL，固定为单机 MoE 残差（避免捕获期 all_reduce 导致 hang）
+        func = self.layers[k].moe_single_device
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
             out = func(h, r)
