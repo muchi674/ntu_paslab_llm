@@ -293,72 +293,65 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
-# =============== MoE Group GEMM Triton Kernel ===============
+# =============== MoE Group GEMM Triton Kernel (per-expert, pointer ranges) ===============
 @triton.jit
 def moe_single_expert_kernel(
-    X_ptr,            # float16/bf16 [N*k, D]  (全局 packed by expert)
-    WGU_ptr,          # float16/bf16 [D, 2H]   (本专家，转置视图即可)
-    WD_ptr,           # float16/bf16 [H, D]    (本专家，转置视图即可)
-    TOPKW_ptr,        # float32/float16 [N*k, 1]
-    ADJ_ptr,          # int32/int64 [N*k]
-    OUT_ptr,          # float32 [N, D] 累加缓冲
-    # shapes / meta
+    X_ptr,            # fp16/bf16 [N*k, D]  (全局按专家路由后的“排序视图”，我们用偏移切片，不拷贝)
+    WGU_ptr,          # fp16/bf16 [D, 2H]   (该专家 Gate/Up 合并矩阵的转置视图)
+    WD_ptr,           # fp16/bf16 [H, D]    (该专家 Down 矩阵的转置视图)
+    TOPKW_ptr,        # fp32     [N*k, 1]   (每 token 对该专家的权重；用全局行号+偏移切片取)
+    ADJ_ptr,          # int32    [N*k]      (排序后的行 -> 原 r_flat 行的映射)
+    OUT_ptr,          # fp32     [N, D]     (最终累加缓冲，原子加)
+    # shapes
     N_total, D, H,
-    OFF0,             # 全局起点 offsets[e]
-    N_TOK_E,          # 本专家 token 数 offsets[e+1] - offsets[e]
+    OFF0,             # 该专家在“排序视图”中的起点（全局）
+    N_TOK_E,          # 该专家 token 数
     # strides
     stride_xn, stride_xd,
     stride_wgu_d, stride_wgu_2h,
     stride_wd_h,  stride_wd_d,
     stride_outn, stride_outd,
     stride_topkw_n, stride_topkw_c,
-    # tuning
-    BLOCK_M: tl.constexpr,   # tokens per block
-    BLOCK_K: tl.constexpr,   # tile along D/H
-    BLOCK_2H: tl.constexpr,  # tile along 2H
+    BLOCK_M: tl.constexpr,   # tokens/tile
+    BLOCK_K: tl.constexpr,   # D/H tile
+    BLOCK_2H: tl.constexpr,  # 2H tile
 ):
-    pid_b = tl.program_id(0)          # 本专家的 token block id
+    pid_b = tl.program_id(0)
     start_local = pid_b * BLOCK_M
     rem = N_TOK_E - start_local
     if rem <= 0:
         return
     M = tl.minimum(rem, BLOCK_M)
-    offs_m = tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
 
+    offs_m  = tl.arange(0, BLOCK_M)
+    mask_m  = offs_m < M
     global_start = OFF0 + start_local
 
-    # GEMM1: [M,D] @ [D,2H] 分片累加到 acc2H
     offs_k  = tl.arange(0, BLOCK_K)
     offs_2h = tl.arange(0, BLOCK_2H)
+    offs_h  = offs_2h
 
-    k_iter     = (D     + BLOCK_K  - 1) // BLOCK_K
-    # H 维分块：分别累加 G/U，避免动态切片
-    h_iter  = (H + BLOCK_2H - 1) // BLOCK_2H
-    offs_h  = tl.arange(0, BLOCK_2H)
-    d_iter  = (D + BLOCK_K - 1) // BLOCK_K
-    offs_d  = tl.arange(0, BLOCK_K)
+    k_iter = (D + BLOCK_K - 1) // BLOCK_K
+    h_iter = (H + BLOCK_2H - 1) // BLOCK_2H
 
-    for h in range(0, h_iter):
-        h0    = h * BLOCK_2H
+    for hblk in range(0, h_iter):
+        h0    = hblk * BLOCK_2H
         hmask = (h0 + offs_h) < H
 
         accG = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
         accU = tl.zeros((BLOCK_M, BLOCK_2H), dtype=tl.float32)
 
-        for k in range(0, k_iter):
-            k0    = k * BLOCK_K
+        for kblk in range(0, k_iter):
+            k0    = kblk * BLOCK_K
             kmask = (k0 + offs_k) < D
 
-            # X tile: [M, K]
             X_tile = tl.load(
                 X_ptr + (global_start + offs_m)[:, None] * stride_xn
-                       + (k0 + offs_k)[None, :] * stride_xd,
+                      + (k0 + offs_k)[None, :] * stride_xd,
                 mask=mask_m[:, None] & kmask[None, :],
                 other=0.0
             ).to(tl.float32)
 
-            # Wg: [K, H_blk]  (前 H)
             Wg_tile = tl.load(
                 WGU_ptr + (k0 + offs_k)[:, None] * stride_wgu_d
                         + (0 + h0 + offs_h)[None, :] * stride_wgu_2h,
@@ -366,7 +359,6 @@ def moe_single_expert_kernel(
                 other=0.0
             ).to(tl.float32)
 
-            # Wu: [K, H_blk]  (后 H)
             Wu_tile = tl.load(
                 WGU_ptr + (k0 + offs_k)[:, None] * stride_wgu_d
                         + (H + h0 + offs_h)[None, :] * stride_wgu_2h,
@@ -377,13 +369,14 @@ def moe_single_expert_kernel(
             accG += tl.dot(X_tile, Wg_tile)
             accU += tl.dot(X_tile, Wu_tile)
 
-        # SiLU(G) * U
         G = accG
         U = accU
         Hact = U * (G * tl.sigmoid(G))  # [M, H_blk]
 
-        for d in range(0, d_iter):
-            d0    = d * BLOCK_K
+        d_iter = (D + BLOCK_K - 1) // BLOCK_K
+        offs_d = tl.arange(0, BLOCK_K)
+        for dblk in range(0, d_iter):
+            d0    = dblk * BLOCK_K
             dmask = (d0 + offs_d) < D
 
             Wd_tile = tl.load(
@@ -393,16 +386,14 @@ def moe_single_expert_kernel(
                 other=0.0
             ).to(tl.float32)
 
-            accD = tl.dot(Hact, Wd_tile)  # [M, min(BLOCK_K, D-d0)]
+            accD = tl.dot(Hact, Wd_tile)  # [M, K]
 
-            # 缩放 topk 权重（逐 token）
             topkw = tl.load(
                 TOPKW_ptr + (global_start + offs_m) * stride_topkw_n + 0 * stride_topkw_c,
                 mask=mask_m, other=0.0
             ).to(tl.float32)
             accD = accD * topkw[:, None]
 
-            # 找回原 token 行索引并原子加回 OUT
             ridx = tl.load(ADJ_ptr + (global_start + offs_m), mask=mask_m, other=0)
             out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
                                + (d0 + offs_d)[None, :] * stride_outd
@@ -411,50 +402,30 @@ def moe_single_expert_kernel(
 
 
 def launch_moe_single_expert(
-    sorted_x: torch.Tensor,     # [N*k, D]
-    topk_w: torch.Tensor,       # [N*k, 1]
-    adj_idxs: torch.Tensor,     # [N*k]
+    sorted_x: torch.Tensor,     # [N*k, D] （排序视图，不复制）
+    topk_w: torch.Tensor,       # [N*k, 1] （fp32）
+    adj_idxs: torch.Tensor,     # [N*k]    （int32）
     off0: int,                  # offsets[e]
     n_tok_e: int,               # offsets[e+1] - offsets[e]
-    w_gate_up: torch.Tensor,    # 原始 [2H, D]
-    w_down: torch.Tensor,       # 原始 [D, H]
-    out_accum: torch.Tensor,    # [N, D] (fp32 累加缓冲)
+    w_gate_up: torch.Tensor,    # [2H, D]
+    w_down: torch.Tensor,       # [D, H]
+    out_accum: torch.Tensor,    # [N, D] fp32
     *, BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128
 ):
-    # 设备一致性 + dtype/contig 保护
     dev = out_accum.device
-    assert dev.type == "cuda", f"out_accum on {dev}"
-    tensors = {
-        "sorted_x": sorted_x, "topk_w": topk_w, "adj_idxs": adj_idxs,
-        "w_gate_up": w_gate_up, "w_down": w_down, "out_accum": out_accum,
-    }
-    for name, t in tensors.items():
-        assert t.is_cuda, f"{name} must be CUDA tensor, got {t.device}"
-        assert t.device == dev, f"{name} device {t.device} != {dev}"
+    assert dev.type == "cuda"
+    # 视图转置成 Triton 方便的 layout
+    WguT = w_gate_up.transpose(0, 1).contiguous()  # [D, 2H]
+    WdT  = w_down.transpose(0, 1).contiguous()     # [H, D]
 
+    sorted_x = sorted_x.contiguous()
+    topk_w   = topk_w.to(torch.float32).contiguous()
+    adj_idxs = adj_idxs.to(torch.int32).contiguous()
     if out_accum.dtype != torch.float32:
-        out_accum = out_accum.to(torch.float32)
-    if topk_w.dtype != torch.float32:
-        topk_w = topk_w.to(torch.float32)
-    if adj_idxs.dtype != torch.int32:
-        adj_idxs = adj_idxs.to(torch.int32)
-
-    sorted_x  = sorted_x.contiguous()
-    topk_w    = topk_w.contiguous()
-    adj_idxs  = adj_idxs.contiguous()
-    w_gate_up = w_gate_up.contiguous()
-    w_down    = w_down.contiguous()
-    out_accum = out_accum.contiguous()
-
-    # 统一到视图 [D, 2H] / [H, D] —— 零拷贝
-    WguT = w_gate_up.transpose(0, 1)  # [D, 2H]
-    WdT  = w_down.transpose(0, 1)     # [H, D]
+        raise ValueError("out_accum must be fp32")
 
     N_total, D = sorted_x.shape
     H = WdT.shape[0]
-    assert WguT.shape[0] == D and WguT.shape[1] == 2 * H
-    assert WdT.shape[1] == D
-
     grid = ((n_tok_e + BLOCK_M - 1) // BLOCK_M,)
 
     with torch.cuda.device(dev):
@@ -470,8 +441,6 @@ def launch_moe_single_expert(
             num_warps=4 if max(D, H) <= 128 else 8,
             num_stages=2,
         )
-
-
 
 
 def get_json(file_path: Path) -> dict:
@@ -636,37 +605,37 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.experts = experts
 
-        # 不进行专家权重堆叠，避免峰值显存放大
-
+    @torch.no_grad()
     def prep_ins(self, x: torch.Tensor):
-        gate_logits = self.gate(x)  # [N, E]
-        topk_vals, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok, dim=-1)  # [N,k]
-        topk_weight = torch.softmax(topk_vals.to(torch.float32), dim=-1)  # fp32 稳定
-        ids_flat = topk_ids.reshape(-1)                        # [N*k]
-        idxs     = ids_flat.argsort()                          # [N*k]
-        adj_idxs = idxs // self.num_experts_per_tok            # [N*k]
-        counts   = torch.bincount(ids_flat, minlength=self.num_experts)  # [E]
+        """
+        x: [N, D] (已是 r_flat)
+        返回：sorted_x, topk_weight(fp32), offsets(int64), adj_idxs(int32)
+        说明：
+          - 不做任何 expert 级别拼接；只生成“排序视图”+ offsets 指针。
+        """
+        gate_logits = self.gate(x)                               # [N,E]
+        topk_vals, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok, dim=-1)
+        topk_weight = torch.softmax(topk_vals.to(torch.float32), dim=-1)  # fp32
+        ids_flat = topk_ids.reshape(-1)                          # [N*k]
+        idxs     = ids_flat.argsort()                            # [N*k]
+        adj_idxs = (idxs // self.num_experts_per_tok).to(torch.int32)     # [N*k]
+        counts   = torch.bincount(ids_flat, minlength=self.num_experts)   # [E]
         offsets  = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long),
-                            counts.cumsum(0)])               # [E+1]
-        sorted_x = x[adj_idxs]                                 # [N*k, D]
-        sorted_w = topk_weight.reshape(-1, 1)[idxs]            # [N*k, 1]
+                              counts.cumsum(0)])                           # [E+1]
+        sorted_x = x[adj_idxs]                                              # 视图拷贝（一次性）
+        sorted_w = topk_weight.reshape(-1, 1)[idxs].contiguous()            # [N*k,1] fp32
         return sorted_x, sorted_w, offsets, adj_idxs
 
-
-
+    @torch.no_grad()
     def experts_infer(
         self,
-        sorted_x: torch.Tensor,
-        topk_weight: torch.Tensor,
-        offsets: torch.Tensor,
-        adj_idxs: torch.Tensor,
-        next_r: torch.Tensor,    # 建议 fp32
-    ) -> torch.Tensor:
-        # 确保参与 Triton 的张量都在同一 CUDA 设备
-        device = next_r.device
-        sorted_x = sorted_x.contiguous().to(device)
-        topk_weight = topk_weight.to(device=device, dtype=torch.float32)
-        adj_idxs = adj_idxs.to(device=device, dtype=torch.long)
+        sorted_x: torch.Tensor,   # [N*k, D]
+        topk_weight: torch.Tensor,# [N*k, 1] fp32
+        offsets: torch.Tensor,    # [E+1]  int64
+        adj_idxs: torch.Tensor,   # [N*k]  int32
+        next_r: torch.Tensor,     # [N, D] fp32 累加缓冲（由调用方 zero_ 后传入）
+    ):
+        # 每个专家单独 kernel，使用指针偏移（off0, n_tok_e），不做任何拼接/concat
         fe, le = self.first_expert, self.last_expert
         for e in range(fe, le + 1):
             off0 = int(offsets[e].item())
@@ -674,8 +643,8 @@ class MoeLayer(nn.Module):
             n_tok_e = off1 - off0
             if n_tok_e <= 0:
                 continue
-            wgu = self.experts.ws[f"{self.glob_li}.{e}.w_gate_up"].to(device)  # [2H, D]
-            wd  = self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device)     # [D, H]
+            wgu = self.experts.ws[f"{self.glob_li}.{e}.w_gate_up"]  # [2H, D]
+            wd  = self.experts.ws[f"{self.glob_li}.{e}.w_down"]     # [D, H]
             launch_moe_single_expert(
                 sorted_x=sorted_x,
                 topk_w=topk_weight,
@@ -687,10 +656,6 @@ class MoeLayer(nn.Module):
                 out_accum=next_r,
                 BLOCK_M=64, BLOCK_K=64, BLOCK_2H=128,
             )
-        return next_r
-
-
-
 
 
 class RMSNorm(torch.nn.Module):
@@ -738,12 +703,13 @@ class TransformerBlock(nn.Module):
     def decode_attn(self, x: torch.Tensor):
         return self.attention(self.attention_norm(x), self.attention.decode_storage_idx)
 
-    def get_r_only(self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor):
+    def get_routings(self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor):
         # attn residual connection, (batch_size, seq_len, model_dim)
         torch.add(h, r, out=next_h)
         # (batch_size * seq_len, model_dim)
         r = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
-        return r
+        sorted_r, topk_weight, offsets, adj_idxs = self.feed_forward.prep_ins(r)
+        return sorted_r, topk_weight, offsets, adj_idxs
 
     def moe_single_device(self, h: torch.Tensor, r: torch.Tensor):
         return h + r.view(h.shape)  # MoE res-conn
@@ -760,7 +726,7 @@ class TransformerBlock(nn.Module):
     # PREFILL, SINGLE-DEVICE-ATTN
 
     def first_prefill_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
-        return self.get_r_only(x, self.prefill_attn(x), next_h)
+        return self.get_routings(x, self.prefill_attn(x), next_h)
 
     def subseq_prefill_graphable(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -783,7 +749,7 @@ class TransformerBlock(nn.Module):
     def first_prefill_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_r_only(x, r, next_h)
+        return self.get_routings(x, r, next_h)
 
     def subseq_prefill_graphable_intra_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -805,7 +771,7 @@ class TransformerBlock(nn.Module):
     def first_prefill_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.get_r_only(x, r, next_h)
+        return self.get_routings(x, r, next_h)
 
     def subseq_prefill_graphable_inter_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -818,7 +784,7 @@ class TransformerBlock(nn.Module):
     # DECODE, SINGLE-DEVICE-ATTN
 
     def first_decode_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
-        return self.get_r_only(x, self.decode_attn(x), next_h)
+        return self.get_routings(x, self.decode_attn(x), next_h)
 
     def subseq_decode_graphable(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -841,7 +807,7 @@ class TransformerBlock(nn.Module):
     def first_decode_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_r_only(x, r, next_h)
+        return self.get_routings(x, r, next_h)
 
     def subseq_decode_graphable_intra_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -863,7 +829,7 @@ class TransformerBlock(nn.Module):
     def first_decode_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.get_r_only(x, r, next_h)
+        return self.get_routings(x, r, next_h)
 
     def subseq_decode_graphable_inter_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -874,50 +840,45 @@ class TransformerBlock(nn.Module):
 
     # ****************************************************************************************************
 
-    def first_forward(
-        self,
-        x: torch.Tensor,  # (batch_size, seq_len, model_dim)
-        graphs: list[torch.cuda.CUDAGraph],
-        data: list[tuple[torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # h.shape = (batch_size, seq_len, model_dim)
+    def first_forward(self, x, graphs, data):
         h, res_r, topk_weight, offsets, adj_idxs = data[self.li]
-        # (h, r, res_r, topk_weight, offsets, adj_idxs)
         next_r = data[self.li + 1][1]
+        next_h = data[self.li + 1][0]        # ★ 取到下一层的 h 缓冲（就是本层的输出）
+
         h.copy_(x)
-        graphs[self.li].replay()  # 写入 next_h = data[self.li + 1][0]
-        # 图外：路由 + MoE，并把 MoE 残差并回 next_h，作为下一层输入
-        next_h = data[self.li + 1][0]
+        graphs[self.li].replay()             # 只做 attn 残差（或 no-op）
+
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
         res_r.copy_(sorted_r)
         topk_weight.copy_(topk_w)
         offsets.copy_(offs)
         adj_idxs.copy_(adj)
+
         next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
+
         next_h.add_(next_r.view_as(next_h))
 
-    def middle_forward(
-        self,
-        graphs: list[torch.cuda.CUDAGraph],
-        data: list[tuple[torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+    def middle_forward(self, graphs, data):
         _h, _r, res_r, topk_weight, offsets, adj_idxs = data[self.li]
-        # (h, r, res_r, topk_weight, offsets, adj_idxs) or (h, r, out)
         next_r = data[self.li + 1][1]
-        graphs[self.li].replay()  # 写入 next_h
-        # 图外：路由 + MoE，并把 MoE 残差并回 next_h
-        next_h = data[self.li + 1][0]
+        next_h = data[self.li + 1][0]        # ★
+
+        graphs[self.li].replay()
+
         r_flat = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
         sorted_r, topk_w, offs, adj = self.feed_forward.prep_ins(r_flat)
         res_r.copy_(sorted_r)
         topk_weight.copy_(topk_w)
         offsets.copy_(offs)
         adj_idxs.copy_(adj)
+
         next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
-        next_h.add_(next_r.view_as(next_h))
+        next_h.add_(next_r.view_as(next_h))  
+
 
     def last_forward(
         self,
@@ -1097,16 +1058,17 @@ class Transformer(nn.Module):
                 self.layers[k].first_decode_graphable_intra_attn,
             ),
         )
+        # without this causes cublas_status_not_initialized error
         graphs.append(torch.cuda.CUDAGraph())
-        with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            # 图内：只做注意力+残差，写 next_h
-            _ = func(h, next_h)
+        with torch.cuda.graph(graphs[-1], pool=pool):
+            r0 = (self.layers[k].prefill_attn(h) if prefill
+                else self.layers[k].decode_attn(h))   # 进图
+            torch.add(h, r0, out=next_h)                # 进图
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
             h = next_h
-            # MoE 专家累加缓冲使用 fp32（避免 bf16 原子加）
-            r = torch.zeros((bsz * seqlen, self.args.dim), dtype=torch.float32, device=self.device)
+            r = get_ins(False)
             next_h = get_ins()
             res_r, topk_weight, offsets, adj_idxs = get_outs()
             k = str(li)
@@ -1129,7 +1091,9 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                _ = func(h, r, next_h)
+                r_sub = (self.layers[k].prefill_attn(h) if prefill
+                        else self.layers[k].decode_attn(h))  # 进图
+                torch.add(h, r_sub, out=next_h)               # 进图
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
@@ -1333,26 +1297,50 @@ class Mixtral8x7B:
             tokenizer = MistralTokenizer.v3()
 
         # ----------------------------
-        # Triton kernels warmup (JIT) — 只预热 rope 与 norm，MoE 在首次运行时自然 JIT
+        # Triton kernels warmup (JIT)
         # ----------------------------
         with torch.cuda.device(device):
             dtype = next(model.parameters()).dtype
+
+            # 1) 预热 rope_fused
             T_w = 4
             B_w = 1
             Hq_w = model_args.n_heads
             Hk_w = model_args.n_kv_heads
             D_h = model_args.head_dim
+
             xq_w = torch.randn(B_w, Hq_w, T_w, D_h, device=device, dtype=dtype)
             xk_w = torch.randn(B_w, Hk_w, T_w, D_h, device=device, dtype=dtype)
             cos_w, sin_w = precompute_rope_cos_sin(dim=D_h, end=T_w, theta=model_args.rope_theta, device=device)
             _ = rope_fused(xq_w, xk_w, cos_w, sin_w)
-            x_w = torch.randn(1, T_w, model_args.dim, device=device, dtype=dtype)
+
+            # 2) 预热会进入 graph 的 Linear / Norm
             any_block = next(iter(model.layers.values()))
-            _ = any_block.attention_norm(x_w)
-            _ = any_block.ffn_norm(x_w)
+            D = model_args.dim
+            x_bt = torch.randn(1, T_w, D, device=device, dtype=dtype)   # (B,T,D) 给 Norm / Attn
+            x_nd = x_bt.view(-1, D)                                      # (N,D)  给线性层
+
+            # 注意力线性层（进 graph，必须预热）
+            _ = any_block.attention.wq(x_nd)                             # [N, D] -> [N, Hq*Dh]
+            _ = any_block.attention.wk(x_nd)                             # [N, D] -> [N, Hk*Dh]
+            _ = any_block.attention.wv(x_nd)                             # [N, D] -> [N, Hk*Dh]
+            y_mha = torch.randn(x_nd.size(0), any_block.attention.n_heads * any_block.attention.head_dim,
+                                device=device, dtype=dtype)
+            _ = any_block.attention.wo(y_mha)                            # [N, Hq*Dh] -> [N, D]
+
+            # Norm（用 (B,T,D) 形状）
+            _ = any_block.attention_norm(x_bt)
+            _ = any_block.ffn_norm(x_bt)
+
+            # 3) （可选）预热 gate（MoE 在 graph 外，想稳一点就留）
+            dummy = torch.randn(T_w, D, device=device, dtype=dtype)      # [N,D]
+            _ = any_block.feed_forward.gate(dummy)
+
+            # 4) 最末尾再做一次同步
             if model.is_last_stage:
-                _ = model.norm(x_w)
+                _ = model.norm(x_bt)
             torch.cuda.synchronize()
+
         return Mixtral8x7B(model, tokenizer)
 
     def __init__(
