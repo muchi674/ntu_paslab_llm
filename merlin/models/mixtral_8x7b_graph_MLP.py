@@ -393,7 +393,7 @@ def moe_single_expert_kernel(
                 other=0.0
             ).to(tl.float32)
 
-            accD = tl.dot(Hact, Wd_tile)  # [M, min(BLOCK_K, D-d0)] (fp32)
+            accD = tl.dot(Hact, Wd_tile)  # [M, min(BLOCK_K, D-d0)]
 
             # 缩放 topk 权重（逐 token）
             topkw = tl.load(
@@ -406,8 +406,7 @@ def moe_single_expert_kernel(
             ridx = tl.load(ADJ_ptr + (global_start + offs_m), mask=mask_m, other=0)
             out_ptr = OUT_ptr + ridx[:, None] * stride_outn \
                                + (d0 + offs_d)[None, :] * stride_outd
-            # cast 到 fp32 保证 atomic_add 支持
-            tl.atomic_add(out_ptr, accD.to(tl.float32), mask=mask_m[:, None] & dmask[None, :])
+            tl.atomic_add(out_ptr, accD, mask=mask_m[:, None] & dmask[None, :])
 
 
 
@@ -1010,7 +1009,7 @@ class Transformer(nn.Module):
                     idx += 1
             return options[idx]
 
-        def get_ins(for_h: bool = True, dtype_override: torch.dtype | None = None):
+        def get_ins(for_h: bool = True):
             shape: tuple
             if for_h:
                 shape = (bsz, seqlen, self.args.dim)
@@ -1018,7 +1017,7 @@ class Transformer(nn.Module):
                 shape = (bsz * seqlen, self.args.dim)
             return torch.ones(
                 shape,
-                dtype=(dtype_override or self.dtype),
+                dtype=self.dtype,
                 device=self.device,
             )
 
@@ -1077,7 +1076,8 @@ class Transformer(nn.Module):
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
             h = next_h
-            r = get_ins(False, torch.float32)
+            # MoE 专家累加缓冲使用 fp32（避免 bf16 原子加）
+            r = torch.zeros((bsz * seqlen, self.args.dim), dtype=torch.float32, device=self.device)
             next_h = get_ins()
             res_r, topk_weight, offsets, adj_idxs = get_outs()
             k = str(li)
