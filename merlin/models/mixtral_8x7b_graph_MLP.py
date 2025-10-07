@@ -702,13 +702,12 @@ class TransformerBlock(nn.Module):
     def decode_attn(self, x: torch.Tensor):
         return self.attention(self.attention_norm(x), self.attention.decode_storage_idx)
 
-    def get_routings(self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor):
+    def get_r_only(self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor):
         # attn residual connection, (batch_size, seq_len, model_dim)
         torch.add(h, r, out=next_h)
         # (batch_size * seq_len, model_dim)
         r = self.ffn_norm(next_h).view(-1, next_h.shape[-1])
-        sorted_r, topk_weight, offsets, adj_idxs = self.feed_forward.prep_ins(r)
-        return sorted_r, topk_weight, offsets, adj_idxs
+        return r
 
     def moe_single_device(self, h: torch.Tensor, r: torch.Tensor):
         return h + r.view(h.shape)  # MoE res-conn
@@ -725,7 +724,7 @@ class TransformerBlock(nn.Module):
     # PREFILL, SINGLE-DEVICE-ATTN
 
     def first_prefill_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
-        return self.get_routings(x, self.prefill_attn(x), next_h)
+        return self.get_r_only(x, self.prefill_attn(x), next_h)
 
     def subseq_prefill_graphable(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -748,7 +747,7 @@ class TransformerBlock(nn.Module):
     def first_prefill_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_routings(x, r, next_h)
+        return self.get_r_only(x, r, next_h)
 
     def subseq_prefill_graphable_intra_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -770,7 +769,7 @@ class TransformerBlock(nn.Module):
     def first_prefill_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.prefill_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.get_routings(x, r, next_h)
+        return self.get_r_only(x, r, next_h)
 
     def subseq_prefill_graphable_inter_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -783,7 +782,7 @@ class TransformerBlock(nn.Module):
     # DECODE, SINGLE-DEVICE-ATTN
 
     def first_decode_graphable(self, x: torch.Tensor, next_h: torch.Tensor):
-        return self.get_routings(x, self.decode_attn(x), next_h)
+        return self.get_r_only(x, self.decode_attn(x), next_h)
 
     def subseq_decode_graphable(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -806,7 +805,7 @@ class TransformerBlock(nn.Module):
     def first_decode_graphable_intra_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM, group=self.local_group)
-        return self.get_routings(x, r, next_h)
+        return self.get_r_only(x, r, next_h)
 
     def subseq_decode_graphable_intra_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -828,7 +827,7 @@ class TransformerBlock(nn.Module):
     def first_decode_graphable_inter_attn(self, x: torch.Tensor, next_h: torch.Tensor):
         r = self.decode_attn(x)
         dist.all_reduce(r, op=dist.ReduceOp.SUM)
-        return self.get_routings(x, r, next_h)
+        return self.get_r_only(x, r, next_h)
 
     def subseq_decode_graphable_inter_attn_inter_moe(
         self, h: torch.Tensor, r: torch.Tensor, next_h: torch.Tensor
@@ -1044,11 +1043,16 @@ class Transformer(nn.Module):
                 self.layers[k].first_decode_graphable_intra_attn,
             ),
         )
-        # without this causes cublas_status_not_initialized error
-        res_r, topk_weight, offsets, adj_idxs = func(h, next_h)
+        # outside capture: compute r and routing, fill static buffers
+        r_flat = func(h, next_h)
+        sorted_r, topk_w, offs, adj = self.layers[k].feed_forward.prep_ins(r_flat)
+        res_r.copy_(sorted_r)
+        topk_weight.copy_(topk_w)
+        offsets.copy_(offs)
+        adj_idxs.copy_(adj)
         graphs.append(torch.cuda.CUDAGraph())
         with torch.cuda.graph(graphs[-1], pool=pool):  # share memory pool
-            res_r, topk_weight, offsets, adj_idxs = func(h, next_h)
+            self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
         static_data.append((h, res_r, topk_weight, offsets, adj_idxs))
 
         for li in range(self.args.first_layer + 1, self.args.last_layer + 1):
@@ -1076,7 +1080,7 @@ class Transformer(nn.Module):
             )
             graphs.append(torch.cuda.CUDAGraph())
             with torch.cuda.graph(graphs[-1], pool=graphs[-2].pool()):
-                res_r, topk_weight, offsets, adj_idxs = func(h, r, next_h)
+                self.layers[k].feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, static_data_placeholder := torch.empty_like(res_r))
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
