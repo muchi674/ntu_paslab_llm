@@ -858,7 +858,7 @@ class TransformerBlock(nn.Module):
         next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
 
-        next_h.add_(next_r.view_as(next_h))
+        next_h.add_( next_r.to(dtype=next_h.dtype).view_as(next_h) )
 
 
     def middle_forward(self, graphs, data):
@@ -877,7 +877,7 @@ class TransformerBlock(nn.Module):
 
         next_r.zero_()
         self.feed_forward.experts_infer(res_r, topk_weight, offsets, adj_idxs, next_r)
-        next_h.add_(next_r.view_as(next_h))  
+        next_h.add_( next_r.to(dtype=next_h.dtype).view_as(next_h) ) 
 
 
     def last_forward(
@@ -1005,15 +1005,15 @@ class Transformer(nn.Module):
                     idx += 1
             return options[idx]
 
-        def get_ins(for_h: bool = True, dtype: torch.dtype | None = None):
+        def get_ins(for_h: bool = True):
             shape: tuple
             if for_h:
                 shape = (bsz, seqlen, self.args.dim)
             else:
                 shape = (bsz * seqlen, self.args.dim)
-            return torch.zeros(
+            return torch.ones(
                 shape,
-                dtype=(dtype or self.dtype),
+                dtype=self.dtype,
                 device=self.device,
             )
 
@@ -1098,7 +1098,7 @@ class Transformer(nn.Module):
             static_data.append((h, r, res_r, topk_weight, offsets, adj_idxs))
 
         h = next_h
-        r = get_ins(False, dtype=torch.float32)
+        r = get_ins(False)
         out = get_ins()
         func = select_last_graphable(
             (
