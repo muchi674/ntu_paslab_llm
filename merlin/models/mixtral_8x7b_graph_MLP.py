@@ -1156,6 +1156,8 @@ class Transformer(nn.Module):
         ys = data[-1][2]  # (h, r, out)
 
         if self.is_last_stage:
+            # 确保输入线性层的张量与权重 dtype 一致（模型 dtype）
+            ys = ys.to(self.dtype)
             ys = self.output(self.norm(ys))
         else:
             if WORLD_RANK == self.local_leader:
