@@ -296,75 +296,68 @@ def repeat_kv_fused(keys: torch.Tensor,
 # ===================== Triton: weighted scatter-add for MoE =====================
 @triton.jit
 def moe_weight_scatter_add_kernel(
-    OUT_ptr,        # [N, D]   expert_outs (in: bf16/fp16/fp32 均可)
-    WEI_ptr,        # [N]      权重 (fp32, 扁平)
-    IDX_ptr,        # [N]      目标行号 (int64)
-    ACC32_ptr,      # [M, D]   FP32 累加缓冲 (与 next_r 形状相同)
+    OUT_ptr,        # *f16/f32  [N, D]   —— 连续的专家输出 (按 offsets 直接写好了)
+    WEI_ptr,        # *f32      [N]      —— 每 token 的 topk 权重（展平）
+    IDX_ptr,        # *int64    [N]      —— 每 token 回写的行号（adj_idxs）
+    NEXT_ptr,       # *f16/f32  [M, D]   —— 目标矩阵，原位累加
     N, D,
-    stride_on, stride_od,      # OUT 的 stride
-    stride_an, stride_ad,      # ACC32 的 stride
+    stride_on, stride_od,        # OUT 的行/列 stride
+    stride_nn, stride_nd,        # NEXT 的行/列 stride
     BLOCK_D: tl.constexpr,
 ):
-    n  = tl.program_id(0)
-    db = tl.program_id(1)
+    n = tl.program_id(0)      # 处理第 n 个 token
+    db = tl.program_id(1)     # 列块索引
+    offs = db * BLOCK_D + tl.arange(0, BLOCK_D)
+    m = offs < D
     if n >= N:
         return
 
-    offs = db * BLOCK_D + tl.arange(0, BLOCK_D)
-    m = offs < D
+    # 标量权重（fp32）
+    w = tl.load(WEI_ptr + n).to(tl.float32)
 
-    # 读该 token 的向量并乘权重（到 fp32）
-    w   = tl.load(WEI_ptr + n).to(tl.float32)
-    row = OUT_ptr + n * stride_on
-    vec = tl.load(row + offs * stride_od, mask=m, other=0.0).to(tl.float32)
+    # 读该 token 的一段向量
+    row_ptr = OUT_ptr + n * stride_on
+    vec = tl.load(row_ptr + offs * stride_od, mask=m, other=0.0).to(tl.float32)
     vec = vec * w
 
     # 目标行
-    dst  = tl.load(IDX_ptr + n).to(tl.int64)
-    base = ACC32_ptr + dst * stride_an
+    dst = tl.load(IDX_ptr + n).to(tl.int64)
+    base = NEXT_ptr + dst * stride_nn
 
-    # fp32 原子累加（线程安全）
-    tl.atomic_add(base + offs * stride_ad, vec, mask=m)
+    # 原位累加
+    out_dtype = tl.constexpr(NEXT_ptr.dtype.element_ty)
+    old = tl.load(base + offs * stride_nd, mask=m, other=0.0).to(tl.float32)
+    new = old + vec
+    tl.store(base + offs * stride_nd, new.to(out_dtype), mask=m)
+
 
 def moe_weight_scatter_add(expert_outs: torch.Tensor,
                            topk_weight: torch.Tensor,
                            adj_idxs: torch.Tensor,
                            next_r: torch.Tensor,
                            block_d: int = 128):
-    assert expert_outs.is_cuda and next_r.is_cuda and adj_idxs.is_cuda
+    assert expert_outs.is_cuda and next_r.is_cuda and adj_idxs.is_cuda, "expect CUDA tensors"
     assert expert_outs.is_contiguous()
     N, D = expert_outs.shape
-    dev  = expert_outs.device
 
-    # 1) 准备/复用一个 FP32 累加缓冲（与 next_r 同形状）
-    acc = getattr(moe_weight_scatter_add, "_accum_fp32", None)
-    if (acc is None) or (acc.shape != next_r.shape) or (acc.device != next_r.device):
-        acc = torch.zeros_like(next_r, dtype=torch.float32, device=dev)
-        moe_weight_scatter_add._accum_fp32 = acc
-    else:
-        acc.zero_()
-
-    # 2) 保证传参的 dtype / 形状 / 连续性
-    out = expert_outs.contiguous()
-    wei = topk_weight.reshape(-1).to(device=dev, dtype=torch.float32, non_blocking=True).contiguous()
-    idx = adj_idxs.to(device=dev, dtype=torch.int64, non_blocking=True).contiguous()
-
-    on, od = out.stride()
-    an, ad = acc.stride()
+    dev = expert_outs.device
+    wei = topk_weight.reshape(-1).contiguous().to(device=dev, dtype=torch.float32)
+    idx = adj_idxs.to(device=dev, dtype=torch.int64, non_blocking=True)
+    on, od = expert_outs.stride()
+    nn, nd = next_r.stride()
 
     grid = (N, (D + block_d - 1) // block_d)
-    moe_weight_scatter_add_kernel[grid](
-        out, wei, idx, acc,
-        N, D,
-        on, od,
-        an, ad,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
-    )
+    with torch.cuda.device(dev):
+        moe_weight_scatter_add_kernel[grid](
+            expert_outs, wei, idx, next_r,
+            N, D,
+            on, od,
+            nn, nd,
+            BLOCK_D=block_d,
+            num_warps=4 if block_d <= 128 else 8,
+            num_stages=2,
+        )
 
-    # 3) 一次性回写到 next_r 的 dtype（避免并发写）
-    next_r.copy_(acc.to(next_r.dtype))
 
 ################################
 ###### 下面是原本 Merlin #########
@@ -576,19 +569,21 @@ class MoeLayer(nn.Module):
         expert_outs = self.tmp_expert_outs[:Ntot]  # view 切片
 
 
-        # 计算专家
         for ei in range(self.first_expert, self.last_expert + 1):
-            l = expert_offsets[ei]; r = expert_offsets[ei + 1]
+            l = expert_offsets[ei]
+            r = expert_offsets[ei + 1]
             if l == r:
                 continue
-            expert_outs[l:r] = self.experts.forward(self.glob_li, ei, sorted_x[l:r])
+            expert_outs[l:r] = self.experts.forward(
+                self.glob_li, ei, sorted_x[l:r]
+            )
 
-        # 乘权重 + scatter add（权重展平）
+        # 4) 一次 Triton kernel：乘权重 + scatter add 回 next_r
         moe_weight_scatter_add(
             expert_outs,
-            topk_weight[:Ntot].reshape(-1),   # <- 关键：保证是 [Ntot]
-            adj_idxs[:Ntot].contiguous(),     # int64
-            next_r,
+            topk_weight[:Ntot],   # [Ntot,1] or [Ntot]
+            adj_idxs[:Ntot].contiguous(),  # int64
+            next_r,                          # in-place 累加
         )
 
 
@@ -1245,13 +1240,7 @@ class Mixtral8x7B:
             
             if model.is_last_stage:
                 _ = model.norm(x_w)
-            
-            Nw, Dw, Mw = 8, 64, 16
-            expert_outs_w = torch.randn(Nw, Dw, device=device, dtype=next(model.parameters()).dtype)
-            topk_w_w     = torch.rand(Nw, 1, device=device, dtype=next(model.parameters()).dtype)
-            adj_idxs_w   = torch.randint(0, Mw, (Nw,), device=device, dtype=torch.int64)
-            next_r_w     = torch.zeros(Mw, Dw, device=device, dtype=next(model.parameters()).dtype)
-            moe_weight_scatter_add(expert_outs_w, topk_w_w, adj_idxs_w, next_r_w)
+
             torch.cuda.synchronize()
         return Mixtral8x7B(model, tokenizer)
 
