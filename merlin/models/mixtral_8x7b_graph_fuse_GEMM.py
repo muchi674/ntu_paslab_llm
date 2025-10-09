@@ -293,7 +293,69 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
+# ===================== Triton: weighted scatter-add for MoE =====================
+@triton.jit
+def moe_weight_scatter_add_kernel(
+    OUT_ptr,        # *f16/f32  [N, D]   —— 连续的专家输出 (按 offsets 直接写好了)
+    WEI_ptr,        # *f32      [N]      —— 每 token 的 topk 权重（展平）
+    IDX_ptr,        # *int64    [N]      —— 每 token 回写的行号（adj_idxs）
+    NEXT_ptr,       # *f16/f32  [M, D]   —— 目标矩阵，原位累加
+    N, D,
+    stride_on, stride_od,        # OUT 的行/列 stride
+    stride_nn, stride_nd,        # NEXT 的行/列 stride
+    BLOCK_D: tl.constexpr,
+):
+    n = tl.program_id(0)      # 处理第 n 个 token
+    db = tl.program_id(1)     # 列块索引
+    offs = db * BLOCK_D + tl.arange(0, BLOCK_D)
+    m = offs < D
+    if n >= N:
+        return
 
+    # 标量权重（fp32）
+    w = tl.load(WEI_ptr + n).to(tl.float32)
+
+    # 读该 token 的一段向量
+    row_ptr = OUT_ptr + n * stride_on
+    vec = tl.load(row_ptr + offs * stride_od, mask=m, other=0.0).to(tl.float32)
+    vec = vec * w
+
+    # 目标行
+    dst = tl.load(IDX_ptr + n).to(tl.int64)
+    base = NEXT_ptr + dst * stride_nn
+
+    # 原位累加
+    tl.atomic_add(base + offs * stride_nd, vec, mask=m)
+
+
+def moe_weight_scatter_add(expert_outs: torch.Tensor,
+                           topk_weight: torch.Tensor,
+                           adj_idxs: torch.Tensor,
+                           next_r: torch.Tensor,
+                           block_d: int = 128):
+    assert expert_outs.is_cuda and next_r.is_cuda and adj_idxs.is_cuda, "expect CUDA tensors"
+    assert expert_outs.is_contiguous()
+    N, D = expert_outs.shape
+
+    wei = topk_weight.reshape(-1).contiguous().to(torch.float32)
+    on, od = expert_outs.stride()
+    nn, nd = next_r.stride()
+
+    grid = (N, (D + block_d - 1) // block_d)
+    moe_weight_scatter_add_kernel[grid](
+        expert_outs, wei, adj_idxs, next_r,
+        N, D,
+        on, od,
+        nn, nd,
+        BLOCK_D=block_d,
+        num_warps=4 if block_d <= 128 else 8,
+        num_stages=2,
+    )
+
+
+################################
+###### 下面是原本 Merlin #########
+################################
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -462,6 +524,7 @@ class MoeLayer(nn.Module):
         self.pinned_offsets = torch.zeros(
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
+        self.tmp_expert_outs = None
 
     def prep_ins(
         self, x: torch.Tensor
@@ -489,26 +552,33 @@ class MoeLayer(nn.Module):
         self.pinned_offsets.copy_(offsets)
         expert_offsets = self.pinned_offsets.tolist()
 
-        expert_outs = []
+        Ntot = int(offsets[-1].item())
+        D = next_r.shape[1]
+        if (self.tmp_expert_outs is None or
+            self.tmp_expert_outs.shape[0] < Ntot or
+            self.tmp_expert_outs.shape[1] != D or
+            self.tmp_expert_outs.dtype != next_r.dtype or
+            self.tmp_expert_outs.device != next_r.device):
+            self.tmp_expert_outs = next_r.new_empty((Ntot, D))
+        expert_outs = self.tmp_expert_outs[:Ntot]  # view 切片
+
+
         for ei in range(self.first_expert, self.last_expert + 1):
             l = expert_offsets[ei]
             r = expert_offsets[ei + 1]
             if l == r:
                 continue
-            expert_outs.append(
-                self.experts.forward(
-                    self.glob_li,
-                    ei,
-                    sorted_x[l:r],
-                )
+            expert_outs[l:r] = self.experts.forward(
+                self.glob_li, ei, sorted_x[l:r]
             )
 
-        if len(expert_outs):
-            l = expert_offsets[self.first_expert]
-            r = expert_offsets[self.last_expert + 1]
-            expert_outs = torch.cat(expert_outs)
-            expert_outs.mul_(topk_weight[l:r])
-            next_r.index_add_(0, adj_idxs[l:r], expert_outs)
+        # 4) 一次 Triton kernel：乘权重 + scatter add 回 next_r
+        moe_weight_scatter_add(
+            expert_outs,
+            topk_weight[:Ntot],   # [Ntot,1] or [Ntot]
+            adj_idxs[:Ntot].contiguous(),  # int64
+            next_r,                          # in-place 累加
+        )
 
 
 class RMSNorm(torch.nn.Module):
