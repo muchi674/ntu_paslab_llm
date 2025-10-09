@@ -325,7 +325,10 @@ def moe_weight_scatter_add_kernel(
     base = NEXT_ptr + dst * stride_nn
 
     # 原位累加
-    tl.atomic_add(base + offs * stride_nd, vec, mask=m)
+    out_dtype = tl.constexpr(NEXT_ptr.dtype.element_ty)
+    old = tl.load(base + offs * stride_nd, mask=m, other=0.0).to(tl.float32)
+    new = old + vec
+    tl.store(base + offs * stride_nd, new.to(tl.bfloat16), mask=m)
 
 
 def moe_weight_scatter_add(expert_outs: torch.Tensor,
