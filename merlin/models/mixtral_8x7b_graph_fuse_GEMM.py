@@ -328,7 +328,7 @@ def moe_weight_scatter_add_kernel(
     out_dtype = tl.constexpr(NEXT_ptr.dtype.element_ty)
     old = tl.load(base + offs * stride_nd, mask=m, other=0.0).to(tl.float32)
     new = old + vec
-    tl.store(base + offs * stride_nd, new.to(tl.bfloat16), mask=m)
+    tl.store(base + offs * stride_nd, new.to(out_dtype), mask=m)
 
 
 def moe_weight_scatter_add(expert_outs: torch.Tensor,
@@ -340,20 +340,23 @@ def moe_weight_scatter_add(expert_outs: torch.Tensor,
     assert expert_outs.is_contiguous()
     N, D = expert_outs.shape
 
-    wei = topk_weight.reshape(-1).contiguous().to(torch.float32)
+    dev = expert_outs.device
+    wei = topk_weight.reshape(-1).contiguous().to(device=dev, dtype=torch.float32)
+    idx = adj_idxs.to(device=dev, dtype=torch.int64, non_blocking=True)
     on, od = expert_outs.stride()
     nn, nd = next_r.stride()
 
     grid = (N, (D + block_d - 1) // block_d)
-    moe_weight_scatter_add_kernel[grid](
-        expert_outs, wei, adj_idxs, next_r,
-        N, D,
-        on, od,
-        nn, nd,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
-    )
+    with torch.cuda.device(dev):
+        moe_weight_scatter_add_kernel[grid](
+            expert_outs, wei, idx, next_r,
+            N, D,
+            on, od,
+            nn, nd,
+            BLOCK_D=block_d,
+            num_warps=4 if block_d <= 128 else 8,
+            num_stages=2,
+        )
 
 
 ################################
