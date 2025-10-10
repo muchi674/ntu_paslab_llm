@@ -523,7 +523,7 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
-        hidden_states = fused_silu_times_up(x, w_gate_up)
+        hidden_states = MLP_fused(x, w_gate_up)
         return hidden_states @ w_down
 
 
