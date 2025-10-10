@@ -338,18 +338,19 @@ def silu_mul_fused(gate_states: torch.Tensor, up_states: torch.Tensor) -> torch.
 
     M, N = gate_states.shape
     out = torch.empty_like(gate_states, dtype=torch.float32)  # accumulate in fp32
-
+    dev = gate_states.device
     grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
 
-    silu_mul_fused_kernel[grid](
-        gate_states, up_states, out,
-        M, N,
-        gate_states.stride(0), gate_states.stride(1),
-        up_states.stride(0), up_states.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_M=128, BLOCK_N=128,
-        num_warps=4,
-    )
+    with torch.cuda.device(dev):
+        silu_mul_fused_kernel[grid](
+            gate_states, up_states, out,
+            M, N,
+            gate_states.stride(0), gate_states.stride(1),
+            up_states.stride(0), up_states.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=128, BLOCK_N=128,
+            num_warps=4,
+        )
 
     return out.to(gate_states.dtype)
 
