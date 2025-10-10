@@ -292,76 +292,90 @@ def repeat_kv_fused(keys: torch.Tensor,
     )
     return k_out, v_out
 
-
-# ===================== Triton: weighted scatter-add for MoE =====================
+################################
+# 下面是 MLP 的 kernel fuse
+################################
 @triton.jit
-def moe_weight_scatter_add_kernel(
-    OUT_ptr,        # *f16/f32  [N, D]   —— 连续的专家输出 (按 offsets 直接写好了)
-    WEI_ptr,        # *f32      [N]      —— 每 token 的 topk 权重（展平）
-    IDX_ptr,        # *int64    [N]      —— 每 token 回写的行号（adj_idxs）
-    NEXT_ptr,       # *f16/f32  [M, D]   —— 目标矩阵，原位累加
-    N, D,
-    stride_on, stride_od,        # OUT 的行/列 stride
-    stride_nn, stride_nd,        # NEXT 的行/列 stride
-    BLOCK_D: tl.constexpr,
+def MLP_fused_kernel(
+    x_ptr, w_packed_ptr, y_ptr,
+    M, K, I,                          # x:[M,K], w_packed:[K,2I], y:[M,I]
+    stride_xm, stride_xk,
+    stride_wp_k, stride_wp_n,         # packed权重的步幅
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    n = tl.program_id(0)      # 处理第 n 个 token
-    db = tl.program_id(1)     # 列块索引
-    offs = db * BLOCK_D + tl.arange(0, BLOCK_D)
-    m = offs < D
-    if n >= N:
-        return
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)     # 覆盖输出列维度 I
 
-    # 标量权重（fp32）
-    w = tl.load(WEI_ptr + n).to(tl.float32)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # 读该 token 的一段向量
-    row_ptr = OUT_ptr + n * stride_on
-    vec = tl.load(row_ptr + offs * stride_od, mask=m, other=0.0).to(tl.float32)
-    vec = vec * w
+    m_mask = offs_m < M
+    n_mask = offs_n < I               # 注意：这里只覆盖 I（不是2I）
 
-    # 目标行
-    dst = tl.load(IDX_ptr + n).to(tl.int64)
-    base = NEXT_ptr + dst * stride_nn
+    # 两个累加器：左半( gate ) 与 右半( up )
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up   = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # 原位累加
-    out_dtype = tl.constexpr(NEXT_ptr.dtype.element_ty)
-    old = tl.load(base + offs * stride_nd, mask=m, other=0.0).to(tl.float32)
-    new = old + vec
-    tl.store(base + offs * stride_nd, new.to(out_dtype), mask=m)
+    # tile指针
+    x_tile = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    # gate子块：列偏移 offs_n
+    w_gate_tile = w_packed_ptr + (offs_k[:, None] * stride_wp_k + offs_n[None, :] * stride_wp_n)
+    # up子块：列偏移 offs_n + I
+    w_up_tile = w_packed_ptr + (offs_k[:, None] * stride_wp_k + (offs_n[None, :] + I) * stride_wp_n)
 
+    # K 循环
+    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+        k_mask = offs_k < K
+        xv  = tl.load(x_tile, mask=m_mask[:, None] & k_mask[None, :], other=0.)
+        wgv = tl.load(w_gate_tile, mask=k_mask[:, None] & n_mask[None, :], other=0.)
+        wuv = tl.load(w_up_tile,   mask=k_mask[:, None] & n_mask[None, :], other=0.)
+        acc_gate += tl.dot(xv, wgv)
+        acc_up   += tl.dot(xv, wuv)
 
-def moe_weight_scatter_add(expert_outs: torch.Tensor,
-                           topk_weight: torch.Tensor,
-                           adj_idxs: torch.Tensor,
-                           next_r: torch.Tensor,
-                           block_d: int = 128):
-    assert expert_outs.is_cuda and next_r.is_cuda and adj_idxs.is_cuda, "expect CUDA tensors"
-    assert expert_outs.is_contiguous()
-    N, D = expert_outs.shape
+        x_tile      += BLOCK_K * stride_xk
+        w_gate_tile += BLOCK_K * stride_wp_k
+        w_up_tile   += BLOCK_K * stride_wp_k
+        offs_k      += BLOCK_K
 
-    dev = expert_outs.device
-    wei = topk_weight.reshape(-1).contiguous().to(device=dev, dtype=torch.float32)
-    idx = adj_idxs.to(device=dev, dtype=torch.int64, non_blocking=True)
-    on, od = expert_outs.stride()
-    nn, nd = next_r.stride()
+    # 寄存器内完成 silu(gate) * up
+    # silu(x) = x * sigmoid(x)
+    sig = 1. / (1. + tl.exp(-acc_gate))
+    out = acc_up * (acc_gate * sig)
 
-    grid = (N, (D + block_d - 1) // block_d)
-    with torch.cuda.device(dev):
-        moe_weight_scatter_add_kernel[grid](
-            expert_outs, wei, idx, next_r,
-            N, D,
-            on, od,
-            nn, nd,
-            BLOCK_D=block_d,
-            num_warps=4 if block_d <= 128 else 8,
-            num_stages=2,
-        )
+    y_ptrs = y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    tl.store(y_ptrs, out, mask=m_mask[:, None] & n_mask[None, :])
 
+def MLP_fused(
+    x: torch.Tensor,            # [M, K]
+    w_gate_up: torch.Tensor,    # [K, 2I] = [W_gate | W_up]
+    block_m=128, block_n=128, block_k=32,
+    num_warps=4, num_stages=2,
+) -> torch.Tensor:
+    assert x.ndim == 2 and w_gate_up.ndim == 2
+    M, K = x.shape
+    K2, twoI = w_gate_up.shape
+    assert K2 == K and twoI % 2 == 0
+    I = twoI // 2
 
-################################
-###### 下面是原本 Merlin #########
-################################
+    x_c = x.contiguous()
+    w_c = w_gate_up.contiguous()
+
+    y = torch.empty((M, I), device=x.device, dtype=torch.float32)
+
+    grid = (triton.cdiv(M, block_m), triton.cdiv(I, block_n))
+    MLP_fused_kernel[grid](
+        x_c, w_c, y,
+        M, K, I,
+        x_c.stride(0), x_c.stride(1),
+        w_c.stride(0), w_c.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return y.to(x.dtype)
+
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -509,8 +523,7 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
-        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
-        hidden_states = nn.functional.silu(gate_states) * up_states
+        hidden_states = fused_silu_times_up(x, w_gate_up)
         return hidden_states @ w_down
 
 
@@ -530,7 +543,6 @@ class MoeLayer(nn.Module):
         self.pinned_offsets = torch.zeros(
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
-        self.tmp_expert_outs = None
 
     def prep_ins(
         self, x: torch.Tensor
@@ -558,33 +570,26 @@ class MoeLayer(nn.Module):
         self.pinned_offsets.copy_(offsets)
         expert_offsets = self.pinned_offsets.tolist()
 
-        Ntot = int(offsets[-1].item())
-        D = next_r.shape[1]
-        if (self.tmp_expert_outs is None or
-            self.tmp_expert_outs.shape[0] < Ntot or
-            self.tmp_expert_outs.shape[1] != D or
-            self.tmp_expert_outs.dtype != next_r.dtype or
-            self.tmp_expert_outs.device != next_r.device):
-            self.tmp_expert_outs = next_r.new_empty((Ntot, D))
-        expert_outs = self.tmp_expert_outs[:Ntot]  # view 切片
-
-
+        expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
             l = expert_offsets[ei]
             r = expert_offsets[ei + 1]
             if l == r:
                 continue
-            expert_outs[l:r] = self.experts.forward(
-                self.glob_li, ei, sorted_x[l:r]
+            expert_outs.append(
+                self.experts.forward(
+                    self.glob_li,
+                    ei,
+                    sorted_x[l:r],
+                )
             )
 
-        # 4) 一次 Triton kernel：乘权重 + scatter add 回 next_r
-        moe_weight_scatter_add(
-            expert_outs,
-            topk_weight[:Ntot],   # [Ntot,1] or [Ntot]
-            adj_idxs[:Ntot].contiguous(),  # int64
-            next_r,                          # in-place 累加
-        )
+        if len(expert_outs):
+            l = expert_offsets[self.first_expert]
+            r = expert_offsets[self.last_expert + 1]
+            expert_outs = torch.cat(expert_outs)
+            expert_outs.mul_(topk_weight[l:r])
+            next_r.index_add_(0, adj_idxs[l:r], expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
@@ -1546,4 +1551,3 @@ if __name__ == "__main__":
     )
 
     # nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --gpu-metrics-devices=all --gpuctxsw=true torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --master-addr=10.10.10.1 --master-port=9091 graph_attn_gate.py
-
