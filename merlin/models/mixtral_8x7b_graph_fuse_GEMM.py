@@ -354,10 +354,6 @@ def MLP_fused(
     num_warps=4, num_stages=2,
 ) -> torch.Tensor:
     # debug devices/dtypes/contiguity for kernel launch
-    dev = w_gate_up.device
-    if x.device != dev:
-        x = x.to(dev, non_blocking=True)
-    torch.cuda.set_device(dev)  # ✅ 确保 Triton 用同一张卡的流
     x = x.contiguous()
     w_gate_up = w_gate_up.contiguous()
     try:
@@ -538,7 +534,6 @@ class Experts:
         self.ws: dict[str, torch.Tensor] = ws
 
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
-        assert x.is_cuda, f"Experts.forward got CPU x (li={li}, ei={ei})"
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
         hidden_states = MLP_fused(x, w_gate_up)
@@ -590,8 +585,8 @@ class MoeLayer(nn.Module):
 
         expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
-            l = int(expert_offsets[ei].item())
-            r = int(expert_offsets[ei + 1].item())
+            l = expert_offsets[ei]
+            r = expert_offsets[ei + 1]
             if l == r:
                 continue
 
