@@ -353,6 +353,15 @@ def MLP_fused(
     block_m=128, block_n=128, block_k=32,
     num_warps=4, num_stages=2,
 ) -> torch.Tensor:
+    # debug devices/dtypes/contiguity for kernel launch
+    try:
+        print(
+            f"[MLP_fused] x: device={x.device}, dtype={x.dtype}, is_cuda={x.is_cuda}, contiguous={x.is_contiguous()}; "
+            f"w_gate_up: device={w_gate_up.device}, dtype={w_gate_up.dtype}, is_cuda={w_gate_up.is_cuda}, contiguous={w_gate_up.is_contiguous()}",
+            flush=True,
+        )
+    except Exception:
+        pass
     assert x.ndim == 2 and w_gate_up.ndim == 2
     M, K = x.shape
     K2, twoI = w_gate_up.shape
@@ -523,13 +532,6 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
-        dev = w_gate_up.device
-        if x.device != dev:
-            print(f"[WARN] moving x from {x.device} → {dev}")
-            x = x.to(dev, non_blocking=True)
-        x = x.contiguous()
-        w_gate_up = w_gate_up.contiguous()
-        assert x.is_cuda and w_gate_up.is_cuda, "Tensors must be on CUDA"
         hidden_states = MLP_fused(x, w_gate_up)
         return hidden_states @ w_down
 
