@@ -362,6 +362,8 @@ def MLP_fused(
         )
     except Exception:
         pass
+    x = x.contiguous()
+    w_gate_up = w_gate_up.contiguous()
     assert x.ndim == 2 and w_gate_up.ndim == 2
     M, K = x.shape
     K2, twoI = w_gate_up.shape
