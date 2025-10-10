@@ -354,6 +354,8 @@ def MLP_fused(
     num_warps=4, num_stages=2,
 ) -> torch.Tensor:
     # debug devices/dtypes/contiguity for kernel launch
+    x = x.contiguous()
+    w_gate_up = w_gate_up.contiguous()
     try:
         print(
             f"[MLP_fused] x: device={x.device}, dtype={x.dtype}, is_cuda={x.is_cuda}, contiguous={x.is_contiguous()}; "
