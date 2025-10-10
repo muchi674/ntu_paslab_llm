@@ -353,9 +353,11 @@ def MLP_fused(
     block_m=128, block_n=128, block_k=32,
     num_warps=4, num_stages=2,
 ) -> torch.Tensor:
-    # debug devices/dtypes/contiguity for kernel launch
+    # 统一设备/连续性，避免 Triton 看到 CPU 指针或跨设备
+    dev = x.device
     x = x.contiguous()
     w_gate_up = w_gate_up.contiguous()
+
     assert x.ndim == 2 and w_gate_up.ndim == 2
     M, K = x.shape
     K2, twoI = w_gate_up.shape
@@ -365,7 +367,7 @@ def MLP_fused(
     x_c = x.contiguous()
     w_c = w_gate_up.contiguous()
 
-    y = torch.empty((M, I), device=x.device, dtype=torch.float32)
+    y = torch.empty((M, I), device=dev, dtype=torch.float32)
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(I, block_n))
     with torch.cuda.device(dev):
