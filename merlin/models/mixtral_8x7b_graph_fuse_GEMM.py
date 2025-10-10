@@ -293,127 +293,94 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
+import triton
+import triton.language as tl
+import torch
+
+
 @triton.jit
-def _topk_softmax_smallE_kernel(
-    logits_ptr,          # [M, E]
-    out_val_ptr,         # [M, K]
-    out_idx_ptr,         # [M, K] (int64)
-    M, E, K,
-    stride_lm, stride_le,
+def fused_gate_topk_softmax_kernel(
+    X, W, out_val, out_idx,
+    M, K, E, K_TOP,
+    stride_xm, stride_xk,
+    stride_wk, stride_we,
     stride_om, stride_ok,
-    BLOCK_E: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)           # one program per row
+    pid = tl.program_id(0)  # 一个 block = 一行 token
     row = pid
-    # bounds
     if row >= M:
         return
 
-    # ---- 读一行 logits，并转成 fp32 计算 ----
-    offs_e = tl.arange(0, BLOCK_E)
-    vals = tl.zeros([BLOCK_E], dtype=tl.float32)
-    idxs = tl.zeros([BLOCK_E], dtype=tl.int32)
-    # 按块加载；E 往往很小（8/16/32/64），通常一次就读完
-    acc = tl.zeros([E], dtype=tl.float32)  # 备用：若 E > BLOCK_E，可以改为流式读；此处简单实现
-    # 读取全行
-    for start in range(0, E, BLOCK_E):
-        mask = (offs_e + start) < E
-        v = tl.load(
-            logits_ptr + row * stride_lm + (offs_e + start) * stride_le,
-            mask=mask,
-            other=-float("inf"),
-        )
-        v = v.to(tl.float32)
-        # 写进 acc
-        # 注意：acc 是长度为 E 的一维向量；用逐元素写
-        # 这里用 scatter，Triton 当前不支持直接 variable indices scatter，只能分支处理
-        # 简化：BLOCK_E 取 >= E，避免多段；否则可改成 while + tl.store 子片段。
-        if start == 0:
-            vals = v
-            idxs = (offs_e + start).to(tl.int32)
-        else:
-            # 合并到 vals/idxs：这里为了简单，假设 E <= BLOCK_E（Mixtral 的 E=8 满足）
-            pass
-
-    # 如果 E <= BLOCK_E，vals/idxs 即整行
-    # ---- 线性扫描维护 K 个槽位（降序）----
-    # 初始为 -inf 和 -1
-    topv = tl.full([16], -float("inf"), tl.float32)   # 支持 K<=16
+    # 初始化 top-K buffer（FP32）
+    topv = tl.full([16], -float("inf"), tl.float32)  # 支持 K_TOP ≤ 16
     topi = tl.full([16], -1, tl.int32)
 
-    # 只用到前 K 个槽位，后面不访问
-    # 逐元素扫描 vals
-    for j in range(0, E):
-        v = vals[j]
-        i = idxs[j]
-        # 插入到有序 top-K（降序）
-        # 与槽位比较，从大到小“冒泡”插入
-        pos = K - 1
-        # 如果比最后一名还小，直接丢弃
-        if v <= topv[pos]:
-            # 但如果初始是 -inf，会进入下面循环
-            # 用 while 将 v 插入到合适位置
-            pass
-        # 向上挪动
-        while (pos > 0) & (v > topv[pos - 1]):
-            topv[pos] = topv[pos - 1]
-            topi[pos] = topi[pos - 1]
-            pos = pos - 1
-        # 放入最终位置
-        if v > topv[pos]:
-            topv[pos] = v
-            topi[pos] = i
-        else:
-            # 如果 v <= topv[pos] 但该位置还没填（-inf），也要写入
-            if topi[pos] < 0:
-                topv[pos] = v
-                topi[pos] = i
+    # 循环 over experts (E)
+    for e in range(E):
+        acc = 0.0
+        # tile over hidden dim
+        for k_off in range(0, K, BLOCK_K):
+            k_idx = tl.arange(0, BLOCK_K)
+            mask = k_idx + k_off < K
+            x_tile = tl.load(X + row * stride_xm + (k_idx + k_off) * stride_xk, mask=mask, other=0.0)
+            w_tile = tl.load(W + (k_idx + k_off) * stride_wk + e * stride_we, mask=mask, other=0.0)
+            acc += tl.sum(x_tile * w_tile, axis=0)
 
-    # ---- 对 top-K 做 softmax（fp32 计算）----
-    # 只取前 K 项
-    # 减最大值防溢出
+        # 插入到 top-K 中（降序）
+        v = acc
+        pos = K_TOP - 1
+        if v > topv[pos]:
+            while (pos > 0) & (v > topv[pos - 1]):
+                topv[pos] = topv[pos - 1]
+                topi[pos] = topi[pos - 1]
+                pos -= 1
+            topv[pos] = v
+            topi[pos] = e
+
+    # softmax 归一化（FP32）
     maxv = -float("inf")
-    for t in range(0, K):
+    for t in range(K_TOP):
         maxv = tl.maximum(maxv, topv[t])
     sumexp = 0.0
-    for t in range(0, K):
+    for t in range(K_TOP):
         sumexp += tl.exp(topv[t] - maxv)
-    # 归一化
-    for t in range(0, K):
+    for t in range(K_TOP):
         sm = tl.exp(topv[t] - maxv) / sumexp
-        # 写回
-        tl.store(out_val_ptr + row * stride_om + t * stride_ok, sm)
-        tl.store(out_idx_ptr + row * stride_om + t * stride_ok, topi[t].to(tl.int64))
+        tl.store(out_val + row * stride_om + t * stride_ok, sm)
+        tl.store(out_idx + row * stride_om + t * stride_ok, topi[t].to(tl.int64))
 
 
-def triton_topk_softmax_smallE(
-    gate_logits: torch.Tensor, k: int, block_e: int = 64
-):
+def fused_gate_topk_softmax(x: torch.Tensor, w_gate: torch.Tensor, k: int):
     """
-    gate_logits: [M, E] (bf16/fp16/fp32), E 小(例如 8/16/32/64)
-    返回: (topk_vals [M,k] same dtype as input, topk_idx [M,k] int64)
+    完全融合版：
+    x: [M,K]   (bf16/fp16/fp32)
+    w_gate: [K,E]
+    k: top-k
     """
-    assert gate_logits.ndim == 2
-    M, E = gate_logits.shape
-    assert k <= 16, "K too large for this simple kernel"
-    assert E <= block_e, "For simplicity, set BLOCK_E >= E (e.g., 64 when E<=64)"
+    assert x.dim() == 2 and w_gate.dim() == 2
+    M, K = x.shape
+    K2, E = w_gate.shape
+    assert K == K2
+    assert k <= 16
 
-    gl = gate_logits.contiguous()
-    # 输出：用 fp32 计算，再转回输入 dtype
-    out_val = torch.empty((M, k), device=gl.device, dtype=torch.float32)
-    out_idx = torch.empty((M, k), device=gl.device, dtype=torch.int64)
+    x = x.contiguous()
+    w_gate = w_gate.contiguous()
+    out_val = torch.empty((M, k), device=x.device, dtype=torch.float32)
+    out_idx = torch.empty((M, k), device=x.device, dtype=torch.int64)
 
     grid = (M,)
-    _topk_softmax_smallE_kernel[grid](
-        gl, out_val, out_idx,
-        M, E, k,
-        gl.stride(0), gl.stride(1),
+    fused_gate_topk_softmax_kernel[grid](
+        x, w_gate, out_val, out_idx,
+        M, K, E, k,
+        x.stride(0), x.stride(1),
+        w_gate.stride(0), w_gate.stride(1),
         out_val.stride(0), out_val.stride(1),
-        BLOCK_E=block_e,
-        num_warps=2,
+        BLOCK_K=64,
+        num_warps=4,
         num_stages=1,
     )
-    return out_val.to(gl.dtype), out_idx
+    return out_val.to(x.dtype), out_idx
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -587,9 +554,8 @@ class MoeLayer(nn.Module):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)  # 仍用 cuBLAS (最快)
-        topk_weight, topk_ids = triton_topk_softmax_smallE(
-            gate_logits, k=self.num_experts_per_tok, block_e=8  # E<=64 即可
+        topk_weight, topk_ids = fused_gate_topk_softmax(
+            x, self.gate.weight.T, self.num_experts_per_tok
         )
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
