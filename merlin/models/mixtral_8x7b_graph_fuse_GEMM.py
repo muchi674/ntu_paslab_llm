@@ -358,8 +358,8 @@ def MLP_fused(
     w_gate_up = w_gate_up.contiguous()
     try:
         print(
-            f"[MLP_fused] x: device={x.device}, dtype={x.dtype}, is_cuda={x.is_cuda}, contiguous={x.is_contiguous()}; "
-            f"w_gate_up: device={w_gate_up.device}, dtype={w_gate_up.dtype}, is_cuda={w_gate_up.is_cuda}, contiguous={w_gate_up.is_contiguous()}",
+            f"[MLP_fused] x: device={x.device}, dtype={x.dtype}, is_cuda={torch.cuda.current_device()}, contiguous={x.is_contiguous()}; "
+            f"w_gate_up: device={w_gate_up.device}, dtype={w_gate_up.dtype}, is_cuda={torch.cuda.current_device()}, contiguous={w_gate_up.is_contiguous()}",
             flush=True,
         )
     except Exception:
