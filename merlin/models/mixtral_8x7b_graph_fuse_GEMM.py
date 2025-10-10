@@ -293,89 +293,125 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
+
 @triton.jit
-def fused_gate_topk_softmax_kernel(
-    X, W, out_val, out_idx,
-    M, K, E, K_TOP,
+def fused_gate_top2_softmax_kernel(
+    X, W, Bias, out_val, out_idx,
+    M, K, E,
     stride_xm, stride_xk,
     stride_wk, stride_we,
     stride_om, stride_ok,
+    has_bias: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)  # 一个 block = 一行 token
-    row = pid
+    # 一个程序处理一行 token（x 的一行）
+    row = tl.program_id(0)
     if row >= M:
         return
 
-    # 初始化 top-K buffer（FP32）
-    topv = tl.full([16], -float("inf"), tl.float32)  # 支持 K_TOP ≤ 16
-    topi = tl.full([16], -1, tl.int32)
+    # Top-2 标量寄存器（fp32）
+    best1 = tl.full((), -float("inf"), tl.float32)
+    best2 = tl.full((), -float("inf"), tl.float32)
+    idx1  = tl.full((), -1, tl.int32)
+    idx2  = tl.full((), -1, tl.int32)
 
-    # 循环 over experts (E)
-    for e in range(E):
-        acc = 0.0
-        # tile over hidden dim
+    # 遍历所有 experts 列 e，逐列算 acc = dot(x_row, W[:, e]) (+ bias[e])
+    for e in range(0, E):
+        acc = tl.full((), 0., tl.float32)
+
+        # 分块遍历 K 维度，X/W 以各自 dtype 读，转 fp32 乘加
         for k_off in range(0, K, BLOCK_K):
             k_idx = tl.arange(0, BLOCK_K)
-            mask = k_idx + k_off < K
-            x_tile = tl.load(X + row * stride_xm + (k_idx + k_off) * stride_xk, mask=mask, other=0.0)
-            w_tile = tl.load(W + (k_idx + k_off) * stride_wk + e * stride_we, mask=mask, other=0.0)
+            mask = (k_idx + k_off) < K
+            x_tile = tl.load(X + row * stride_xm + (k_idx + k_off) * stride_xk,
+                             mask=mask, other=0.).to(tl.float32)
+            w_tile = tl.load(W + (k_idx + k_off) * stride_wk + e * stride_we,
+                             mask=mask, other=0.).to(tl.float32)
             acc += tl.sum(x_tile * w_tile, axis=0)
 
-        # 插入到 top-K 中（降序）
-        v = acc
-        pos = K_TOP - 1
-        if v > topv[pos]:
-            while (pos > 0) & (v > topv[pos - 1]):
-                topv[pos] = topv[pos - 1]
-                topi[pos] = topi[pos - 1]
-                pos -= 1
-            topv[pos] = v
-            topi[pos] = e
+        if has_bias:
+            acc += tl.load(Bias + e).to(tl.float32)
 
-    # softmax 归一化（FP32）
-    maxv = -float("inf")
-    for t in range(K_TOP):
-        maxv = tl.maximum(maxv, topv[t])
-    sumexp = 0.0
-    for t in range(K_TOP):
-        sumexp += tl.exp(topv[t] - maxv)
-    for t in range(K_TOP):
-        sm = tl.exp(topv[t] - maxv) / sumexp
-        tl.store(out_val + row * stride_om + t * stride_ok, sm)
-        tl.store(out_idx + row * stride_om + t * stride_ok, topi[t].to(tl.int64))
+        # 维护 top-2（降序），全标量，不用数组、不用动态索引
+        if acc > best1:
+            best2 = best1
+            idx2  = idx1
+            best1 = acc
+            idx1  = e
+        elif acc > best2:
+            best2 = acc
+            idx2  = e
+
+    # 对 top-2 做 softmax（fp32），再写回
+    m = tl.maximum(best1, best2)
+    e1 = tl.exp(best1 - m)
+    e2 = tl.exp(best2 - m)
+    den = e1 + e2
+    p1 = e1 / den
+    p2 = e2 / den
+
+    # row 输出位置
+    base_o = row * stride_om
+    tl.store(out_val + base_o + 0 * stride_ok, p1)
+    tl.store(out_val + base_o + 1 * stride_ok, p2)
+    tl.store(out_idx + base_o + 0 * stride_ok, idx1.to(tl.int64))
+    tl.store(out_idx + base_o + 1 * stride_ok, idx2.to(tl.int64))
 
 
-def fused_gate_topk_softmax(x: torch.Tensor, w_gate: torch.Tensor, k: int):
+def fused_gate_topk_softmax(x: torch.Tensor,
+                            w_gate: torch.Tensor,
+                            k: int,
+                            bias: torch.Tensor | None = None,
+                            block_k: int = 128):
     """
-    完全融合版：
-    x: [M,K]   (bf16/fp16/fp32)
-    w_gate: [K,E]
-    k: top-k
+    三合一 (GEMM + TopK + Softmax) — K=2 版本。
+    x:      [M, K]   (bf16/fp16/fp32)
+    w_gate: [K, E]   (bf16/fp16/fp32)  ← 注意是转置后的权重 self.gate.weight.T
+    k: 只能为 2（Mixtral 默认 top-2）
+    bias:   [E] 或 None
+    返回: (topk_val[M,2] same dtype as x, topk_idx[M,2] int64)
     """
-    assert x.dim() == 2 and w_gate.dim() == 2
+    assert x.ndim == 2 and w_gate.ndim == 2
+    assert k == 2, "当前实现专为 top-k=2，若需通用 K，请说一声我给你扩展成 K<=4 的无动态索引版本"
     M, K = x.shape
     K2, E = w_gate.shape
-    assert K == K2
-    assert k <= 16
+    assert K2 == K
+
+    dev = w_gate.device
+    if x.device != dev:
+        x = x.to(dev, non_blocking=True)
+    if bias is not None and bias.device != dev:
+        bias = bias.to(dev, non_blocking=True)
 
     x = x.contiguous()
     w_gate = w_gate.contiguous()
-    out_val = torch.empty((M, k), device=x.device, dtype=torch.float32)
-    out_idx = torch.empty((M, k), device=x.device, dtype=torch.int64)
+    if bias is None:
+        bias = torch.empty(1, device=dev, dtype=w_gate.dtype)  # 占位，不访问
+        has_bias = True if False else False
+    else:
+        has_bias = True
+
+    # 输出先用 fp32，再 cast 回输入 dtype（与 PyTorch 行为对齐）
+    out_val = torch.empty((M, 2), device=dev, dtype=torch.float32)
+    out_idx = torch.empty((M, 2), device=dev, dtype=torch.int64)
 
     grid = (M,)
-    fused_gate_topk_softmax_kernel[grid](
-        x, w_gate, out_val, out_idx,
-        M, K, E, k,
+    # 确保当前 CUDA 上下文与张量设备一致（多进程/多卡很重要）
+    torch.cuda.set_device(dev)
+
+    fused_gate_top2_softmax_kernel[grid](
+        x, w_gate, bias, out_val, out_idx,
+        M, K, E,
         x.stride(0), x.stride(1),
         w_gate.stride(0), w_gate.stride(1),
         out_val.stride(0), out_val.stride(1),
-        BLOCK_K=64,
+        has_bias=has_bias,
+        BLOCK_K=block_k,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
     return out_val.to(x.dtype), out_idx
+
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -550,7 +586,11 @@ class MoeLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         topk_weight, topk_ids = fused_gate_topk_softmax(
-            x, self.gate.weight.T, self.num_experts_per_tok
+            x,
+            self.gate.weight.T,                     # 注意：传 W^T，shape [K,E]
+            k=self.num_experts_per_tok,            # 这里应为 2
+            bias=(self.gate.bias if hasattr(self.gate, "bias") and self.gate.bias is not None else None),
+            block_k=128
         )
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
