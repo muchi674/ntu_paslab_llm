@@ -523,6 +523,7 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
+        x = x.to(w_gate_up.device, non_blocking=True)
         hidden_states = MLP_fused(x, w_gate_up)
         return hidden_states @ w_down
 
@@ -567,8 +568,8 @@ class MoeLayer(nn.Module):
         adj_idxs: torch.Tensor,
         next_r: torch.Tensor,
     ) -> torch.Tensor:
-        device = sorted_x.device
-        expert_offsets = offsets.to(device=device, non_blocking=True)
+        self.pinned_offsets.copy_(offsets)
+        expert_offsets = self.pinned_offsets.tolist()
 
         expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
