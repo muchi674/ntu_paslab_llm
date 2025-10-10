@@ -523,7 +523,13 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
-        x = x.to(w_gate_up.device, non_blocking=True)
+        dev = w_gate_up.device
+        if x.device != dev:
+            print(f"[WARN] moving x from {x.device} → {dev}")
+            x = x.to(dev, non_blocking=True)
+        x = x.contiguous()
+        w_gate_up = w_gate_up.contiguous()
+        assert x.is_cuda and w_gate_up.is_cuda, "Tensors must be on CUDA"
         hidden_states = MLP_fused(x, w_gate_up)
         return hidden_states @ w_down
 
