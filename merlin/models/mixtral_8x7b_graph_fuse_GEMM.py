@@ -319,12 +319,14 @@ def silu_mul_fused_kernel(
 
     gate = tl.load(gate_tile, mask=mask_m[:, None] & mask_n[None, :], other=0.)
     up   = tl.load(up_tile,   mask=mask_m[:, None] & mask_n[None, :], other=0.)
+    gate_f32 = gate.to(tl.float32)
+    up_f32   = up.to(tl.float32)    
 
-    sig = 1. / (1. + tl.exp(-gate))
-    silu = gate * sig
-    out = silu * up
+    sig  = 1.0 / (1.0 + tl.exp(-gate_f32))
+    silu = gate_f32 * sig
+    out  = silu * up_f32
 
-    tl.store(out_tile, out, mask=mask_m[:, None] & mask_n[None, :])
+    tl.store(out_tile, out.to(gate.dtype), mask=mask_m[:, None] & mask_n[None, :])
 
 def silu_mul_fused(gate_states: torch.Tensor, up_states: torch.Tensor) -> torch.Tensor:
     """
