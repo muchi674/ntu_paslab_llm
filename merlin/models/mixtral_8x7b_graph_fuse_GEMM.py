@@ -292,67 +292,7 @@ def repeat_kv_fused(keys: torch.Tensor,
     )
     return k_out, v_out
 
-################################
-# 下面是 silu_mul 的 kernel fuse
-################################
-@triton.jit
-def silu_mul_fused_kernel(
-    gate_ptr, up_ptr, out_ptr,
-    M, N,
-    stride_gm, stride_gn,
-    stride_um, stride_un,
-    stride_om, stride_on,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-
-    gate_tile = gate_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
-    up_tile   = up_ptr   + offs_m[:, None] * stride_um + offs_n[None, :] * stride_un
-    out_tile  = out_ptr  + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-
-    gate = tl.load(gate_tile, mask=mask_m[:, None] & mask_n[None, :], other=0.)
-    up   = tl.load(up_tile,   mask=mask_m[:, None] & mask_n[None, :], other=0.)
-    gate_f32 = gate.to(tl.float32)
-    up_f32   = up.to(tl.float32)    
-
-    sig  = 1.0 / (1.0 + tl.exp(-gate_f32))
-    silu = gate_f32 * sig
-    out  = silu * up_f32
-
-    tl.store(out_tile, out.to(gate.dtype), mask=mask_m[:, None] & mask_n[None, :])
-
-def silu_mul_fused(gate_states: torch.Tensor, up_states: torch.Tensor) -> torch.Tensor:
-    """
-    Compute hidden_states = silu(gate_states) * up_states
-    Both inputs: [M, I], same shape/dtype/device.
-    """
-    assert gate_states.shape == up_states.shape
-    assert gate_states.is_cuda and up_states.is_cuda
-
-    M, N = gate_states.shape
-    out = torch.empty_like(gate_states, dtype=torch.float32)  # accumulate in fp32
-    dev = gate_states.device
-    grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
-
-    with torch.cuda.device(dev):
-        silu_mul_fused_kernel[grid](
-            gate_states, up_states, out,
-            M, N,
-            gate_states.stride(0), gate_states.stride(1),
-            up_states.stride(0), up_states.stride(1),
-            out.stride(0), out.stride(1),
-            BLOCK_M=128, BLOCK_N=128,
-            num_warps=4,
-        )
-
-    return out.to(gate_states.dtype)
 
 
 def get_json(file_path: Path) -> dict:
@@ -502,7 +442,7 @@ class Experts:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
         gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
-        hidden_states = silu_mul_fused(gate_states, up_states)
+        hidden_states = nn.functional.silu(gate_states) * up_states
         return hidden_states @ w_down
 
 
@@ -527,8 +467,8 @@ class MoeLayer(nn.Module):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight, topk_ids = torch._foreach_topk(self.gate(x), k=self.num_experts_per_tok)
+
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
