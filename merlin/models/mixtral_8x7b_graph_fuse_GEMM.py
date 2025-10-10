@@ -567,8 +567,7 @@ class MoeLayer(nn.Module):
         adj_idxs: torch.Tensor,
         next_r: torch.Tensor,
     ) -> torch.Tensor:
-        self.pinned_offsets.copy_(offsets)
-        expert_offsets = self.pinned_offsets.tolist()
+        expert_offsets = offsets.to(x.device, non_blocking=True)
 
         expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
