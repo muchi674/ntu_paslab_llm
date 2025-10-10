@@ -293,7 +293,90 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
+@triton.jit
+def fused_gate_topk_softmax_kernel(
+    x_ptr, w_ptr,
+    out_val_ptr, out_idx_ptr,
+    M, K, E, K_TOP,
+    stride_xm, stride_xk,
+    stride_wk, stride_we,
+    stride_om, stride_ok,
+    BLOCK_E: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # 每个程序处理一个 token (x 的一行)
+    offs_m = pid
+    offs_k = tl.arange(0, K)
+    offs_e = tl.arange(0, BLOCK_E)
 
+    # -----------------------------
+    # Step 1: load input row x
+    # -----------------------------
+    x_row = tl.load(x_ptr + offs_m * stride_xm + offs_k * stride_xk, mask=offs_k < K, other=0.0)
+
+    # -----------------------------
+    # Step 2: compute logits = x @ w
+    # -----------------------------
+    logits = tl.zeros([E], dtype=tl.float32)
+    for off in range(0, E, BLOCK_E):
+        mask_e = offs_e + off < E
+        w_tile = tl.load(
+            w_ptr + (offs_k[:, None] * stride_wk + (offs_e[None, :] + off) * stride_we),
+            mask=mask_e[None, :],
+            other=0.0,
+        )
+        # dot(x, W_tile)
+        part = tl.sum(x_row[:, None] * w_tile, axis=0)
+        logits = tl.where(mask_e, logits + part, logits)
+
+    # -----------------------------
+    # Step 3: top-k selection
+    # -----------------------------
+    topk_val, topk_idx = tl.topk(logits, K_TOP, largest=True)
+
+    # -----------------------------
+    # Step 4: fused softmax (FP32)
+    # -----------------------------
+    max_val = tl.max(topk_val, axis=0)
+    topk_val = topk_val - max_val
+    exp_val = tl.exp(topk_val)
+    sum_exp = tl.sum(exp_val, axis=0)
+    softmax_val = exp_val / sum_exp
+
+    # -----------------------------
+    # Step 5: store
+    # -----------------------------
+    tl.store(out_val_ptr + offs_m * stride_om + tl.arange(0, K_TOP) * stride_ok, softmax_val)
+    tl.store(out_idx_ptr + offs_m * stride_om + tl.arange(0, K_TOP) * stride_ok, topk_idx)
+
+
+def fused_gate_topk_softmax(x: torch.Tensor, w_gate: torch.Tensor, k: int):
+    assert x.dim() == 2 and w_gate.dim() == 2
+    M, K = x.shape
+    K2, E = w_gate.shape
+    assert K == K2
+
+    x = x.contiguous()
+    w_gate = w_gate.contiguous()
+
+    # 输出
+    out_val = torch.empty((M, k), device=x.device, dtype=torch.float32)
+    out_idx = torch.empty((M, k), device=x.device, dtype=torch.int64)
+
+    grid = (M,)
+    fused_gate_topk_softmax_kernel[grid](
+        x, w_gate,
+        out_val, out_idx,
+        M, K, E, k,
+        x.stride(0), x.stride(1),
+        w_gate.stride(0), w_gate.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        BLOCK_E=128,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out_val.to(x.dtype), out_idx
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -467,9 +550,7 @@ class MoeLayer(nn.Module):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        topk_weight, topk_ids = torch._foreach_topk(self.gate(x), k=self.num_experts_per_tok)
-
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        topk_weight, topk_ids = fused_gate_topk_softmax(x, self.gate.weight.T, k=self.num_experts_per_tok)
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)
