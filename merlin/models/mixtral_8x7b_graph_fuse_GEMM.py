@@ -353,22 +353,9 @@ def MLP_fused(
     block_m=128, block_n=128, block_k=32,
     num_warps=4, num_stages=2,
 ) -> torch.Tensor:
-    # 统一设备/连续性，避免 Triton 看到 CPU 指针或跨设备
-    dev = x.device
-    assert x.is_cuda, f"x must be CUDA tensor, got {x.device}"
-    if w_gate_up.device != dev:
-        w_gate_up = w_gate_up.to(device=dev, non_blocking=True)
+    # debug devices/dtypes/contiguity for kernel launch
     x = x.contiguous()
     w_gate_up = w_gate_up.contiguous()
-    # debug（规范化后）
-    try:
-        print(
-            f"[MLP_fused norm] x: device={x.device}, dtype={x.dtype}, is_cuda={x.is_cuda}, contiguous={x.is_contiguous()}; "
-            f"w_gate_up: device={w_gate_up.device}, dtype={w_gate_up.dtype}, is_cuda={w_gate_up.is_cuda}, contiguous={w_gate_up.is_contiguous()}",
-            flush=True,
-        )
-    except Exception:
-        pass
     assert x.ndim == 2 and w_gate_up.ndim == 2
     M, K = x.shape
     K2, twoI = w_gate_up.shape
@@ -378,7 +365,7 @@ def MLP_fused(
     x_c = x.contiguous()
     w_c = w_gate_up.contiguous()
 
-    y = torch.empty((M, I), device=dev, dtype=torch.float32)
+    y = torch.empty((M, I), device=x.device, dtype=torch.float32)
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(I, block_n))
     with torch.cuda.device(dev):
