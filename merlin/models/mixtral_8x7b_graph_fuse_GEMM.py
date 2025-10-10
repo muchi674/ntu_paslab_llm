@@ -293,94 +293,63 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 ################################
-# 下面是 MLP 的 kernel fuse
+# 下面是 silu_mul 的 kernel fuse
 ################################
 @triton.jit
-def MLP_fused_kernel(
-    x_ptr, w_packed_ptr, y_ptr,
-    M, K, I,                          # x:[M,K], w_packed:[K,2I], y:[M,I]
-    stride_xm, stride_xk,
-    stride_wp_k, stride_wp_n,         # packed权重的步幅
-    stride_ym, stride_yn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+def silu_mul_fused_kernel(
+    gate_ptr, up_ptr, out_ptr,
+    M, N,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)     # 覆盖输出列维度 I
+    pid_n = tl.program_id(axis=1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
 
-    m_mask = offs_m < M
-    n_mask = offs_n < I               # 注意：这里只覆盖 I（不是2I）
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-    # 两个累加器：左半( gate ) 与 右半( up )
-    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc_up   = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    gate_tile = gate_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
+    up_tile   = up_ptr   + offs_m[:, None] * stride_um + offs_n[None, :] * stride_un
+    out_tile  = out_ptr  + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
 
-    # tile指针
-    x_tile = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    # gate子块：列偏移 offs_n
-    w_gate_tile = w_packed_ptr + (offs_k[:, None] * stride_wp_k + offs_n[None, :] * stride_wp_n)
-    # up子块：列偏移 offs_n + I
-    w_up_tile = w_packed_ptr + (offs_k[:, None] * stride_wp_k + (offs_n[None, :] + I) * stride_wp_n)
+    gate = tl.load(gate_tile, mask=mask_m[:, None] & mask_n[None, :], other=0.)
+    up   = tl.load(up_tile,   mask=mask_m[:, None] & mask_n[None, :], other=0.)
 
-    # K 循环
-    for _ in range(0, tl.cdiv(K, BLOCK_K)):
-        k_mask = offs_k < K
-        xv  = tl.load(x_tile, mask=m_mask[:, None] & k_mask[None, :], other=0.)
-        wgv = tl.load(w_gate_tile, mask=k_mask[:, None] & n_mask[None, :], other=0.)
-        wuv = tl.load(w_up_tile,   mask=k_mask[:, None] & n_mask[None, :], other=0.)
-        acc_gate += tl.dot(xv, wgv)
-        acc_up   += tl.dot(xv, wuv)
+    sig = 1. / (1. + tl.exp(-gate))
+    silu = gate * sig
+    out = silu * up
 
-        x_tile      += BLOCK_K * stride_xk
-        w_gate_tile += BLOCK_K * stride_wp_k
-        w_up_tile   += BLOCK_K * stride_wp_k
-        offs_k      += BLOCK_K
+    tl.store(out_tile, out, mask=mask_m[:, None] & mask_n[None, :])
 
-    # 寄存器内完成 silu(gate) * up
-    # silu(x) = x * sigmoid(x)
-    sig = 1. / (1. + tl.exp(-acc_gate))
-    out = acc_up * (acc_gate * sig)
+def silu_mul_fused(gate_states: torch.Tensor, up_states: torch.Tensor) -> torch.Tensor:
+    """
+    Compute hidden_states = silu(gate_states) * up_states
+    Both inputs: [M, I], same shape/dtype/device.
+    """
+    assert gate_states.shape == up_states.shape
+    assert gate_states.is_cuda and up_states.is_cuda
 
-    y_ptrs = y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
-    tl.store(y_ptrs, out, mask=m_mask[:, None] & n_mask[None, :])
+    M, N = gate_states.shape
+    out = torch.empty_like(gate_states, dtype=torch.float32)  # accumulate in fp32
 
-def MLP_fused(
-    x: torch.Tensor,            # [M, K]
-    w_gate_up: torch.Tensor,    # [K, 2I] = [W_gate | W_up]
-    block_m=128, block_n=128, block_k=32,
-    num_warps=4, num_stages=2,
-) -> torch.Tensor:
-    # 统一设备/连续性，避免 Triton 看到 CPU 指针或跨设备
-    dev = x.device
-    x = x.contiguous()
-    w_gate_up = w_gate_up.contiguous()
+    grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
 
-    assert x.ndim == 2 and w_gate_up.ndim == 2
-    M, K = x.shape
-    K2, twoI = w_gate_up.shape
-    assert K2 == K and twoI % 2 == 0
-    I = twoI // 2
+    silu_mul_fused_kernel[grid](
+        gate_states, up_states, out,
+        M, N,
+        gate_states.stride(0), gate_states.stride(1),
+        up_states.stride(0), up_states.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128, BLOCK_N=128,
+        num_warps=4,
+    )
 
-    x_c = x.contiguous()
-    w_c = w_gate_up.contiguous()
-
-    y = torch.empty((M, I), device=dev, dtype=torch.float32)
-
-    grid = (triton.cdiv(M, block_m), triton.cdiv(I, block_n))
-    with torch.cuda.device(dev):
-        MLP_fused_kernel[grid](
-            x_c, w_c, y,
-            M, K, I,
-            x_c.stride(0), x_c.stride(1),
-            w_c.stride(0), w_c.stride(1),
-            y.stride(0), y.stride(1),
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-            num_warps=num_warps, num_stages=num_stages,
-        )
-    return y.to(x.dtype)
+    return out.to(gate_states.dtype)
 
 
 def get_json(file_path: Path) -> dict:
@@ -529,7 +498,8 @@ class Experts:
     def forward(self, li: int, ei: int, x: torch.Tensor) -> torch.Tensor:
         w_gate_up: torch.Tensor = self.ws[f"{li}.{ei}.w_gate_up"].T
         w_down: torch.Tensor = self.ws[f"{li}.{ei}.w_down"].T
-        hidden_states = MLP_fused(x, w_gate_up)
+        gate_states, up_states = (x @ w_gate_up).chunk(2, dim=-1)
+        hidden_states = silu_mul_fused(gate_states, up_states)
         return hidden_states @ w_down
 
 
@@ -582,10 +552,13 @@ class MoeLayer(nn.Module):
             r = expert_offsets[ei + 1]
             if l == r:
                 continue
-
-            x_e = sorted_x[l:r]  # 纯 slice，仍在 GPU
-            y_e = self.experts.forward(self.glob_li, ei, x_e)
-            expert_outs.append(y_e)
+            expert_outs.append(
+                self.experts.forward(
+                    self.glob_li,
+                    ei,
+                    sorted_x[l:r],
+                )
+            )
 
         if len(expert_outs):
             l = expert_offsets[self.first_expert]
