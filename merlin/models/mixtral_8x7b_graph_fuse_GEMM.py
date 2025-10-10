@@ -293,11 +293,6 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
-import triton
-import triton.language as tl
-import torch
-
-
 @triton.jit
 def fused_gate_topk_softmax_kernel(
     X, W, out_val, out_idx,
