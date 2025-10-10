@@ -567,8 +567,8 @@ class MoeLayer(nn.Module):
         adj_idxs: torch.Tensor,
         next_r: torch.Tensor,
     ) -> torch.Tensor:
-        self.pinned_offsets.copy_(offsets.cpu(), non_blocking=True)
-        expert_offsets = self.pinned_offsets.cuda(non_blocking=True)
+        device = sorted_x.device
+        expert_offsets = offsets.to(device=device, non_blocking=True)
 
         expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
