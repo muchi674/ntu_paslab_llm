@@ -405,14 +405,6 @@ def kv_scatter_fused(xk: torch.Tensor,
 ################################
 # Router GPU 化：统计 + 前缀和 + 稳定散列
 ################################
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
-    ],
-    key=['NK']
-)
 @triton.jit
 def hist_counts_kernel(
     IDS_ptr,           # [NK] int32
@@ -446,14 +438,6 @@ def counts_to_offsets_kernel(
         tl.store(OFFS_ptr + (e + 1), acc)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 64,  'BLOCK_D': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_D': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_D': 128}, num_warps=8, num_stages=2),
-    ],
-    key=['NK', 'D']
-)
 @triton.jit
 def scatter_by_expert_kernel(
     X_ptr,                 # [N, D]
