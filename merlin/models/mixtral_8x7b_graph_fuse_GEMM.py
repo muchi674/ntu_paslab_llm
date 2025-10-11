@@ -463,90 +463,63 @@ class MoeLayer(nn.Module):
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
-    def prep_ins(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
-        cnts.scatter_(1, topk_ids, 1)
-        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
-        idxs = topk_ids.flatten().argsort()
-        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
-        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
+    def prep_ins(self, x: torch.Tensor):
+        # 1) gate + top-k + softmax
+        gate_logits = self.gate(x)  # [N,E]
+        topv, topi = torch.topk(gate_logits, self.num_experts_per_tok, dim=1)  # [N,k]
+        topw = F.softmax(topv, dim=1, dtype=torch.float).to(x.dtype).reshape(-1, 1)  # [N*k,1]
+
+        # 2) offsets：bincount + cumsum
+        flat_ids = topi.reshape(-1)                                   # [N*k]
+        counts  = torch.bincount(flat_ids, minlength=self.num_experts)  # [E]
+        offsets = torch.empty(self.num_experts + 1, dtype=torch.long, device=x.device)
+        offsets[0] = 0
+        torch.cumsum(counts, dim=0, out=offsets[1:])                  # [E+1]
+
+        # 3) 复合键计数排序（按 expert 分组 + 保留 token 次序）
+        N, k = topi.shape
+        tok_ids   = torch.repeat_interleave(torch.arange(N, device=x.device), k)  # [N*k]
+        composite = flat_ids * N + tok_ids                                        # [N*k]
+        sort_idx  = torch.argsort(composite)                                      # [N*k]
+
+        adj_idxs    = tok_ids[sort_idx]        # [N*k]  → 用来把 x 排到 expert 分组顺序
+        sorted_x    = x[adj_idxs]              # [N*k, D_model]
+        topk_weight = topw[sort_idx]           # [N*k, 1] 与 sorted_x 对齐
+
+        return sorted_x, topk_weight, offsets, adj_idxs
+
 
     def experts_infer(
         self,
-        sorted_x: torch.Tensor,    # [T, D_model]
-        topk_weight: torch.Tensor, # [T, 1]
-        offsets: torch.Tensor,     # [E+1]
-        adj_idxs: torch.Tensor,    # [T]
-        next_r: torch.Tensor,      # [N, D_model]
+        sorted_x: torch.Tensor,
+        topk_weight: torch.Tensor,
+        offsets: torch.Tensor,
+        adj_idxs: torch.Tensor,
+        next_r: torch.Tensor,
     ) -> torch.Tensor:
-        device = sorted_x.device
-        dtype  = sorted_x.dtype
-        E      = self.num_experts
+        self.pinned_offsets.copy_(offsets)
+        expert_offsets = self.pinned_offsets.tolist()
 
-        # --- 从某个 expert 的 w_down 推导形状 ---
-        sample_w_down_raw = self.experts.ws[f"{self.glob_li}.{self.first_expert}.w_down"].to(device)
-        D_model, I = sample_w_down_raw.shape
-        W_down = torch.stack([
-            self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device).T   # [I, D_model]
-            for e in range(self.first_expert, self.last_expert + 1)
-        ], dim=0)  # [E_used, I, D_model]
-        E_used = W_down.shape[0]
-
-        # --- 计算每个 expert 的段长度 ---
-        lens = (offsets[1:] - offsets[:-1])
-        lens_used = lens[self.first_expert:self.last_expert+1]
-        if torch.all(lens_used == 0):
-            return next_r
-
-        max_len = int(lens_used.max().item())
-
-        # --- 预分配批输入 ---
-        hidden_pad = torch.zeros((E_used, max_len, I), device=device, dtype=dtype)
-        w_pad      = torch.zeros((E_used, max_len, 1), device=device, dtype=dtype)
-
-        # --- 计算每个 expert 的中间激活（展开 MLP_fused）---
-        e_base = self.first_expert
+        expert_outs = []
         for ei in range(self.first_expert, self.last_expert + 1):
-            l = int(offsets[ei].item())
-            r = int(offsets[ei + 1].item())
+            l = expert_offsets[ei]
+            r = expert_offsets[ei + 1]
             if l == r:
                 continue
-            n = r - l
-            x_slice = sorted_x[l:r]  # [n, D_model]
+            expert_outs.append(
+                self.experts.forward(
+                    self.glob_li,
+                    ei,
+                    sorted_x[l:r],
+                )
+            )
 
-            # 取 w_gate_up 并直接展开激活： (x @ w_gate_up).chunk(2)
-            w_gate_up_raw = self.experts.ws[f"{self.glob_li}.{ei}.w_gate_up"].to(device).T
-            gate_up = x_slice @ w_gate_up_raw  # [n, 2I]
-            gate_states, up_states = gate_up.chunk(2, dim=-1)
-            hidden = F.silu(gate_states) * up_states  # [n, I]
-
-            e_idx = ei - e_base
-            hidden_pad[e_idx, :n, :] = hidden
-            w_pad[e_idx, :n, :] = topk_weight[l:r]
-
-        # --- batched bmm 下投影 ---
-        out_pad = torch.bmm(hidden_pad, W_down)  # [E_used, max_len, D_model]
-        out_pad.mul_(w_pad)
-
-        # --- 去 padding 并聚合 ---
-        flat_out = out_pad.reshape(E_used * max_len, D_model)
-        rng = torch.arange(max_len, device=device)[None, :].expand(E_used, max_len)
-        valid = rng < lens_used.view(-1, 1)
-        flat_out = flat_out[valid.reshape(-1)]
-        # 仅聚合本层本卡专家对应的区间，确保与 flat_out 行数一致
-        l0 = int(offsets[self.first_expert].item())
-        r1 = int(offsets[self.last_expert + 1].item())
-        next_r.index_add_(0, adj_idxs[l0:r1], flat_out)
-        return next_r
-
-
+        if len(expert_outs):
+            l = expert_offsets[self.first_expert]
+            r = expert_offsets[self.last_expert + 1]
+            expert_outs = torch.cat(expert_outs)
+            expert_outs.mul_(topk_weight[l:r])
+            next_r.index_add_(0, adj_idxs[l:r], expert_outs)
 
 
 class RMSNorm(torch.nn.Module):
