@@ -293,54 +293,37 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 @triton.jit
-def count_expert_tokens_kernel(
-    topk_ids_ptr,             # [N, K]
-    expert_counts_ptr,        # [E]
-    N, K, E,
-    stride_nk,
+def count_expert_tokens_k2_kernel(
+    topk_ids_ptr, expert_counts_ptr,
+    N, E, stride_row,
 ):
     pid = tl.program_id(0)
     if pid >= N:
         return
 
-    # 每个 token 的 top-k expert id
-    offs = tl.arange(0, K)
-    mask = offs < K
-    topk = tl.load(topk_ids_ptr + pid * stride_nk + offs, mask=mask, other=0)
+    base = topk_ids_ptr + pid * stride_row
+    e0 = tl.load(base + 0).to(tl.int32)
+    e1 = tl.load(base + 1).to(tl.int32)
 
-    # 对每个选中的 expert 做原子加
-    for i in range(0, K):
-        e = topk[i]
-        if e < E:
-            tl.atomic_add(expert_counts_ptr + e, 1)
+    if e0 < E:
+        tl.atomic_add(expert_counts_ptr + e0, 1)
+    if e1 < E:
+        tl.atomic_add(expert_counts_ptr + e1, 1)
 
-
-def fused_count_and_offsets(topk_ids: torch.Tensor, num_experts: int):
-    """
-    Triton fused Stage-1:
-    从 topk_ids 直接统计每个 expert 被选中次数。
-    Args:
-        topk_ids: [N, K] int64
-        num_experts: int
-    Returns:
-        offsets: [E+1] int64 (torch)
-    """
+def fused_count_and_offsets_k2(topk_ids: torch.Tensor, num_experts: int):
     N, K = topk_ids.shape
+    assert K == 2
     dev = topk_ids.device
-    topk_ids_i32 = topk_ids.to(torch.int32, non_blocking=True)
-    expert_counts = torch.zeros((num_experts,), device=dev, dtype=torch.int32)
-
+    ids_i32 = topk_ids.contiguous().to(torch.int32)
+    counts = torch.zeros((num_experts,), device=dev, dtype=torch.int32)
     grid = (N,)
-    count_expert_tokens_kernel[grid](
-        topk_ids_i32,
-        expert_counts,
-        N, K, num_experts,
-        topk_ids_i32.stride(0),
+    count_expert_tokens_k2_kernel[grid](
+        ids_i32, counts, N, num_experts, ids_i32.stride(0),
+        num_warps=1, num_stages=1,
     )
-
-    # offsets = [0, cumsum(counts)]
-    offsets = torch.zeros((num_experts + 1,), device=dev, dtype=torch.int64)
-    offsets[1:] = expert_counts.to(torch.int64).cumsum(dim=0)
+    offsets = torch.empty((num_experts + 1,), device=dev, dtype=torch.int64)
+    offsets[0] = 0
+    offsets[1:] = counts.to(torch.int64).cumsum(0)
     return offsets
 
 
@@ -520,7 +503,7 @@ class MoeLayer(nn.Module):
         topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
-        
+
         offsets = fused_count_and_offsets(topk_ids, self.num_experts)
 
         idxs = topk_ids.flatten().argsort()
