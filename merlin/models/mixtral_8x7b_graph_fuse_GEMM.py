@@ -494,7 +494,7 @@ class MoeLayer(nn.Module):
         sample_w_down_raw = self.experts.ws[f"{self.glob_li}.{self.first_expert}.w_down"].to(device)
         D_model, I = sample_w_down_raw.shape
         W_down = torch.stack([
-            self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device).T   # [I, D_model]
+            self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device)   # [I, D_model]
             for e in range(self.first_expert, self.last_expert + 1)
         ], dim=0)  # [E_used, I, D_model]
         E_used = W_down.shape[0]
