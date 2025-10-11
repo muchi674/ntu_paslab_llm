@@ -468,20 +468,14 @@ def scatter_by_expert_kernel(
     toks = (offs_n // KTOP).to(tl.int32)
     pos_in_e = tl.atomic_add(CNT_ptr + ids, 1, mask=valid)
     base_e = tl.load(OFFS_ptr + ids, mask=valid, other=0)
-    next_e = tl.load(OFFS_ptr + (ids + 1), mask=valid & (ids + 1 <= E), other=base_e)
-    len_e = next_e - base_e
     dst = base_e + pos_in_e
 
-    # 额外边界保护（防止非法地址）
-    within_seg = pos_in_e < len_e
-    dst_valid = valid & within_seg & (toks >= 0) & (toks < N) & (dst >= 0) & (dst < NK)
-
     # 写 adj（按有效掩码）
-    tl.store(ADJ_ptr + dst, toks, mask=dst_valid)
+    tl.store(ADJ_ptr + dst, toks, mask=valid)
 
     # 写权重
-    w = tl.load(TOPW_ptr + offs_n * stride_tw_n + 0 * stride_tw_c, mask=dst_valid, other=0.0)
-    tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w, mask=dst_valid)
+    w = tl.load(TOPW_ptr + offs_n * stride_tw_n + 0 * stride_tw_c, mask=valid, other=0.0)
+    tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w, mask=valid)
 
     # 写向量 X[tok,:]（按列块循环）
     for d0 in range(0, D, BLOCK_D):
@@ -489,9 +483,9 @@ def scatter_by_expert_kernel(
         md = offs_d < D
         # 构造 [BLOCK_N, BLOCK_D] 指针
         x_src_ptr = X_ptr + toks[:, None] * stride_xn + offs_d[None, :] * stride_xd
-        x_val = tl.load(x_src_ptr, mask=dst_valid[:, None] & md[None, :], other=0.0)
+        x_val = tl.load(x_src_ptr, mask=valid[:, None] & md[None, :], other=0.0)
         out_ptr = OUT_X_ptr + dst[:, None] * stride_ox_n + offs_d[None, :] * stride_ox_d
-        tl.store(out_ptr, x_val, mask=dst_valid[:, None] & md[None, :])
+        tl.store(out_ptr, x_val, mask=valid[:, None] & md[None, :])
 
 
 def router_hist_and_offsets(flat_ids: torch.Tensor, num_experts: int):
