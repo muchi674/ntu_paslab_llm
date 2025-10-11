@@ -293,6 +293,94 @@ def repeat_kv_fused(keys: torch.Tensor,
     return k_out, v_out
 
 
+################################
+# K/V cache scatter 融合（一次写入）
+################################
+@triton.jit
+def kv_scatter_fused_kernel(
+    XK_ptr, XV_ptr,          # [B, H, T, D]
+    K_dst_ptr, V_dst_ptr,    # [B, H, MaxT, D]
+    STO_ptr,                 # [T] (int64)
+    B, H, T, D,
+    stride_xk_b, stride_xk_h, stride_xk_t, stride_xk_d,
+    stride_xv_b, stride_xv_h, stride_xv_t, stride_xv_d,
+    stride_k_b,  stride_k_h,  stride_k_t,  stride_k_d,
+    stride_v_b,  stride_v_h,  stride_v_t,  stride_v_d,
+    BLOCK_D: tl.constexpr,
+):
+    # grid: (B*H, T, ceil(D/BLOCK_D))
+    bh   = tl.program_id(0)
+    t_ix = tl.program_id(1)
+    db   = tl.program_id(2)
+
+    b_ix = bh // H
+    h_ix = bh % H
+
+    d_start = db * BLOCK_D
+    offs_d  = d_start + tl.arange(0, BLOCK_D)
+    m_d     = offs_d < D
+
+    # 源行指针
+    xk_row = XK_ptr + b_ix*stride_xk_b + h_ix*stride_xk_h + t_ix*stride_xk_t
+    xv_row = XV_ptr + b_ix*stride_xv_b + h_ix*stride_xv_h + t_ix*stride_xv_t
+
+    # 目的行指针（时间维根据 storage_idx[t]）
+    st = tl.load(STO_ptr + t_ix).to(tl.int32)
+    k_row = K_dst_ptr + b_ix*stride_k_b + h_ix*stride_k_h + st*stride_k_t
+    v_row = V_dst_ptr + b_ix*stride_v_b + h_ix*stride_v_h + st*stride_v_t
+
+    kv = tl.load(xk_row + offs_d*stride_xk_d, mask=m_d, other=0.0)
+    vv = tl.load(xv_row + offs_d*stride_xv_d, mask=m_d, other=0.0)
+    tl.store(k_row + offs_d*stride_k_d, kv, mask=m_d)
+    tl.store(v_row + offs_d*stride_v_d, vv, mask=m_d)
+
+
+def kv_scatter_fused(xk: torch.Tensor,
+                     xv: torch.Tensor,
+                     keys_dst: torch.Tensor,
+                     values_dst: torch.Tensor,
+                     storage_idx: torch.Tensor,
+                     block_d: int = 128) -> None:
+    """
+    将 xk/xv 按 storage_idx 一次性写入 K/V cache。
+    xk, xv:      [B, H, T, D]
+    keys_dst:    [B, H, MaxT, D]
+    values_dst:  [B, H, MaxT, D]
+    storage_idx: [T] (long)
+    """
+    assert xk.shape == xv.shape and xk.ndim == 4
+    B, H, T, D = xk.shape
+    assert keys_dst.ndim == 4 and values_dst.ndim == 4
+    assert keys_dst.shape[0] == B and keys_dst.shape[1] == H and keys_dst.shape[-1] == D
+    assert values_dst.shape[0] == B and values_dst.shape[1] == H and values_dst.shape[-1] == D
+    assert storage_idx.numel() == T
+
+    dev = xk.device
+    xk = xk.contiguous()
+    xv = xv.contiguous()
+    keys_dst = keys_dst.contiguous()
+    values_dst = values_dst.contiguous()
+    storage_idx = storage_idx.contiguous()
+
+    sxk_b, sxk_h, sxk_t, sxk_d = xk.stride()
+    sxv_b, sxv_h, sxv_t, sxv_d = xv.stride()
+    sk_b,  sk_h,  sk_t,  sk_d  = keys_dst.stride()
+    sv_b,  sv_h,  sv_t,  sv_d  = values_dst.stride()
+
+    grid = (B * H, T, (D + block_d - 1) // block_d)
+    with torch.cuda.device(dev):
+        kv_scatter_fused_kernel[grid](
+            xk, xv, keys_dst, values_dst, storage_idx,
+            B, H, T, D,
+            sxk_b, sxk_h, sxk_t, sxk_d,
+            sxv_b, sxv_h, sxv_t, sxv_d,
+            sk_b,  sk_h,  sk_t,  sk_d,
+            sv_b,  sv_h,  sv_t,  sv_d,
+            BLOCK_D=block_d,
+            num_warps=4 if block_d <= 128 else 8,
+            num_stages=2,
+        )
+
 
 
 def get_json(file_path: Path) -> dict:
@@ -412,8 +500,12 @@ class Attention(nn.Module):
         
 
         # assumes bsz matches that of cache
-        self.cache[0, self.li].index_copy_(dim=-2, index=storage_idx, source=xk)
-        self.cache[1, self.li].index_copy_(dim=-2, index=storage_idx, source=xv)
+        kv_scatter_fused(
+            xk, xv,
+            self.cache[0, self.li],
+            self.cache[1, self.li],
+            storage_idx,
+        )
         keys = self.cache[0, self.li]
         values = self.cache[1, self.li]
 
@@ -463,31 +555,20 @@ class MoeLayer(nn.Module):
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
-    def prep_ins(self, x: torch.Tensor):
-        # 1) gate + top-k + softmax
-        gate_logits = self.gate(x)  # [N,E]
-        topv, topi = torch.topk(gate_logits, self.num_experts_per_tok, dim=1)  # [N,k]
-        topw = F.softmax(topv, dim=1, dtype=torch.float).to(x.dtype).reshape(-1, 1)  # [N*k,1]
-
-        # 2) offsets：bincount + cumsum
-        flat_ids = topi.reshape(-1)                                   # [N*k]
-        counts  = torch.bincount(flat_ids, minlength=self.num_experts)  # [E]
-        offsets = torch.empty(self.num_experts + 1, dtype=torch.long, device=x.device)
-        offsets[0] = 0
-        torch.cumsum(counts, dim=0, out=offsets[1:])                  # [E+1]
-
-        # 3) 复合键计数排序（按 expert 分组 + 保留 token 次序）
-        N, k = topi.shape
-        tok_ids   = torch.repeat_interleave(torch.arange(N, device=x.device), k)  # [N*k]
-        composite = flat_ids * N + tok_ids                                        # [N*k]
-        sort_idx  = torch.argsort(composite)                                      # [N*k]
-
-        adj_idxs    = tok_ids[sort_idx]        # [N*k]  → 用来把 x 排到 expert 分组顺序
-        sorted_x    = x[adj_idxs]              # [N*k, D_model]
-        topk_weight = topw[sort_idx]           # [N*k, 1] 与 sorted_x 对齐
-
-        return sorted_x, topk_weight, offsets, adj_idxs
-
+    def prep_ins(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
+        gate_logits = self.gate(x)
+        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
+        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
+        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
+        cnts.scatter_(1, topk_ids, 1)
+        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
+        idxs = topk_ids.flatten().argsort()
+        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
+        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
 
     def experts_infer(
         self,
