@@ -292,44 +292,78 @@ def repeat_kv_fused(keys: torch.Tensor,
     )
     return k_out, v_out
 
+
 @triton.jit
-def count_expert_tokens_k2_kernel(
-    topk_ids_ptr, expert_counts_ptr,
-    N, E, stride_row,
+def prefix_sum_offsets_kernel(
+    counts_ptr,      # [E] int32
+    offsets_ptr,     # [E+1] int64
+    E: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    if pid >= N:
+    if pid != 0:
         return
 
-    base = topk_ids_ptr + pid * stride_row
-    e0 = tl.load(base + 0).to(tl.int32)
-    e1 = tl.load(base + 1).to(tl.int32)
+    # allocate shared memory
+    shm = tl.zeros([E + 1], dtype=tl.int64)
 
-    if e0 < E:
-        tl.atomic_add(expert_counts_ptr + e0, 1)
-    if e1 < E:
-        tl.atomic_add(expert_counts_ptr + e1, 1)
+    # load counts
+    offs = tl.arange(0, E)
+    c = tl.load(counts_ptr + offs, mask=offs < E, other=0).to(tl.int64)
+    tl.store(shm + 1 + offs, c)
 
-def fused_count_and_offsets_k2(topk_ids: torch.Tensor, num_experts: int):
-    # topk_ids: [N, 2] int64
+    # -------- up-sweep --------
+    stride = 1
+    while stride < E:
+        offs2 = tl.arange(0, E)
+        cond = (offs2 + 1) % (2 * stride) == 0
+        if tl.any(cond):
+            left = offs2 - stride
+            val = tl.load(shm + 1 + offs2)
+            val_left = tl.load(shm + 1 + left)
+            tl.store(shm + 1 + offs2, val + val_left, mask=cond)
+        stride *= 2
+
+    # set last to 0 (exclusive scan)
+    tl.store(shm + E, 0)
+
+    # -------- down-sweep --------
+    stride = E // 2
+    while stride >= 1:
+        offs2 = tl.arange(0, E)
+        cond = (offs2 + 1) % (2 * stride) == 0
+        if tl.any(cond):
+            left = offs2 - stride
+            val = tl.load(shm + 1 + offs2)
+            val_left = tl.load(shm + 1 + left)
+            tl.store(shm + 1 + left, val, mask=cond)
+            tl.store(shm + 1 + offs2, val + val_left, mask=cond)
+        stride //= 2
+
+    # write to output
+    tl.store(offsets_ptr + 0, tl.zeros((), tl.int64))
+    offs = tl.arange(0, E)
+    tl.store(offsets_ptr + 1 + offs, tl.load(shm + 1 + offs))
+
+
+def fused_count_and_offsets_fast(topk_ids, counts_buf, offsets_buf):
     N, K = topk_ids.shape
-    assert K == 2
     dev = topk_ids.device
-
     ids_i32 = topk_ids.contiguous().to(torch.int32)
-    counts = torch.zeros((num_experts,), device=dev, dtype=torch.int32)
 
-    grid = (N,)
-    count_expert_tokens_k2_kernel[grid](
-        ids_i32, counts, N, num_experts, ids_i32.stride(0),
+    # 统计阶段
+    counts_buf.zero_()
+    count_expert_tokens_k2_kernel[(N,)](
+        ids_i32, counts_buf, N, counts_buf.numel(), ids_i32.stride(0),
         num_warps=1, num_stages=1,
     )
 
-    # ↓↓↓ 这里完全用 device 运算，避免 offsets[0] = 0 这种 host 写入 ↓↓↓
-    csum = counts.to(torch.int64).cumsum(0)                      # [E]
-    zero = torch.zeros(1, device=dev, dtype=torch.int64)         # [1]
-    offsets = torch.cat((zero, csum), dim=0)                     # [E+1]
-    return offsets
+    # 前缀和阶段（高速单 kernel）
+    prefix_sum_offsets_kernel[(1,)](
+        counts_buf, offsets_buf,
+        E=counts_buf.numel(),
+        num_warps=4, num_stages=1,
+    )
+
 
 
 def get_json(file_path: Path) -> dict:
@@ -509,7 +543,7 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
 
-        offsets = fused_count_and_offsets_k2(topk_ids, self.num_experts)
+        offsets = fused_count_and_offsets_fast(topk_ids, self.num_experts)
 
         idxs = topk_ids.flatten().argsort()
         adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
