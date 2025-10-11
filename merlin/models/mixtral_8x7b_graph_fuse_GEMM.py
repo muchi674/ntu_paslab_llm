@@ -396,11 +396,8 @@ def hist_counts_kernel(
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     m = offs < NK
     ids = tl.load(IDS_ptr + offs, mask=m, other=0).to(tl.int32)
-    for i in range(0, BLOCK_N):
-        if m[i]:
-            eid = ids[i]
-            if (0 <= eid) & (eid < E):
-                tl.atomic_add(COUNTS_ptr + eid, 1)
+    valid = m & (ids >= 0) & (ids < E)
+    tl.atomic_add(COUNTS_ptr + ids, 1, mask=valid)
 
 
 @triton.jit
@@ -439,40 +436,36 @@ def scatter_by_expert_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # 遍历 NK 维度，按 expert 计数稳定写入
+    # 遍历 NK 维度（分块向量化），按 expert 计数稳定写入
     pid = tl.program_id(0)
     base = pid * BLOCK_N
     offs_n = base + tl.arange(0, BLOCK_N)
     m = offs_n < NK
     ids = tl.load(IDS_ptr + offs_n, mask=m, other=0).to(tl.int32)
+    valid = m & (ids >= 0) & (ids < E)
 
-    # 逐元素处理（NK 很大，BLOCK_N 适中，吞吐可）
-    for i in range(0, BLOCK_N):
-        valid = m[i]
-        if valid:
-            j = offs_n[i]
-            e = ids[i]
-            if (0 <= e) & (e < E):
-                # 原 token 行号（保持稳定：按行优先）
-                tok = (j // KTOP).to(tl.int32)
-                # 目标位置 = offsets[e] + cnt[e]++
-                pos_in_e = tl.atomic_add(CNT_ptr + e, 1)
-                base_e = tl.load(OFFS_ptr + e)
-                dst = base_e + pos_in_e
+    # token 行号与目标位置
+    toks = (offs_n // KTOP).to(tl.int32)
+    pos_in_e = tl.atomic_add(CNT_ptr + ids, 1, mask=valid)
+    base_e = tl.load(OFFS_ptr + ids, mask=valid, other=0)
+    dst = base_e + pos_in_e
 
-                # 写 adj
-                tl.store(ADJ_ptr + dst, tok)
+    # 写 adj（按有效掩码）
+    tl.store(ADJ_ptr + dst, toks, mask=valid)
 
-                # 写权重
-                w = tl.load(TOPW_ptr + j * stride_tw_n + 0 * stride_tw_c)
-                tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w)
+    # 写权重
+    w = tl.load(TOPW_ptr + offs_n * stride_tw_n + 0 * stride_tw_c, mask=valid, other=0.0)
+    tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w, mask=valid)
 
-                # 写向量 X[tok,:]
-                for d0 in range(0, D, BLOCK_D):
-                    offs_d = d0 + tl.arange(0, BLOCK_D)
-                    md = offs_d < D
-                    xv = tl.load(X_ptr + tok * stride_xn + offs_d * stride_xd, mask=md, other=0.0)
-                    tl.store(OUT_X_ptr + dst * stride_ox_n + offs_d * stride_ox_d, xv, mask=md)
+    # 写向量 X[tok,:]（按列块循环）
+    for d0 in range(0, D, BLOCK_D):
+        offs_d = d0 + tl.arange(0, BLOCK_D)
+        md = offs_d < D
+        # 构造 [BLOCK_N, BLOCK_D] 指针
+        x_src_ptr = X_ptr + toks[:, None] * stride_xn + offs_d[None, :] * stride_xd
+        x_val = tl.load(x_src_ptr, mask=valid[:, None] & md[None, :], other=0.0)
+        out_ptr = OUT_X_ptr + dst[:, None] * stride_ox_n + offs_d[None, :] * stride_ox_d
+        tl.store(out_ptr, x_val, mask=valid[:, None] & md[None, :])
 
 
 def router_hist_and_offsets(flat_ids: torch.Tensor, num_experts: int):
