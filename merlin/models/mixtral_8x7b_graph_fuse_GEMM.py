@@ -504,7 +504,7 @@ class MoeLayer(nn.Module):
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
         topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
 
-        offsets = fused_count_and_offsets(topk_ids, self.num_experts)
+        offsets = fused_count_and_offsets_k2(topk_ids, self.num_experts)
 
         idxs = topk_ids.flatten().argsort()
         adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
