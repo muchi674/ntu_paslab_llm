@@ -41,6 +41,14 @@ def precompute_rope_cos_sin(dim: int, end: int, theta: float, device):
 
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def rope_fused_kernel(
     Q_ptr, K_ptr,        # [B, Hq/Hk, T, D]
@@ -124,7 +132,7 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
     sc_t, sc_dh = cos.stride()
 
     Hmax = max(Hq, Hk)
-    grid = (B * Hmax, T, ceil(D / block_d))
+    grid = lambda meta: (B * Hmax, T, triton.cdiv(D, meta['BLOCK_D']))
 
     rope_fused_kernel[grid](
         xq, xk, oq, ok, cos, sin,
@@ -134,9 +142,6 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
         soq_b, soq_h, soq_t, soq_d,
         sok_b, sok_h, sok_t, sok_d,
         sc_t, sc_dh,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
     )
     return oq, ok
 
@@ -144,6 +149,14 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
 ################################
 # 下面是 RMSNorm 的 kernel fuse
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def rmsnorm_fused_kernel(
     X_ptr,            
@@ -212,9 +225,6 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
             sy_m, sy_d,
             sw_d,
             inv_D,                   
-            BLOCK_D=block_d,
-            num_warps=4 if block_d <= 256 else 8,
-            num_stages=2,
         )
     return y_2d.view_as(x)
 
@@ -222,6 +232,14 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
 ################################
 # 下面是 repeat_kv 的 kernel fuse
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def repeat_kv_fused_kernel(
     K_in, V_in,           # [B, Hk, T, D]
@@ -278,7 +296,7 @@ def repeat_kv_fused(keys: torch.Tensor,
     sko_b, sko_h, sko_t, sko_d = k_out.stride()
     svo_b, svo_h, svo_t, svo_d = v_out.stride()
 
-    grid = (B * Hq, T, (D + block_d - 1) // block_d)
+    grid = lambda meta: (B * Hq, T, triton.cdiv(D, meta['BLOCK_D']))
     repeat_kv_fused_kernel[grid](
         k_in, v_in, k_out, v_out,
         B, Hk, Hq, T, D, n_rep,
@@ -286,12 +304,247 @@ def repeat_kv_fused(keys: torch.Tensor,
         svi_b, svi_h, svi_t, svi_d,
         sko_b, sko_h, sko_t, sko_d,
         svo_b, svo_h, svo_t, svo_d,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
     )
     return k_out, v_out
 
+
+################################
+# K/V cache scatter 融合（一次写入）
+################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
+@triton.jit
+def kv_scatter_fused_kernel(
+    XK_ptr, XV_ptr,          # [B, H, T, D]
+    K_dst_ptr, V_dst_ptr,    # [B, H, MaxT, D]
+    STO_ptr,                 # [T] (int64)
+    B, H, T, D,
+    stride_xk_b, stride_xk_h, stride_xk_t, stride_xk_d,
+    stride_xv_b, stride_xv_h, stride_xv_t, stride_xv_d,
+    stride_k_b,  stride_k_h,  stride_k_t,  stride_k_d,
+    stride_v_b,  stride_v_h,  stride_v_t,  stride_v_d,
+    BLOCK_D: tl.constexpr,
+):
+    # grid: (B*H, T, ceil(D/BLOCK_D))
+    bh   = tl.program_id(0)
+    t_ix = tl.program_id(1)
+    db   = tl.program_id(2)
+
+    b_ix = bh // H
+    h_ix = bh % H
+
+    d_start = db * BLOCK_D
+    offs_d  = d_start + tl.arange(0, BLOCK_D)
+    m_d     = offs_d < D
+
+    # 源行指针
+    xk_row = XK_ptr + b_ix*stride_xk_b + h_ix*stride_xk_h + t_ix*stride_xk_t
+    xv_row = XV_ptr + b_ix*stride_xv_b + h_ix*stride_xv_h + t_ix*stride_xv_t
+
+    # 目的行指针（时间维根据 storage_idx[t]）
+    st = tl.load(STO_ptr + t_ix).to(tl.int32)
+    k_row = K_dst_ptr + b_ix*stride_k_b + h_ix*stride_k_h + st*stride_k_t
+    v_row = V_dst_ptr + b_ix*stride_v_b + h_ix*stride_v_h + st*stride_v_t
+
+    kv = tl.load(xk_row + offs_d*stride_xk_d, mask=m_d, other=0.0)
+    vv = tl.load(xv_row + offs_d*stride_xv_d, mask=m_d, other=0.0)
+    tl.store(k_row + offs_d*stride_k_d, kv, mask=m_d)
+    tl.store(v_row + offs_d*stride_v_d, vv, mask=m_d)
+
+
+def kv_scatter_fused(xk: torch.Tensor,
+                     xv: torch.Tensor,
+                     keys_dst: torch.Tensor,
+                     values_dst: torch.Tensor,
+                     storage_idx: torch.Tensor,
+                     block_d: int = 128) -> None:
+    """
+    将 xk/xv 按 storage_idx 一次性写入 K/V cache。
+    xk, xv:      [B, H, T, D]
+    keys_dst:    [B, H, MaxT, D]
+    values_dst:  [B, H, MaxT, D]
+    storage_idx: [T] (long)
+    """
+    assert xk.shape == xv.shape and xk.ndim == 4
+    B, H, T, D = xk.shape
+    assert keys_dst.ndim == 4 and values_dst.ndim == 4
+    assert keys_dst.shape[0] == B and keys_dst.shape[1] == H and keys_dst.shape[-1] == D
+    assert values_dst.shape[0] == B and values_dst.shape[1] == H and values_dst.shape[-1] == D
+    assert storage_idx.numel() == T
+
+    dev = xk.device
+    xk = xk.contiguous()
+    xv = xv.contiguous()
+    keys_dst = keys_dst.contiguous()
+    values_dst = values_dst.contiguous()
+    storage_idx = storage_idx.contiguous()
+
+    sxk_b, sxk_h, sxk_t, sxk_d = xk.stride()
+    sxv_b, sxv_h, sxv_t, sxv_d = xv.stride()
+    sk_b,  sk_h,  sk_t,  sk_d  = keys_dst.stride()
+    sv_b,  sv_h,  sv_t,  sv_d  = values_dst.stride()
+
+    grid = lambda meta: (B * H, T, triton.cdiv(D, meta['BLOCK_D']))
+    with torch.cuda.device(dev):
+        kv_scatter_fused_kernel[grid](
+            xk, xv, keys_dst, values_dst, storage_idx,
+            B, H, T, D,
+            sxk_b, sxk_h, sxk_t, sxk_d,
+            sxv_b, sxv_h, sxv_t, sxv_d,
+            sk_b,  sk_h,  sk_t,  sk_d,
+            sv_b,  sv_h,  sv_t,  sv_d,
+        )
+
+
+################################
+# Router GPU 化：统计 + 前缀和 + 稳定散列
+################################
+@triton.jit
+def hist_counts_kernel(
+    IDS_ptr,           # [NK] int32
+    NK, E,
+    COUNTS_ptr,        # [E] int32 (zero-initialized)
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    m = offs < NK
+    ids = tl.load(IDS_ptr + offs, mask=m, other=0).to(tl.int32)
+    valid = m & (ids >= 0) & (ids < E)
+    tl.atomic_add(COUNTS_ptr + ids, 1, mask=valid)
+
+
+@triton.jit
+def counts_to_offsets_kernel(
+    COUNTS_ptr,        # [E]  int32
+    OFFS_ptr,          # [E+1] int32
+    E,
+):
+    # 单 program 顺序前缀和
+    pid = tl.program_id(0)
+    if pid != 0:
+        return
+    tl.store(OFFS_ptr + 0, 0)
+    acc = tl.full((), 0, tl.int32)
+    for e in range(0, E):
+        c = tl.load(COUNTS_ptr + e)
+        acc = acc + c
+        tl.store(OFFS_ptr + (e + 1), acc)
+
+
+@triton.jit
+def scatter_by_expert_kernel(
+    X_ptr,                 # [N, D]
+    TOPW_ptr,              # [NK, 1]
+    IDS_ptr,               # [NK] int32
+    OFFS_ptr,              # [E+1] int32
+    CNT_ptr,               # [E] int32 (zero-init, per-expert counters)
+    OUT_X_ptr,             # [NK, D]
+    OUT_W_ptr,             # [NK, 1]
+    ADJ_ptr,               # [NK] int32
+    N, KTOP, NK, D, E,
+    stride_xn, stride_xd,
+    stride_tw_n, stride_tw_c,
+    stride_ox_n, stride_ox_d,
+    stride_ow_n, stride_ow_c,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    base = pid * BLOCK_N
+    offs_n = base + tl.arange(0, BLOCK_N)
+    m = offs_n < NK
+    ids = tl.load(IDS_ptr + offs_n, mask=m, other=0).to(tl.int32)
+    valid = m & (ids >= 0) & (ids < E)
+
+    toks = (offs_n // KTOP).to(tl.int32)
+    pos_in_e = tl.atomic_add(CNT_ptr + ids, 1, mask=valid)
+    base_e = tl.load(OFFS_ptr + ids, mask=valid, other=0)
+    dst = base_e + pos_in_e
+
+    tl.store(ADJ_ptr + dst, toks, mask=valid)
+
+    w = tl.load(TOPW_ptr + offs_n * stride_tw_n + 0 * stride_tw_c, mask=valid, other=0.0)
+    tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w, mask=valid)
+
+    for d0 in range(0, D, BLOCK_D):
+        offs_d = d0 + tl.arange(0, BLOCK_D)
+        md = offs_d < D
+        # 构造 [BLOCK_N, BLOCK_D] 指针
+        x_src_ptr = X_ptr + toks[:, None] * stride_xn + offs_d[None, :] * stride_xd
+        x_val = tl.load(x_src_ptr, mask=valid[:, None] & md[None, :], other=0.0)
+        out_ptr = OUT_X_ptr + dst[:, None] * stride_ox_n + offs_d[None, :] * stride_ox_d
+        tl.store(out_ptr, x_val, mask=valid[:, None] & md[None, :])
+
+
+def router_hist_and_offsets(flat_ids: torch.Tensor, num_experts: int):
+    assert flat_ids.is_cuda and flat_ids.dtype in (torch.int32, torch.int64)
+    ids_i32 = flat_ids.to(torch.int32).contiguous()
+    NK = ids_i32.numel()
+    E = int(num_experts)
+    dev = ids_i32.device
+    counts = torch.zeros((E,), device=dev, dtype=torch.int32)
+    offs = torch.empty((E + 1,), device=dev, dtype=torch.int32)
+
+    BLOCK_N = 256
+    grid = ( (NK + BLOCK_N - 1) // BLOCK_N, )
+    with torch.cuda.device(dev):
+        hist_counts_kernel[grid](
+            ids_i32, NK, E, counts,
+            BLOCK_N=BLOCK_N,
+        )
+        counts_to_offsets_kernel[(1,)](counts, offs, E)
+    return counts, offs
+
+
+def router_scatter_by_expert(x: torch.Tensor,
+                             topw: torch.Tensor,
+                             flat_ids: torch.Tensor,
+                             offsets: torch.Tensor,
+                             k_top: int):
+    # x: [N,D], topw: [N*k,1], flat_ids: [N*k] (int32), offsets: [E+1] (int32)
+    assert x.is_cuda and topw.is_cuda and flat_ids.is_cuda and offsets.is_cuda
+    N, D = x.shape
+    NK = flat_ids.numel()
+    E = int(offsets.numel() - 1)
+    dev = x.device
+    x = x.contiguous()
+    topw = topw.contiguous()
+    flat_ids = flat_ids.to(torch.int32).contiguous()
+    offsets = offsets.to(torch.int32).contiguous()
+
+    sorted_x = torch.empty((NK, D), device=dev, dtype=x.dtype)
+    sorted_w = torch.empty((NK, 1), device=dev, dtype=topw.dtype)
+    adj = torch.empty((NK,), device=dev, dtype=torch.int32)
+    counters = torch.zeros((E,), device=dev, dtype=torch.int32)
+
+    sx_n, sx_d = x.stride()
+    tw_n, tw_c = topw.stride()
+    sox_n, sox_d = sorted_x.stride()
+    sow_n, sow_c = sorted_w.stride()
+
+    BLOCK_N = 128
+    BLOCK_D = 128
+    grid = ( (NK + BLOCK_N - 1) // BLOCK_N, )
+    with torch.cuda.device(dev):
+        scatter_by_expert_kernel[grid](
+            x, topw, flat_ids, offsets, counters,
+            sorted_x, sorted_w, adj,
+            N, int(k_top), NK, D, E,
+            sx_n, sx_d,
+            tw_n, tw_c,
+            sox_n, sox_d,
+            sow_n, sow_c,
+            BLOCK_D=BLOCK_D,
+            BLOCK_N=BLOCK_N,
+        )
+    return sorted_x, sorted_w, adj
 
 
 
@@ -412,8 +665,12 @@ class Attention(nn.Module):
         
 
         # assumes bsz matches that of cache
-        self.cache[0, self.li].index_copy_(dim=-2, index=storage_idx, source=xk)
-        self.cache[1, self.li].index_copy_(dim=-2, index=storage_idx, source=xv)
+        kv_scatter_fused(
+            xk, xv,
+            self.cache[0, self.li],
+            self.cache[1, self.li],
+            storage_idx,
+        )
         keys = self.cache[0, self.li]
         values = self.cache[1, self.li]
 
@@ -466,17 +723,28 @@ class MoeLayer(nn.Module):
     def prep_ins(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
-        cnts.scatter_(1, topk_ids, 1)
-        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
-        idxs = topk_ids.flatten().argsort()
-        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
-        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
+        # GPU 路由：top-2 → 直方图/前缀和 → 稳定散列
+        # x: [N, D]
+        logits = self.gate(x)  # [N, E]
+        topv, topi = torch.topk(logits, self.num_experts_per_tok, dim=1)  # [N,k]
+        topw = F.softmax(topv, dim=1, dtype=torch.float).to(x.dtype).reshape(-1, 1)  # [N*k,1]
+        flat_ids = topi.reshape(-1)  # [N*k]
+
+        # 统计与前缀和（int32），得到 offsets
+        _counts, offsets_i32 = router_hist_and_offsets(flat_ids, self.num_experts)
+
+        # 稳定散列到 expert 段，得到 sorted_x / sorted_w / adj
+        sorted_x, sorted_w, adj_i32 = router_scatter_by_expert(
+            x, topw, flat_ids, offsets_i32, self.num_experts_per_tok
+        )
+
+        # 与原接口对齐（offsets/adj 用 int64）
+        return (
+            sorted_x,
+            sorted_w,
+            offsets_i32.to(torch.int64),
+            adj_i32.to(torch.int64),
+        )
 
     def experts_infer(
         self,
