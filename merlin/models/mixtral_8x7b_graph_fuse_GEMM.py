@@ -463,30 +463,20 @@ class MoeLayer(nn.Module):
             (1 + self.num_experts,), dtype=torch.int64, device="cpu"
         ).pin_memory()
 
-    def prep_ins(self, x: torch.Tensor):
-        # 1) gate → topk
+    def prep_ins(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
         gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok, dim=1)
+        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
         topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-
-        # 2) 计算 offsets（每个 expert 的起止边界），用 bincount 省去 N×E scatter
-        flat_ids = topk_ids.reshape(-1)                                   # [N*k]
-        counts  = torch.bincount(flat_ids, minlength=self.num_experts)    # [E]
-        # 警告：下一行在 CUDA Graph 捕获中不安全（单元素 host 写 device）
-        offsets = torch.empty(self.num_experts + 1, device=x.device, dtype=torch.int64)
-        offsets[0] = 0
-        offsets[1:] = counts.to(torch.int64).cumsum(0)
-
-        # 3) 得到把 token 排成“按 expert 分组”的顺序
-        idxs = flat_ids.argsort()                                         # [N*k]
-        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")  # [N*k] → 原 token 索引
-
-        # 4) 重排 x 与对应的 gate 权重
-        sorted_x = x.index_select(0, adj_idxs)
-        sorted_w = topk_weight.reshape(-1, 1).index_select(0, idxs)
-
-        return sorted_x, sorted_w, offsets, adj_idxs
-
+        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
+        cnts.scatter_(1, topk_ids, 1)
+        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
+        idxs = topk_ids.flatten().argsort()
+        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
+        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
 
     def experts_infer(
         self,
