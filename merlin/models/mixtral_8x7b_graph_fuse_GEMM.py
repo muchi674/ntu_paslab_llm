@@ -494,7 +494,7 @@ class MoeLayer(nn.Module):
         sample_w_down_raw = self.experts.ws[f"{self.glob_li}.{self.first_expert}.w_down"].to(device)
         D_model, I = sample_w_down_raw.shape
         W_down = torch.stack([
-            self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device)   # [I, D_model]
+            self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device).T   # [I, D_model]
             for e in range(self.first_expert, self.last_expert + 1)
         ], dim=0)  # [E_used, I, D_model]
         E_used = W_down.shape[0]
@@ -522,7 +522,7 @@ class MoeLayer(nn.Module):
             x_slice = sorted_x[l:r]  # [n, D_model]
 
             # 取 w_gate_up 并直接展开激活： (x @ w_gate_up).chunk(2)
-            w_gate_up_raw = self.experts.ws[f"{self.glob_li}.{ei}.w_gate_up"].to(device)
+            w_gate_up_raw = self.experts.ws[f"{self.glob_li}.{ei}.w_gate_up"].to(device).T
             gate_up = x_slice @ w_gate_up_raw  # [n, 2I]
             gate_states, up_states = gate_up.chunk(2, dim=-1)
             hidden = F.silu(gate_states) * up_states  # [n, I]
