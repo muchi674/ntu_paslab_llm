@@ -311,19 +311,24 @@ def count_expert_tokens_k2_kernel(
         tl.atomic_add(expert_counts_ptr + e1, 1)
 
 def fused_count_and_offsets_k2(topk_ids: torch.Tensor, num_experts: int):
+    # topk_ids: [N, 2] int64
     N, K = topk_ids.shape
     assert K == 2
     dev = topk_ids.device
+
     ids_i32 = topk_ids.contiguous().to(torch.int32)
     counts = torch.zeros((num_experts,), device=dev, dtype=torch.int32)
+
     grid = (N,)
     count_expert_tokens_k2_kernel[grid](
         ids_i32, counts, N, num_experts, ids_i32.stride(0),
         num_warps=1, num_stages=1,
     )
-    offsets = torch.empty((num_experts + 1,), device=dev, dtype=torch.int64)
-    offsets[0] = 0
-    offsets[1:] = counts.to(torch.int64).cumsum(0)
+
+    # ↓↓↓ 这里完全用 device 运算，避免 offsets[0] = 0 这种 host 写入 ↓↓↓
+    csum = counts.to(torch.int64).cumsum(0)                      # [E]
+    zero = torch.zeros(1, device=dev, dtype=torch.int64)         # [1]
+    offsets = torch.cat((zero, csum), dim=0)                     # [E+1]
     return offsets
 
 
