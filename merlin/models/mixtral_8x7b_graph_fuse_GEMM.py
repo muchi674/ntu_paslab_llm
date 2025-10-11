@@ -400,6 +400,139 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     return torch.gather(probs_idx, -1, next_token)
 
 
+@triton.jit
+def top_p_sample_kernel(
+    LOGITS,            # [M, V]
+    OUT_IDX,           # [M]
+    U_PTR,             # [M] uniform random in [0,1)
+    M, V,
+    stride_lm, stride_lv,
+    stride_om,
+    stride_um,
+    p: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    TOPN: tl.constexpr,
+):
+    # one program per row m
+    m = tl.program_id(0)
+    if m >= M:
+        return
+
+    # Pass 1: compute max logit
+    lmax = tl.full((), -float("inf"), tl.float32)
+    for v0 in range(0, V, BLOCK_K):
+        offs = v0 + tl.arange(0, BLOCK_K)
+        mask = offs < V
+        x = tl.load(LOGITS + m * stride_lm + offs * stride_lv, mask=mask, other=-float("inf"))
+        x = x.to(tl.float32)
+        tile_max = tl.max(x, axis=0)
+        lmax = tl.maximum(lmax, tile_max)
+
+    # TopN reservoir (descending)
+    topv = tl.full((TOPN,), -float("inf"), tl.float32)
+    topi = tl.full((TOPN,), -1, tl.int32)
+    zsum = tl.full((), 0.0, tl.float32)
+
+    # Pass 2: accumulate Z and maintain top-N exp values
+    for v0 in range(0, V, BLOCK_K):
+        offs = v0 + tl.arange(0, BLOCK_K)
+        mask = offs < V
+        x = tl.load(LOGITS + m * stride_lm + offs * stride_lv, mask=mask, other=-float("inf"))
+        x = (x.to(tl.float32) - lmax)
+        e = tl.exp(x)
+        # accumulate partition function
+        zsum += tl.sum(e, axis=0)
+
+        # process each element in the tile sequentially for stable insertion
+        for i in range(0, BLOCK_K):
+            valid = (v0 + i) < V
+            if valid:
+                v = e[i]
+                idx = (v0 + i).to(tl.int32)
+                # find insertion pos = number of elements strictly greater than v
+                greater = (topv > v)
+                pos = tl.sum(greater.to(tl.int32), axis=0)
+                # insert if within TOPN
+                if pos < TOPN:
+                    # shift tail downwards
+                    for j in range(TOPN - 2, -1, -1):
+                        cond = pos <= j
+                        src_v = topv[j]
+                        src_i = topi[j]
+                        dst_v = topv[j + 1]
+                        dst_i = topi[j + 1]
+                        topv = tl.where(tl.arange(0, TOPN) == (j + 1), tl.where(cond, src_v, dst_v), topv)
+                        topi = tl.where(tl.arange(0, TOPN) == (j + 1), tl.where(cond, src_i, dst_i), topi)
+                    # place new one at pos
+                    topv = tl.where(tl.arange(0, TOPN) == pos, v, topv)
+                    topi = tl.where(tl.arange(0, TOPN) == pos, idx, topi)
+
+    # threshold = p * Z
+    thresh = p * zsum
+    prefix = tl.full((), 0.0, tl.float32)
+    mcut = 0
+    for i in range(0, TOPN):
+        tv = topv[i]
+        if tv == -float("inf"):
+            break
+        prefix += tv
+        mcut += 1
+        if prefix >= thresh:
+            break
+
+    # sum within selected set (if threshold not reached, take all collected)
+    sel_sum = tl.full((), 0.0, tl.float32)
+    for i in range(0, mcut):
+        sel_sum += topv[i]
+
+    # sample
+    u = tl.load(U_PTR + m * stride_um).to(tl.float32)
+    target = u * sel_sum
+    acc = tl.full((), 0.0, tl.float32)
+    chosen = tl.full((), -1, tl.int32)
+    for i in range(0, mcut):
+        acc += topv[i]
+        if (chosen < 0) & (acc >= target):
+            chosen = topi[i]
+    if chosen < 0:
+        chosen = tl.where(mcut > 0, topi[mcut - 1], 0)
+
+    tl.store(OUT_IDX + m * stride_om, chosen.to(tl.int64))
+
+
+def top_p_sample_triton(logits: torch.Tensor, p: float, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Triton 版 top-p 采样（按行处理）。
+    logits: [M, V]
+    返回: [M, 1] 的 next_token（int64）
+    说明：内部选取 TOPN=1024 的候选集合，若累计质量不足 p，将以收集到的全部候选重归一化采样。
+    """
+    assert logits.ndim == 2
+    M, V = logits.shape
+    dev = logits.device
+    x = logits / max(temperature, 1e-6)
+    x = x.contiguous()
+    out_idx = torch.empty((M,), device=dev, dtype=torch.int64)
+    u = torch.rand((M,), device=dev, dtype=torch.float32)
+    slm, slv = x.stride()
+    som = out_idx.stride(0)
+    sum_ = u.stride(0)
+    grid = (M,)
+    with torch.cuda.device(dev):
+        top_p_sample_kernel[grid](
+            x, out_idx, u,
+            M, V,
+            slm, slv,
+            som,
+            sum_,
+            p=p,
+            BLOCK_K=32,
+            TOPN=1024,
+            num_warps=4,
+            num_stages=2,
+        )
+    return out_idx.view(M, 1)
+
 @dataclass
 class ModelArgs:
     dim: int
@@ -1405,8 +1538,11 @@ class Mixtral8x7B:
             )
 
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, 0.8)
+                next_token = top_p_sample_triton(
+                    logits[:, -1],
+                    p=0.8,
+                    temperature=temperature,
+                ).squeeze(1)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
