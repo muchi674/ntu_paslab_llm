@@ -382,6 +382,164 @@ def kv_scatter_fused(xk: torch.Tensor,
         )
 
 
+################################
+# Router GPU 化：统计 + 前缀和 + 稳定散列
+################################
+@triton.jit
+def hist_counts_kernel(
+    IDS_ptr,           # [NK] int32
+    NK, E,
+    COUNTS_ptr,        # [E] int32 (zero-initialized)
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    m = offs < NK
+    ids = tl.load(IDS_ptr + offs, mask=m, other=0).to(tl.int32)
+    for i in range(0, BLOCK_N):
+        if m[i]:
+            eid = ids[i]
+            if (0 <= eid) & (eid < E):
+                tl.atomic_add(COUNTS_ptr + eid, 1)
+
+
+@triton.jit
+def counts_to_offsets_kernel(
+    COUNTS_ptr,        # [E]  int32
+    OFFS_ptr,          # [E+1] int32
+    E,
+):
+    # 单 program 顺序前缀和
+    pid = tl.program_id(0)
+    if pid != 0:
+        return
+    tl.store(OFFS_ptr + 0, 0)
+    acc = tl.full((), 0, tl.int32)
+    for e in range(0, E):
+        c = tl.load(COUNTS_ptr + e)
+        acc = acc + c
+        tl.store(OFFS_ptr + (e + 1), acc)
+
+
+@triton.jit
+def scatter_by_expert_kernel(
+    X_ptr,                 # [N, D]
+    TOPW_ptr,              # [NK, 1]
+    IDS_ptr,               # [NK] int32
+    OFFS_ptr,              # [E+1] int32
+    CNT_ptr,               # [E] int32 (zero-init, per-expert counters)
+    OUT_X_ptr,             # [NK, D]
+    OUT_W_ptr,             # [NK, 1]
+    ADJ_ptr,               # [NK] int32
+    N, KTOP, NK, D, E,
+    stride_xn, stride_xd,
+    stride_tw_n, stride_tw_c,
+    stride_ox_n, stride_ox_d,
+    stride_ow_n, stride_ow_c,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # 遍历 NK 维度，按 expert 计数稳定写入
+    pid = tl.program_id(0)
+    base = pid * BLOCK_N
+    offs_n = base + tl.arange(0, BLOCK_N)
+    m = offs_n < NK
+    ids = tl.load(IDS_ptr + offs_n, mask=m, other=0).to(tl.int32)
+
+    # 逐元素处理（NK 很大，BLOCK_N 适中，吞吐可）
+    for i in range(0, BLOCK_N):
+        valid = m[i]
+        if valid:
+            j = offs_n[i]
+            e = ids[i]
+            if (0 <= e) & (e < E):
+                # 原 token 行号（保持稳定：按行优先）
+                tok = (j // KTOP).to(tl.int32)
+                # 目标位置 = offsets[e] + cnt[e]++
+                pos_in_e = tl.atomic_add(CNT_ptr + e, 1)
+                base_e = tl.load(OFFS_ptr + e)
+                dst = base_e + pos_in_e
+
+                # 写 adj
+                tl.store(ADJ_ptr + dst, tok)
+
+                # 写权重
+                w = tl.load(TOPW_ptr + j * stride_tw_n + 0 * stride_tw_c)
+                tl.store(OUT_W_ptr + dst * stride_ow_n + 0 * stride_ow_c, w)
+
+                # 写向量 X[tok,:]
+                for d0 in range(0, D, BLOCK_D):
+                    offs_d = d0 + tl.arange(0, BLOCK_D)
+                    md = offs_d < D
+                    xv = tl.load(X_ptr + tok * stride_xn + offs_d * stride_xd, mask=md, other=0.0)
+                    tl.store(OUT_X_ptr + dst * stride_ox_n + offs_d * stride_ox_d, xv, mask=md)
+
+
+def router_hist_and_offsets(flat_ids: torch.Tensor, num_experts: int):
+    assert flat_ids.is_cuda and flat_ids.dtype in (torch.int32, torch.int64)
+    ids_i32 = flat_ids.to(torch.int32).contiguous()
+    NK = ids_i32.numel()
+    E = int(num_experts)
+    dev = ids_i32.device
+    counts = torch.zeros((E,), device=dev, dtype=torch.int32)
+    offs = torch.empty((E + 1,), device=dev, dtype=torch.int32)
+
+    grid = ( (NK + 256 - 1) // 256, )
+    with torch.cuda.device(dev):
+        hist_counts_kernel[grid](
+            ids_i32, NK, E, counts,
+            BLOCK_N=256,
+            num_warps=4,
+            num_stages=2,
+        )
+        counts_to_offsets_kernel[(1,)](counts, offs, E)
+    return counts, offs
+
+
+def router_scatter_by_expert(x: torch.Tensor,
+                             topw: torch.Tensor,
+                             flat_ids: torch.Tensor,
+                             offsets: torch.Tensor,
+                             k_top: int):
+    # x: [N,D], topw: [N*k,1], flat_ids: [N*k] (int32), offsets: [E+1] (int32)
+    assert x.is_cuda and topw.is_cuda and flat_ids.is_cuda and offsets.is_cuda
+    N, D = x.shape
+    NK = flat_ids.numel()
+    E = int(offsets.numel() - 1)
+    dev = x.device
+    x = x.contiguous()
+    topw = topw.contiguous()
+    flat_ids = flat_ids.to(torch.int32).contiguous()
+    offsets = offsets.to(torch.int32).contiguous()
+
+    sorted_x = torch.empty((NK, D), device=dev, dtype=x.dtype)
+    sorted_w = torch.empty((NK, 1), device=dev, dtype=topw.dtype)
+    adj = torch.empty((NK,), device=dev, dtype=torch.int32)
+    counters = torch.zeros((E,), device=dev, dtype=torch.int32)
+
+    sx_n, sx_d = x.stride()
+    tw_n, tw_c = topw.stride()
+    sox_n, sox_d = sorted_x.stride()
+    sow_n, sow_c = sorted_w.stride()
+
+    grid = ( (NK + 128 - 1) // 128, )
+    with torch.cuda.device(dev):
+        scatter_by_expert_kernel[grid](
+            x, topw, flat_ids, offsets, counters,
+            sorted_x, sorted_w, adj,
+            N, int(k_top), NK, D, E,
+            sx_n, sx_d,
+            tw_n, tw_c,
+            sox_n, sox_d,
+            sow_n, sow_c,
+            BLOCK_D=128,
+            BLOCK_N=128,
+            num_warps=4,
+            num_stages=2,
+        )
+    return sorted_x, sorted_w, adj
+
+
 
 def get_json(file_path: Path) -> dict:
     with open(file_path, "r") as f:
@@ -558,17 +716,28 @@ class MoeLayer(nn.Module):
     def prep_ins(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # WARNING: assumes x to be 2D: (batch_size * seq_len, model_dim)
-        gate_logits = self.gate(x)
-        topk_weight, topk_ids = torch.topk(gate_logits, self.num_experts_per_tok)
-        topk_weight = F.softmax(topk_weight, dim=1, dtype=torch.float).to(x.dtype)
-        topk_weight = topk_weight.flatten().unsqueeze(dim=-1)
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
-        cnts.scatter_(1, topk_ids, 1)
-        offsets = torch.cat((self.dummy_zero, cnts.sum(dim=0).cumsum(dim=0)))
-        idxs = topk_ids.flatten().argsort()
-        adj_idxs = torch.div(idxs, self.num_experts_per_tok, rounding_mode="floor")
-        return x[adj_idxs], topk_weight[idxs], offsets, adj_idxs
+        # GPU 路由：top-2 → 直方图/前缀和 → 稳定散列
+        # x: [N, D]
+        logits = self.gate(x)  # [N, E]
+        topv, topi = torch.topk(logits, self.num_experts_per_tok, dim=1)  # [N,k]
+        topw = F.softmax(topv, dim=1, dtype=torch.float).to(x.dtype).reshape(-1, 1)  # [N*k,1]
+        flat_ids = topi.reshape(-1)  # [N*k]
+
+        # 统计与前缀和（int32），得到 offsets
+        _counts, offsets_i32 = router_hist_and_offsets(flat_ids, self.num_experts)
+
+        # 稳定散列到 expert 段，得到 sorted_x / sorted_w / adj
+        sorted_x, sorted_w, adj_i32 = router_scatter_by_expert(
+            x, topw, flat_ids, offsets_i32, self.num_experts_per_tok
+        )
+
+        # 与原接口对齐（offsets/adj 用 int64）
+        return (
+            sorted_x,
+            sorted_w,
+            offsets_i32.to(torch.int64),
+            adj_i32.to(torch.int64),
+        )
 
     def experts_infer(
         self,
