@@ -41,6 +41,14 @@ def precompute_rope_cos_sin(dim: int, end: int, theta: float, device):
 
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def rope_fused_kernel(
     Q_ptr, K_ptr,        # [B, Hq/Hk, T, D]
@@ -124,7 +132,7 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
     sc_t, sc_dh = cos.stride()
 
     Hmax = max(Hq, Hk)
-    grid = (B * Hmax, T, ceil(D / block_d))
+    grid = lambda meta: (B * Hmax, T, triton.cdiv(D, meta['BLOCK_D']))
 
     rope_fused_kernel[grid](
         xq, xk, oq, ok, cos, sin,
@@ -134,9 +142,6 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
         soq_b, soq_h, soq_t, soq_d,
         sok_b, sok_h, sok_t, sok_d,
         sc_t, sc_dh,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
     )
     return oq, ok
 
@@ -144,6 +149,14 @@ def rope_fused(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin: torch
 ################################
 # 下面是 RMSNorm 的 kernel fuse
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def rmsnorm_fused_kernel(
     X_ptr,            
@@ -212,9 +225,6 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
             sy_m, sy_d,
             sw_d,
             inv_D,                   
-            BLOCK_D=block_d,
-            num_warps=4 if block_d <= 256 else 8,
-            num_stages=2,
         )
     return y_2d.view_as(x)
 
@@ -222,6 +232,14 @@ def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float, block_d: in
 ################################
 # 下面是 repeat_kv 的 kernel fuse
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def repeat_kv_fused_kernel(
     K_in, V_in,           # [B, Hk, T, D]
@@ -278,7 +296,7 @@ def repeat_kv_fused(keys: torch.Tensor,
     sko_b, sko_h, sko_t, sko_d = k_out.stride()
     svo_b, svo_h, svo_t, svo_d = v_out.stride()
 
-    grid = (B * Hq, T, (D + block_d - 1) // block_d)
+    grid = lambda meta: (B * Hq, T, triton.cdiv(D, meta['BLOCK_D']))
     repeat_kv_fused_kernel[grid](
         k_in, v_in, k_out, v_out,
         B, Hk, Hq, T, D, n_rep,
@@ -286,9 +304,6 @@ def repeat_kv_fused(keys: torch.Tensor,
         svi_b, svi_h, svi_t, svi_d,
         sko_b, sko_h, sko_t, sko_d,
         svo_b, svo_h, svo_t, svo_d,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d <= 128 else 8,
-        num_stages=2,
     )
     return k_out, v_out
 
@@ -296,6 +311,14 @@ def repeat_kv_fused(keys: torch.Tensor,
 ################################
 # K/V cache scatter 融合（一次写入）
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['D']
+)
 @triton.jit
 def kv_scatter_fused_kernel(
     XK_ptr, XV_ptr,          # [B, H, T, D]
@@ -367,7 +390,7 @@ def kv_scatter_fused(xk: torch.Tensor,
     sk_b,  sk_h,  sk_t,  sk_d  = keys_dst.stride()
     sv_b,  sv_h,  sv_t,  sv_d  = values_dst.stride()
 
-    grid = (B * H, T, (D + block_d - 1) // block_d)
+    grid = lambda meta: (B * H, T, triton.cdiv(D, meta['BLOCK_D']))
     with torch.cuda.device(dev):
         kv_scatter_fused_kernel[grid](
             xk, xv, keys_dst, values_dst, storage_idx,
@@ -376,15 +399,20 @@ def kv_scatter_fused(xk: torch.Tensor,
             sxv_b, sxv_h, sxv_t, sxv_d,
             sk_b,  sk_h,  sk_t,  sk_d,
             sv_b,  sv_h,  sv_t,  sv_d,
-            BLOCK_D=block_d,
-            num_warps=4 if block_d <= 128 else 8,
-            num_stages=2,
         )
 
 
 ################################
 # Router GPU 化：统计 + 前缀和 + 稳定散列
 ################################
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['NK']
+)
 @triton.jit
 def hist_counts_kernel(
     IDS_ptr,           # [NK] int32
@@ -418,6 +446,14 @@ def counts_to_offsets_kernel(
         tl.store(OFFS_ptr + (e + 1), acc)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 64,  'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_D': 64},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_D': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['NK', 'D']
+)
 @triton.jit
 def scatter_by_expert_kernel(
     X_ptr,                 # [N, D]
