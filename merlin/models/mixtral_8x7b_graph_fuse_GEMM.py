@@ -503,10 +503,12 @@ def router_hist_and_offsets(flat_ids: torch.Tensor, num_experts: int):
     counts = torch.zeros((E,), device=dev, dtype=torch.int32)
     offs = torch.empty((E + 1,), device=dev, dtype=torch.int32)
 
-    grid = lambda meta: (triton.cdiv(NK, meta['BLOCK_N']),)
+    BLOCK_N = 256
+    grid = ( (NK + BLOCK_N - 1) // BLOCK_N, )
     with torch.cuda.device(dev):
         hist_counts_kernel[grid](
             ids_i32, NK, E, counts,
+            BLOCK_N=BLOCK_N,
         )
         counts_to_offsets_kernel[(1,)](counts, offs, E)
     return counts, offs
@@ -538,7 +540,9 @@ def router_scatter_by_expert(x: torch.Tensor,
     sox_n, sox_d = sorted_x.stride()
     sow_n, sow_c = sorted_w.stride()
 
-    grid = lambda meta: (triton.cdiv(NK, meta['BLOCK_N']),)
+    BLOCK_N = 128
+    BLOCK_D = 128
+    grid = ( (NK + BLOCK_N - 1) // BLOCK_N, )
     with torch.cuda.device(dev):
         scatter_by_expert_kernel[grid](
             x, topw, flat_ids, offsets, counters,
@@ -548,6 +552,8 @@ def router_scatter_by_expert(x: torch.Tensor,
             tw_n, tw_c,
             sox_n, sox_d,
             sow_n, sow_c,
+            BLOCK_D=BLOCK_D,
+            BLOCK_N=BLOCK_N,
         )
     return sorted_x, sorted_w, adj
 
