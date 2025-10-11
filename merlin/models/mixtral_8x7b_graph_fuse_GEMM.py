@@ -480,9 +480,9 @@ class MoeLayer(nn.Module):
 
     def experts_infer(
         self,
-        sorted_x: torch.Tensor,    # [T, D_model] 这里的 T = N * k （按 expert 分组后的）
+        sorted_x: torch.Tensor,    # [T, D_model]
         topk_weight: torch.Tensor, # [T, 1]
-        offsets: torch.Tensor,     # [E+1] exclusive scan
+        offsets: torch.Tensor,     # [E+1]
         adj_idxs: torch.Tensor,    # [T]
         next_r: torch.Tensor,      # [N, D_model]
     ) -> torch.Tensor:
@@ -491,34 +491,27 @@ class MoeLayer(nn.Module):
         E      = self.num_experts
 
         # --- 从某个 expert 的 w_down 推导形状 ---
-        # ws 里保存的是未经转置的权重（你 forward 里用了 .T 再 @）
-        # 记：w_down_raw.shape = [D_model, I]  =>  w_down_T.shape = [I, D_model]
         sample_w_down_raw = self.experts.ws[f"{self.glob_li}.{self.first_expert}.w_down"].to(device)
-        D_model, I = sample_w_down_raw.shape  # 注意是 raw 形状
-        # 我们需要叠成 [E, I, D_model] 供 bmm 使用
+        D_model, I = sample_w_down_raw.shape
         W_down = torch.stack([
             self.experts.ws[f"{self.glob_li}.{e}.w_down"].to(device).T   # [I, D_model]
             for e in range(self.first_expert, self.last_expert + 1)
         ], dim=0)  # [E_used, I, D_model]
         E_used = W_down.shape[0]
 
-        # --- 计算每个 expert 的段长度，并找最大长度做 padding ---
-        # 注意：offsets 是 GPU 上的 int64，graph-safe
-        lens = (offsets[1:] - offsets[:-1])                      # [E] int64
-        lens_used = lens[self.first_expert:self.last_expert+1]   # 只取启用的 experts
+        # --- 计算每个 expert 的段长度 ---
+        lens = (offsets[1:] - offsets[:-1])
+        lens_used = lens[self.first_expert:self.last_expert+1]
         if torch.all(lens_used == 0):
-            return next_r  # 没有 token 命中这些 expert，直接返回
+            return next_r
 
         max_len = int(lens_used.max().item())
 
-        # --- 预分配 [E_used, max_len, *] 的批输入 ---
-        # hidden_pad: 保存每个 expert 的 MLP 中间激活 (维度 I)
+        # --- 预分配批输入 ---
         hidden_pad = torch.zeros((E_used, max_len, I), device=device, dtype=dtype)
         w_pad      = torch.zeros((E_used, max_len, 1), device=device, dtype=dtype)
 
-        # --- 逐 expert 计算隐藏激活（SiLU(gate) * up），只做这一步的 for 循环 ---
-        # 这里使用你已经有的 MLP_fused(x, w_gate_up)：输入 [n, D_model]，权重 [D_model, 2I]（转置后 [2I, D_model]?）
-        # 你的实现是：w_gate_up_raw.T 传给 MLP_fused；因此这里沿用相同调用方式。
+        # --- 计算每个 expert 的中间激活（展开 MLP_fused）---
         e_base = self.first_expert
         for ei in range(self.first_expert, self.last_expert + 1):
             l = int(offsets[ei].item())
@@ -526,34 +519,30 @@ class MoeLayer(nn.Module):
             if l == r:
                 continue
             n = r - l
-            # 取该 expert 的输入切片
             x_slice = sorted_x[l:r]  # [n, D_model]
 
-            # 取该 expert 的 gate_up 权重并做中间激活（你已有的融合核）
-            w_gate_up_raw: torch.Tensor = self.experts.ws[f"{self.glob_li}.{ei}.w_gate_up"].to(device)
-            # 你的 MLP_fused 期望传入转置后的 [D_model, 2I]^T?（按你之前的写法：MLP_fused(x, w_gate_up_T)）
-            hidden = MLP_fused(x_slice, w_gate_up_raw.T)  # [n, I]，保持 dtype=device 与现有实现一致
+            # 取 w_gate_up 并直接展开激活： (x @ w_gate_up).chunk(2)
+            w_gate_up_raw = self.experts.ws[f"{self.glob_li}.{ei}.w_gate_up"].to(device)
+            gate_up = x_slice @ w_gate_up_raw  # [n, 2I]
+            gate_states, up_states = gate_up.chunk(2, dim=-1)
+            hidden = F.silu(gate_states) * up_states  # [n, I]
 
-            # 写到 padded 批里
             e_idx = ei - e_base
             hidden_pad[e_idx, :n, :] = hidden
-            w_pad     [e_idx, :n, :] = topk_weight[l:r]
+            w_pad[e_idx, :n, :] = topk_weight[l:r]
 
-        # --- batched bmm 做所有 expert 的下投影： [E, max_len, I] @ [E, I, D_model] -> [E, max_len, D_model]
-        out_pad = torch.bmm(hidden_pad, W_down)   # [E_used, max_len, D_model]
-        out_pad.mul_(w_pad)                       # 按 topk_weight 加权
+        # --- batched bmm 下投影 ---
+        out_pad = torch.bmm(hidden_pad, W_down)  # [E_used, max_len, D_model]
+        out_pad.mul_(w_pad)
 
-        # --- 去除 padding，并聚合回原 token 顺序 ---
-        # 展平并用一个 mask 去掉多余行
+        # --- 去 padding 并聚合 ---
         flat_out = out_pad.reshape(E_used * max_len, D_model)
-        # 构建 mask：每个 expert 的前 n 行有效
-        rng = torch.arange(max_len, device=device)[None, :].expand(E_used, max_len)   # [E_used, max_len]
-        valid = rng < lens_used.view(-1, 1)                                           # [E_used, max_len]
-        flat_out = flat_out[valid.reshape(-1)]                                        # [T, D_model] 恢复到与 sorted_x 同序
-
-        # 与原逻辑一致：scatter-add 回到 token 维度
+        rng = torch.arange(max_len, device=device)[None, :].expand(E_used, max_len)
+        valid = rng < lens_used.view(-1, 1)
+        flat_out = flat_out[valid.reshape(-1)]
         next_r.index_add_(0, adj_idxs, flat_out)
         return next_r
+
 
 
 
