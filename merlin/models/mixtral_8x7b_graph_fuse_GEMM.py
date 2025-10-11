@@ -484,10 +484,13 @@ def scatter_by_expert_kernel(
     toks = (offs_n // KTOP).to(tl.int32)
     pos_in_e = tl.atomic_add(CNT_ptr + ids, 1, mask=valid)
     base_e = tl.load(OFFS_ptr + ids, mask=valid, other=0)
+    next_e = tl.load(OFFS_ptr + (ids + 1), mask=valid & (ids + 1 <= E), other=base_e)
+    len_e = next_e - base_e
     dst = base_e + pos_in_e
 
     # 额外边界保护（防止非法地址）
-    dst_valid = valid & (toks >= 0) & (toks < N) & (dst >= 0) & (dst < NK)
+    within_seg = pos_in_e < len_e
+    dst_valid = valid & within_seg & (toks >= 0) & (toks < N) & (dst >= 0) & (dst < NK)
 
     # 写 adj（按有效掩码）
     tl.store(ADJ_ptr + dst, toks, mask=dst_valid)
