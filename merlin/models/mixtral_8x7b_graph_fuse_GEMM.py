@@ -540,7 +540,10 @@ class MoeLayer(nn.Module):
         rng = torch.arange(max_len, device=device)[None, :].expand(E_used, max_len)
         valid = rng < lens_used.view(-1, 1)
         flat_out = flat_out[valid.reshape(-1)]
-        next_r.index_add_(0, adj_idxs, flat_out)
+        # 仅聚合本层本卡专家对应的区间，确保与 flat_out 行数一致
+        l0 = int(offsets[self.first_expert].item())
+        r1 = int(offsets[self.last_expert + 1].item())
+        next_r.index_add_(0, adj_idxs[l0:r1], flat_out)
         return next_r
 
 
