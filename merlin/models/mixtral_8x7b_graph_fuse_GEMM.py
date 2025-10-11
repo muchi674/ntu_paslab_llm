@@ -480,35 +480,51 @@ class MoeLayer(nn.Module):
 
     def experts_infer(
         self,
-        sorted_x: torch.Tensor,
-        topk_weight: torch.Tensor,
-        offsets: torch.Tensor,
-        adj_idxs: torch.Tensor,
-        next_r: torch.Tensor,
+        sorted_x: torch.Tensor,    # [N*k, D]
+        topk_weight: torch.Tensor, # [N*k, 1]
+        offsets: torch.Tensor,     # [E+1]
+        adj_idxs: torch.Tensor,    # [N*k]
+        next_r: torch.Tensor,      # [N, H]
     ) -> torch.Tensor:
-        self.pinned_offsets.copy_(offsets)
-        expert_offsets = self.pinned_offsets.tolist()
+        E = self.num_experts
+        D = sorted_x.shape[-1]
+        H = self.experts.hidden_dim  # 每个 expert 输出维度相同
 
-        expert_outs = []
-        for ei in range(self.first_expert, self.last_expert + 1):
-            l = expert_offsets[ei]
-            r = expert_offsets[ei + 1]
+        # 1) 每个 expert 的输入段长度
+        lens = (offsets[1:] - offsets[:-1]).tolist()  # [E]
+
+        # 2) 找到最大长度，用 pad 方便做 batch
+        max_len = max(lens)
+        if max_len == 0:
+            return next_r
+
+        # 3) 构造 [E, max_len, D] 输入批
+        x_pad = sorted_x.new_zeros((E, max_len, D))
+        w_pad = sorted_x.new_zeros((E, max_len, 1))
+        for e in range(E):
+            l, r = offsets[e].item(), offsets[e + 1].item()
             if l == r:
                 continue
-            expert_outs.append(
-                self.experts.forward(
-                    self.glob_li,
-                    ei,
-                    sorted_x[l:r],
-                )
-            )
+            n = r - l
+            x_pad[e, :n, :] = sorted_x[l:r]
+            w_pad[e, :n, :] = topk_weight[l:r]
 
-        if len(expert_outs):
-            l = expert_offsets[self.first_expert]
-            r = expert_offsets[self.last_expert + 1]
-            expert_outs = torch.cat(expert_outs)
-            expert_outs.mul_(topk_weight[l:r])
-            next_r.index_add_(0, adj_idxs[l:r], expert_outs)
+        # 4) 所有 expert 权重拼成 [E, D, H]
+        W = torch.stack([
+            self.experts.ws[f"{self.glob_li}.{e}.w_down"].T for e in range(E)
+        ])  # [E, D, H]
+
+        # 5) batched matmul: [E, max_len, D] × [E, D, H] → [E, max_len, H]
+        out = torch.bmm(x_pad, W)  # 每个 expert 的输出
+        out.mul_(w_pad)            # 加权 topk_weight
+
+        # 6) 展平 + scatter 回原 token 序
+        flat_out = out.reshape(E * max_len, H)
+        # 去掉 padding 行
+        mask = torch.arange(max_len, device=offsets.device)[None, :] < torch.tensor(lens, device=offsets.device)[:, None]
+        flat_out = flat_out[mask.flatten()]
+        next_r.index_add_(0, adj_idxs, flat_out)
+        return next_r
 
 
 class RMSNorm(torch.nn.Module):
